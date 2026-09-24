@@ -100,3 +100,32 @@ int QuickConeSat::cell_complexity(RTLIL::Cell *cell)
 	// Unknown cell.
 	return 5;
 }
+
+int64_t SatEffortBudget::charge_import(QuickConeSat &qcsat, int64_t cells_charged)
+{
+	if (enabled())
+		remaining -= (GetSize(qcsat.imported_cells) - cells_charged) * import_cell_cost;
+	return GetSize(qcsat.imported_cells);
+}
+
+SatEffortBudget::Result SatEffortBudget::solve(QuickConeSat &qcsat, int64_t cap, const std::vector<int> &assumptions)
+{
+	std::vector<bool> modelVals;
+	return solve(qcsat, cap, {}, modelVals, assumptions);
+}
+
+SatEffortBudget::Result SatEffortBudget::solve(QuickConeSat &qcsat, int64_t cap, const std::vector<int> &modelExprs,
+		std::vector<bool> &modelVals, const std::vector<int> &assumptions)
+{
+	if (spent())
+		return Result::LimitReached;
+	if (enabled())
+		cap = (cap > 0) ? std::min(cap, remaining) : remaining;
+	qcsat.ez->setSolverPropLimit(cap);
+	bool sat = qcsat.ez->solve(modelExprs, modelVals, assumptions);
+	if (enabled())
+		remaining -= qcsat.ez->getSolverProps();
+	if (!sat && qcsat.ez->getSolverPropLimitStatus())
+		return Result::LimitReached;
+	return sat ? Result::Sat : Result::Unsat;
+}
