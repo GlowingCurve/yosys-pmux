@@ -7,6 +7,7 @@ yosys_pass(synth_intel
 		blackbox
 		check
 		clean
+		ctrl_restructure
 		deminout
 		dfflegalize
 		flatten

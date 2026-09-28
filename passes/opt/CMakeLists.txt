@@ -16,6 +16,9 @@ yosys_pass(opt_reduce
 yosys_pass(opt_share
 	opt_share.cc
 )
+yosys_pass(ctrl_restructure
+	ctrl_restructure.cc
+)
 yosys_pass(opt_expr
 	opt_expr.cc
 )

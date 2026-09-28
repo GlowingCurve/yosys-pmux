@@ -1,0 +1,137 @@
+read_verilog ctrl_restructure.v
+proc
+opt_dff
+deminout
+
+select -assert-min 1 ctrl_restructure_pmux/t:$pmux
+
+ctrl_restructure ctrl_restructure_mux ctrl_restructure_reconvergent ctrl_restructure_existing_ce
+opt_clean
+
+select -assert-count 1 ctrl_restructure_mux/t:$dffe
+select -assert-count 1 ctrl_restructure_mux/t:$mux
+select -assert-count 1 ctrl_restructure_reconvergent/t:$dffe
+select -assert-count 0 ctrl_restructure_reconvergent/t:$mux
+select -assert-count 1 ctrl_restructure_existing_ce/t:$sdffce
+
+design -reset
+read_verilog ctrl_restructure.v
+hierarchy -top ctrl_restructure_with_unknown
+proc
+deminout
+ctrl_restructure
+opt_clean
+select -assert-count 1 ctrl_restructure_with_unknown/t:$dffe
+select -assert-count 1 ctrl_restructure_with_unknown/t:$dff
+
+design -reset
+read_verilog ctrl_restructure.v
+hierarchy -top ctrl_restructure_mux
+proc
+opt_dff
+deminout
+equiv_opt -assert -multiclock ctrl_restructure
+
+design -reset
+read_verilog ctrl_restructure.v
+hierarchy -top ctrl_restructure_reconvergent
+proc
+opt_dff
+deminout
+equiv_opt -assert -multiclock ctrl_restructure
+
+design -reset
+read_verilog ctrl_restructure.v
+hierarchy -top ctrl_restructure_existing_ce
+proc
+opt_dff
+deminout
+equiv_opt -assert -multiclock ctrl_restructure
+
+design -reset
+read_verilog ctrl_restructure.v
+hierarchy -top ctrl_restructure_pmux
+proc
+deminout
+select -assert-min 1 ctrl_restructure_pmux/t:$pmux
+ctrl_restructure
+opt_clean
+select -assert-count 0 ctrl_restructure_pmux/t:$pmux
+select -assert-count 1 ctrl_restructure_pmux/t:$dffe
+select -assert-count 1 ctrl_restructure_pmux/t:$mux
+
+design -reset
+read_verilog ctrl_restructure.v
+hierarchy -top ctrl_restructure_pmux
+proc
+deminout
+equiv_opt -assert -multiclock ctrl_restructure
+
+design -reset
+read_verilog ctrl_restructure.v
+proc
+opt_dff
+deminout
+ctrl_restructure ctrl_restructure_reject_overlap
+select -assert-count 0 ctrl_restructure_reject_overlap/t:$dffe
+
+design -reset
+read_verilog ctrl_restructure.v
+proc
+opt_dff
+deminout
+ctrl_restructure ctrl_restructure_reject_partial
+select -assert-count 0 ctrl_restructure_reject_partial/t:$dffe
+
+design -reset
+read_rtlil ctrl_restructure_priority.il
+rename -hide
+copy ctrl_restructure_priority gold
+ctrl_restructure ctrl_restructure_priority
+opt_clean ctrl_restructure_priority
+select -assert-count 1 ctrl_restructure_priority/t:$sdffce
+select -assert-count 0 ctrl_restructure_priority/t:$mux
+equiv_make gold ctrl_restructure_priority equiv
+hierarchy -top equiv
+equiv_simple
+equiv_induct
+equiv_status -assert
+
+design -reset
+read_verilog ctrl_restructure.v
+hierarchy -top ctrl_restructure_shared_control
+proc
+deminout
+ctrl_restructure
+opt_clean
+select -assert-count 3 t:$dffe
+select -assert-count 0 t:$mux
+select -assert-count 1 t:$and
+select -assert-count 1 t:$not
+check -assert
+
+design -reset
+read_verilog ctrl_restructure.v
+hierarchy -top ctrl_restructure_shared_control
+proc
+deminout
+equiv_opt -assert -multiclock ctrl_restructure
+
+design -reset
+read_verilog ctrl_restructure.v
+hierarchy -top ctrl_restructure_reject_uncovered
+proc
+deminout
+ctrl_restructure
+select -assert-count 1 t:$dff
+select -assert-count 0 t:$dffe
+
+design -reset
+read_verilog ctrl_restructure.v
+hierarchy -top ctrl_restructure_with_cycle
+proc
+deminout
+ctrl_restructure
+opt_clean
+select -assert-count 1 t:$dffe
+select -assert-count 1 t:$dff

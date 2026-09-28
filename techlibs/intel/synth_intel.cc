@@ -203,6 +203,7 @@ struct SynthIntelPass : public ScriptPass {
 			}
 			run("tribuf -logic");
 			run("deminout");
+			run("ctrl_restructure");
 			run("opt_expr");
 			run("opt_clean");
 			run("check");
