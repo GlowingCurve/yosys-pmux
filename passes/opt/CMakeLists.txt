@@ -10,6 +10,13 @@ yosys_pass(opt_mem_widen
 yosys_pass(opt_muxtree
 	opt_muxtree.cc
 )
+yosys_pass(opt_muxcombine
+	opt_muxcombine.cc
+	REQUIRES
+		opt_expr
+		opt_muxtree
+		opt_clean
+)
 yosys_pass(opt_reduce
 	opt_reduce.cc
 )
