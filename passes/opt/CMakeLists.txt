@@ -91,3 +91,6 @@ yosys_pass(peepopt
 	peepopt.cc
 	${PMGEN_peepopt_OUTPUT}
 )
+yosys_pass(opt_pmuxopt
+	opt_pmuxopt.cc
+)

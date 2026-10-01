@@ -17,47 +17,46 @@
  *
  */
 
+#include "kernel/celltypes.h"
+#include "kernel/log.h"
 #include "kernel/register.h"
 #include "kernel/sigtools.h"
-#include "kernel/log.h"
-#include "kernel/celltypes.h"
 #include <cstddef>
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
 
 /**
-  * TERMINOLOGY
-  *
-  * A multiplexer tree (mux tree) is a tree composed exclusively of muxes.
-  * By mux, I mean $mux or $pmux. By port, I usually mean input port.
-  * The children of a node are all the muxes driving its input ports (A, B).
-  * It must be rooted in a "root mux", a mux which has multiple mux port users
-  * or any number of non-mux users. Only the root and leaf nodes can be
-  * root muxes, not the internal nodes. Leaf nodes that are root muxes
-  * are roots of "input trees".
-  *
-  * OPERATING PRINCIPLE
-  *
-  * This pass traverses mux trees, learning port activations and making
-  * assumptions about them as it goes. When valid, ports are replaced
-  * with constants, or removed if they can never be activated.
-  * When valid, muxes are replaced with shorts from port to output,
-  * or removed if their outputs are found to be no longer observable.
-  *
-  * Input trees can be recursed into if limits_t::recursions_left allows.
-  * Otherwise, the input tree is queued for a re-run with a fresh knowledge_t.
-  * At any point, if glob_evals_left goes to 0, the pass terminates.
-  *
-  * Unlike share, this pass doesn't use SAT to learn things about logic
-  * driving the mux control signals, and traverses mux regions from users
-  * to drivers.
-  */
+ * TERMINOLOGY
+ *
+ * A multiplexer tree (mux tree) is a tree composed exclusively of muxes.
+ * By mux, I mean $mux or $pmux. By port, I usually mean input port.
+ * The children of a node are all the muxes driving its input ports (A, B).
+ * It must be rooted in a "root mux", a mux which has multiple mux port users
+ * or any number of non-mux users. Only the root and leaf nodes can be
+ * root muxes, not the internal nodes. Leaf nodes that are root muxes
+ * are roots of "input trees".
+ *
+ * OPERATING PRINCIPLE
+ *
+ * This pass traverses mux trees, learning port activations and making
+ * assumptions about them as it goes. When valid, ports are replaced
+ * with constants, or removed if they can never be activated.
+ * When valid, muxes are replaced with shorts from port to output,
+ * or removed if their outputs are found to be no longer observable.
+ *
+ * Input trees can be recursed into if limits_t::recursions_left allows.
+ * Otherwise, the input tree is queued for a re-run with a fresh knowledge_t.
+ * At any point, if glob_evals_left goes to 0, the pass terminates.
+ *
+ * Unlike share, this pass doesn't use SAT to learn things about logic
+ * driving the mux control signals, and traverses mux regions from users
+ * to drivers.
+ */
 
-struct OptMuxtreeWorker
-{
+struct OptMuxtreeWorker {
 	RTLIL::Design *design;
 	RTLIL::Module *module;
 	SigMap assign_map;
@@ -68,7 +67,12 @@ struct OptMuxtreeWorker
 		int mux;
 		// Hacky: -1 is port A, if positive then indexes B port slices (of which $mux has only one)
 		int port;
-		inline Hasher hash_into(Hasher h) const { h.eat(mux); h.eat(port); return h; }
+		inline Hasher hash_into(Hasher h) const
+		{
+			h.eat(mux);
+			h.eat(port);
+			return h;
+		}
 		bool operator==(const MuxPort &other) const { return mux == other.mux && port == other.port; }
 	};
 	struct bitinfo_t {
@@ -101,7 +105,8 @@ struct OptMuxtreeWorker
 	vector<bool> root_enable_muxes;
 	pool<int> root_mux_rerun;
 
-	portinfo_t used_port_bit(RTLIL::SigSpec& sig, int mux_idx, int port_idx) {
+	portinfo_t used_port_bit(RTLIL::SigSpec &sig, int mux_idx, int port_idx)
+	{
 		portinfo_t portinfo = {};
 		for (int bit_idx : sig2bits(sig)) {
 			bit2info[bit_idx].mux_users.insert({mux_idx, port_idx});
@@ -110,7 +115,8 @@ struct OptMuxtreeWorker
 		return portinfo;
 	}
 
-	void track_mux(Cell* cell) {
+	void track_mux(Cell *cell)
+	{
 		// Populate bit2info[]:
 		//	.seen_non_mux
 		//	.mux_users
@@ -132,7 +138,7 @@ struct OptMuxtreeWorker
 		// Analyze port B
 		// In case of $pmux, port B is multiple slices, concatenated, one per bit of port S
 		for (int i = 0; i < GetSize(sig_s); i++) {
-			RTLIL::SigSpec sig = sig_b.extract(i*GetSize(sig_a), GetSize(sig_a));
+			RTLIL::SigSpec sig = sig_b.extract(i * GetSize(sig_a), GetSize(sig_a));
 			RTLIL::SigSpec ctrl_sig = assign_map(SigSpec{sig_s[i]});
 			portinfo_t portinfo = used_port_bit(sig, this_mux_idx, i);
 			portinfo.ctrl_sig = sig2bits(ctrl_sig, false).front();
@@ -149,7 +155,8 @@ struct OptMuxtreeWorker
 
 		for (int idx : sig2bits(sig_y)) {
 			if (bit2info[idx].mux_driver)
-				log_cmd_error("Cell %s Y port signal %s already driven by %s\n", cell->name, log_signal(sig_y), mux2info[*bit2info[idx].mux_driver].cell->name);
+				log_cmd_error("Cell %s Y port signal %s already driven by %s\n", cell->name, log_signal(sig_y),
+					      mux2info[*bit2info[idx].mux_driver].cell->name);
 			bit2info[idx].mux_driver = this_mux_idx;
 		}
 
@@ -157,14 +164,16 @@ struct OptMuxtreeWorker
 			bit2info[idx].seen_non_mux = true;
 	}
 
-	void see_non_mux_cell(Cell* cell) {
+	void see_non_mux_cell(Cell *cell)
+	{
 		for (auto &it : cell->connections()) {
 			for (int idx : sig2bits(it.second))
 				bit2info[idx].seen_non_mux = true;
 		}
 	}
 
-	void see_non_mux_wires() {
+	void see_non_mux_wires()
+	{
 		for (auto wire : module->wires()) {
 			if (wire->port_output || wire->get_bool_attribute(ID::keep))
 				for (int idx : sig2bits(RTLIL::SigSpec(wire)))
@@ -174,20 +183,22 @@ struct OptMuxtreeWorker
 
 	// Populate mux2info[].ports[]:
 	//	.input_muxes
-	void fixup_input_muxes() {
+	void fixup_input_muxes()
+	{
 		// bit2info knows the mux users and mux drivers of bits
 		// use this to tell mux2info ports about what muxes are driven by it
 		for (int i = 0; i < GetSize(bit2info); i++)
-		for (auto muxport : bit2info[i].mux_users) {
-			for (auto &p : mux2info[muxport.mux].ports) {
-				if (p.input_sigs.count(i))
-					if (bit2info[i].mux_driver)
-						p.input_muxes.insert(*bit2info[i].mux_driver);
+			for (auto muxport : bit2info[i].mux_users) {
+				for (auto &p : mux2info[muxport.mux].ports) {
+					if (p.input_sigs.count(i))
+						if (bit2info[i].mux_driver)
+							p.input_muxes.insert(*bit2info[i].mux_driver);
+				}
 			}
-		}
 	}
 
-	void populate_roots() {
+	void populate_roots()
+	{
 		// mux_to_users[i] means "set of muxes using output of mux i"
 		dict<int, pool<struct MuxPort>> mux_to_users;
 		// Pure root muxes (outputs seen by non-muxes)
@@ -212,8 +223,7 @@ struct OptMuxtreeWorker
 				root_muxes.at(driving_mux) = true;
 	}
 
-	struct knowledge_t
-	{
+	struct knowledge_t {
 		// Known inactive signals
 		// The payload is a reference counter used to manage the list
 		// When it is non-zero, the signal in known to be inactive
@@ -228,22 +238,21 @@ struct OptMuxtreeWorker
 		std::vector<bool> visited_muxes;
 
 		// Initialize with the maximum possible sizes
-		knowledge_t(int num_bits, int num_muxes) {
+		knowledge_t(int num_bits, int num_muxes)
+		{
 			known_inactive.assign(num_bits, 0);
 			known_active.assign(num_bits, 0);
 			visited_muxes.assign(num_muxes, false);
 		}
 	};
 
-	OptMuxtreeWorker(RTLIL::Design *design, RTLIL::Module *module) :
-			design(design), module(module), assign_map(module), removed_count(0)
+	OptMuxtreeWorker(RTLIL::Design *design, RTLIL::Module *module) : design(design), module(module), assign_map(module), removed_count(0)
 	{
 		log("Running muxtree optimizer on module %s..\n", module->name);
 
 		log("  Creating internal representation of mux trees.\n");
 
-		for (auto cell : module->cells())
-		{
+		for (auto cell : module->cells()) {
 			if (cell->type.in(ID($mux), ID($pmux)))
 				track_mux(cell);
 			else
@@ -290,16 +299,15 @@ struct OptMuxtreeWorker
 		log("  Analyzing evaluation results.\n");
 		log_assert(glob_evals_left > 0);
 
-		for (auto &mi : mux2info)
-		{
+		for (auto &mi : mux2info) {
 			vector<int> live_ports;
 			for (int port_idx = 0; port_idx < GetSize(mi.ports); port_idx++) {
 				portinfo_t &pi = mi.ports[port_idx];
 				if (pi.observable) {
 					live_ports.push_back(port_idx);
 				} else {
-					log("    dead port %d/%d on %s %s.\n", port_idx+1, GetSize(mi.ports),
-							mi.cell->type.c_str(), mi.cell->name.c_str());
+					log("    dead port %d/%d on %s %s.\n", port_idx + 1, GetSize(mi.ports), mi.cell->type.c_str(),
+					    mi.cell->name.c_str());
 					removed_count++;
 				}
 			}
@@ -320,19 +328,16 @@ struct OptMuxtreeWorker
 			RTLIL::SigSpec sig_ports = sig_b;
 			sig_ports.append(sig_a);
 
-			if (GetSize(live_ports) == 1)
-			{
-				RTLIL::SigSpec sig_in = sig_ports.extract(live_ports[0]*GetSize(sig_a), GetSize(sig_a));
+			if (GetSize(live_ports) == 1) {
+				RTLIL::SigSpec sig_in = sig_ports.extract(live_ports[0] * GetSize(sig_a), GetSize(sig_a));
 				module->connect(RTLIL::SigSig(sig_y, sig_in));
 				module->remove(mi.cell);
-			}
-			else
-			{
+			} else {
 				RTLIL::SigSpec new_sig_a, new_sig_b, new_sig_s;
 
 				for (int i = 0; i < GetSize(live_ports); i++) {
-					RTLIL::SigSpec sig_in = sig_ports.extract(live_ports[i]*GetSize(sig_a), GetSize(sig_a));
-					if (i == GetSize(live_ports)-1) {
+					RTLIL::SigSpec sig_in = sig_ports.extract(live_ports[i] * GetSize(sig_a), GetSize(sig_a));
+					if (i == GetSize(live_ports) - 1) {
 						new_sig_a = sig_in;
 					} else {
 						new_sig_b.append(sig_in);
@@ -371,7 +376,8 @@ struct OptMuxtreeWorker
 		return results;
 	}
 
-	static void activate_port(knowledge_t &knowledge, int port_idx, const muxinfo_t &muxinfo) {
+	static void activate_port(knowledge_t &knowledge, int port_idx, const muxinfo_t &muxinfo)
+	{
 		// First, mark all other ports inactive
 		for (int i = 0; i < GetSize(muxinfo.ports); i++) {
 			if (i == port_idx)
@@ -380,18 +386,19 @@ struct OptMuxtreeWorker
 				++knowledge.known_inactive[muxinfo.ports[i].ctrl_sig];
 		}
 		// Mark port active unless it's the last one
-		if (port_idx < GetSize(muxinfo.ports)-1 && !muxinfo.ports[port_idx].const_activated)
+		if (port_idx < GetSize(muxinfo.ports) - 1 && !muxinfo.ports[port_idx].const_activated)
 			++knowledge.known_active[muxinfo.ports[port_idx].ctrl_sig];
 	}
 
-	static void deactivate_port(knowledge_t &knowledge, int port_idx, const muxinfo_t &muxinfo) {
-		auto unlearn = [](std::vector<int>& knowns, int bit_idx) {
+	static void deactivate_port(knowledge_t &knowledge, int port_idx, const muxinfo_t &muxinfo)
+	{
+		auto unlearn = [](std::vector<int> &knowns, int bit_idx) {
 			if (knowns[bit_idx] > 0) {
 				--knowns[bit_idx];
 			}
 		};
 
-		if (port_idx < GetSize(muxinfo.ports)-1 && !muxinfo.ports[port_idx].const_activated)
+		if (port_idx < GetSize(muxinfo.ports) - 1 && !muxinfo.ports[port_idx].const_activated)
 			unlearn(knowledge.known_active, muxinfo.ports[port_idx].ctrl_sig);
 
 		// Undo inactivity assumptions for other ports
@@ -411,9 +418,11 @@ struct OptMuxtreeWorker
 		// True if we're recursing from a pure root mux
 		bool do_mark_ports_observable = true;
 		// How many more subtree recursions into input trees can we take?
-		// Then shalt thou count to three, no more, no less. Three shall be the number thou shalt count, and the number of the counting shall be three.
+		// Then shalt thou count to three, no more, no less. Three shall be the number thou shalt count, and the number of the counting shall
+		// be three.
 		int recursions_left = 3;
-		limits_t subtree() const {
+		limits_t subtree() const
+		{
 			limits_t ret = *this;
 			log_assert(ret.recursions_left > 0);
 			ret.recursions_left--;
@@ -499,8 +508,7 @@ struct OptMuxtreeWorker
 				if (knowledge.known_inactive[bits[i]] > 0) {
 					sig[i] = State::S0;
 					did_something = true;
-				} else
-				if (knowledge.known_active[bits[i]] > 0) {
+				} else if (knowledge.known_active[bits[i]] > 0) {
 					sig[i] = State::S1;
 					did_something = true;
 				}
@@ -529,13 +537,13 @@ struct OptMuxtreeWorker
 			if (width_if_b) {
 				// Roll over into next slice
 				if (++slice_off == width_if_b)
-					slice_idx++, slice_off=0;
+					slice_idx++, slice_off = 0;
 			}
 		}
 
 		if (did_something) {
-			log("      Replacing known input bits on port %s of cell %s: %s -> %s\n", portname.unescape(),
-					muxinfo.cell, log_signal(muxinfo.cell->getPort(portname)), log_signal(sig));
+			log("      Replacing known input bits on port %s of cell %s: %s -> %s\n", portname.unescape(), muxinfo.cell,
+			    log_signal(muxinfo.cell->getPort(portname)), log_signal(sig));
 			muxinfo.cell->setPort(portname, sig);
 		}
 	}
@@ -556,8 +564,7 @@ struct OptMuxtreeWorker
 		}
 
 		// if there is a constant activated port we just use it
-		for (int port_idx = 0; port_idx < GetSize(muxinfo.ports); port_idx++)
-		{
+		for (int port_idx = 0; port_idx < GetSize(muxinfo.ports); port_idx++) {
 			portinfo_t &portinfo = muxinfo.ports[port_idx];
 			if (portinfo.const_activated) {
 				eval_mux_port(knowledge, mux_idx, port_idx, limits);
@@ -568,8 +575,7 @@ struct OptMuxtreeWorker
 		// Compare ports with known active control signals. if we find a match,
 		// only this port can be active. Do not include the last port,
 		// it's the default port without an associated control signal
-		for (int port_idx = 0; port_idx < GetSize(muxinfo.ports)-1; port_idx++)
-		{
+		for (int port_idx = 0; port_idx < GetSize(muxinfo.ports) - 1; port_idx++) {
 			portinfo_t &portinfo = muxinfo.ports[port_idx];
 			if (portinfo.const_deactivated)
 				continue;
@@ -581,12 +587,11 @@ struct OptMuxtreeWorker
 
 		// eval all ports that could be activated (control signal is not in
 		// known_inactive or const_deactivated).
-		for (int port_idx = 0; port_idx < GetSize(muxinfo.ports); port_idx++)
-		{
+		for (int port_idx = 0; port_idx < GetSize(muxinfo.ports); port_idx++) {
 			portinfo_t &portinfo = muxinfo.ports[port_idx];
 			if (portinfo.const_deactivated)
 				continue;
-			if (port_idx < GetSize(muxinfo.ports)-1)
+			if (port_idx < GetSize(muxinfo.ports) - 1)
 				if (knowledge.known_inactive[portinfo.ctrl_sig] > 0)
 					continue;
 			eval_mux_port(knowledge, mux_idx, port_idx, limits);
@@ -608,7 +613,7 @@ struct OptMuxtreeWorker
 };
 
 struct OptMuxtreePass : public Pass {
-	OptMuxtreePass() : Pass("opt_muxtree", "eliminate dead trees in multiplexer trees") { }
+	OptMuxtreePass() : Pass("opt_muxtree", "eliminate dead trees in multiplexer trees") {}
 	void help() override
 	{
 		//   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
