@@ -117,7 +117,8 @@ struct SynthIntelPass : public ScriptPass {
 			}
 			if (args[argidx] == "-vqm" && argidx + 1 < args.size()) {
 				vout_file = args[++argidx];
-				log_warning("The Quartus backend has not been tested recently and is likely incompatible with modern versions of Quartus.\n");
+				log_warning(
+				  "The Quartus backend has not been tested recently and is likely incompatible with modern versions of Quartus.\n");
 				continue;
 			}
 			if (args[argidx] == "-vpr" && argidx + 1 < args.size()) {
@@ -166,10 +167,7 @@ struct SynthIntelPass : public ScriptPass {
 		if (family_opt == "cyclonev")
 			log_cmd_error("Cyclone V synthesis has been moved to synth_intel_alm.\n");
 
-		if (family_opt != "max10" &&
-		    family_opt != "cycloneiv" &&
-		    family_opt != "cycloneive" &&
-		    family_opt != "cyclone10lp")
+		if (family_opt != "max10" && family_opt != "cycloneiv" && family_opt != "cycloneive" && family_opt != "cyclone10lp")
 			log_cmd_error("Invalid or no family specified: '%s'\n", family_opt);
 
 		if (family_opt != "max10")
@@ -212,7 +210,7 @@ struct SynthIntelPass : public ScriptPass {
 			run("wreduce");
 			run("peepopt");
 			run("opt_clean");
-			run("opt_pmuxopt");
+			run("opt_pmux");
 			run("techmap -map +/cmp2lut.v -D LUT_WIDTH=4");
 			run("opt_expr");
 			run("opt_clean");
@@ -220,12 +218,15 @@ struct SynthIntelPass : public ScriptPass {
 			if (help_mode) {
 				run("techmap -map +mul2dsp.v [...]", "(unless -nodsp)");
 			} else if (!nodsp) {
-				run("techmap -map +/mul2dsp.v -D DSP_A_MAXWIDTH=18 -D DSP_B_MAXWIDTH=18  -D DSP_A_MINWIDTH=10 -D DSP_B_MINWIDTH=4 -D DSP_NAME=$__MUL18X18");
-					run("chtype -set $mul t:$__soft_mul");
-					run("techmap -map +/mul2dsp.v -D DSP_A_MAXWIDTH=18 -D DSP_B_MAXWIDTH=18  -D DSP_A_MINWIDTH=4 -D DSP_B_MINWIDTH=10 -D DSP_NAME=$__MUL18X18");
-					run("chtype -set $mul t:$__soft_mul");
-					run("techmap -map +/mul2dsp.v -D DSP_A_MAXWIDTH=9 -D DSP_B_MAXWIDTH=9  -D DSP_A_MINWIDTH=4 -D DSP_B_MINWIDTH=4 -D DSP_NAME=$__MUL9X9");
-					run("chtype -set $mul t:$__soft_mul");
+				run("techmap -map +/mul2dsp.v -D DSP_A_MAXWIDTH=18 -D DSP_B_MAXWIDTH=18  -D DSP_A_MINWIDTH=10 -D DSP_B_MINWIDTH=4 -D "
+				    "DSP_NAME=$__MUL18X18");
+				run("chtype -set $mul t:$__soft_mul");
+				run("techmap -map +/mul2dsp.v -D DSP_A_MAXWIDTH=18 -D DSP_B_MAXWIDTH=18  -D DSP_A_MINWIDTH=4 -D DSP_B_MINWIDTH=10 -D "
+				    "DSP_NAME=$__MUL18X18");
+				run("chtype -set $mul t:$__soft_mul");
+				run("techmap -map +/mul2dsp.v -D DSP_A_MAXWIDTH=9 -D DSP_B_MAXWIDTH=9  -D DSP_A_MINWIDTH=4 -D DSP_B_MINWIDTH=4 -D "
+				    "DSP_NAME=$__MUL9X9");
+				run("chtype -set $mul t:$__soft_mul");
 				run("alumacc");
 				run(stringf("techmap -map +/intel/%s/dsp_map.v", family_opt));
 			} else {
@@ -237,10 +238,7 @@ struct SynthIntelPass : public ScriptPass {
 		}
 
 		if (!nobram && check_label("map_bram", "(skip if -nobram)")) {
-				if (family_opt == "cycloneiv" ||
-				    family_opt == "cycloneive" ||
-				    family_opt == "max10" ||
-				    help_mode) {
+			if (family_opt == "cycloneiv" || family_opt == "cycloneive" || family_opt == "max10" || help_mode) {
 				run("memory_bram -rules +/intel/common/brams_m9k.txt", "(if applicable for family)");
 				run("techmap -map +/intel/common/brams_map_m9k.v", "(if applicable for family)");
 			} else {
