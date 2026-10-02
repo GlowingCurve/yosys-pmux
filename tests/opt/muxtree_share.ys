@@ -1,0 +1,110 @@
+# y1 selects the data of y0 with s[0] inverted, except for s == 0
+read_verilog <<EOT
+module top(input [2:0] s, input [3:0] a0, b0, c0, a1, b1, a2, b2, a3, b3, output reg [3:0] y0, y1);
+	always @* begin
+		case (s)
+			3'd0: y0 = c0;
+			3'd1: y0 = b0;
+			3'd2: y0 = a1;
+			3'd3: y0 = b1;
+			3'd4: y0 = a2;
+			3'd5: y0 = b2;
+			3'd6: y0 = a3;
+			3'd7: y0 = b3;
+		endcase
+		case (s)
+			3'd0: y1 = b0;
+			3'd1: y1 = a0;
+			3'd2: y1 = b1;
+			3'd3: y1 = a1;
+			3'd4: y1 = b2;
+			3'd5: y1 = a2;
+			3'd6: y1 = b3;
+			3'd7: y1 = a3;
+		endcase
+	end
+endmodule
+EOT
+proc
+opt_clean
+equiv_opt -assert muxtree_share
+design -load postopt
+select -assert-count 0 t:$pmux
+design -reset
+
+# partial cases fall back to the default, s == 0 is matched by $logic_not
+read_verilog <<EOT
+module top(input [1:0] s, input [3:0] a, b, c, d, output reg [3:0] y0, y1);
+	always @* begin
+		y0 = d;
+		y1 = d;
+		case (s)
+			2'd0: y0 = a;
+			2'd1: y0 = b;
+			2'd2: y0 = c;
+		endcase
+		case (s)
+			2'd0: y1 = b;
+			2'd1: y1 = a;
+			2'd3: y1 = c;
+		endcase
+	end
+endmodule
+EOT
+proc
+opt_clean
+equiv_opt -assert muxtree_share
+design -load postopt
+select -assert-count 0 t:$pmux
+design -reset
+
+# y1 depends on y0, sharing would create a combinational loop
+read_verilog <<EOT
+module top(input [1:0] s, input [3:0] a, b, c, d, output reg [3:0] y0, y1);
+	always @* begin
+		case (s)
+			2'd0: y0 = a;
+			2'd1: y0 = b;
+			2'd2: y0 = c;
+			2'd3: y0 = d;
+		endcase
+		case (s)
+			2'd0: y1 = b;
+			2'd1: y1 = a;
+			2'd2: y1 = d;
+			2'd3: y1 = y0 ^ c;
+		endcase
+	end
+endmodule
+EOT
+proc
+opt_clean
+equiv_opt -assert muxtree_share
+design -load postopt
+select -assert-count 2 t:$pmux
+design -reset
+
+# unrelated data, nothing to share
+read_verilog <<EOT
+module top(input [1:0] s, input [3:0] a, b, c, d, e, f, g, h, output reg [3:0] y0, y1);
+	always @* begin
+		case (s)
+			2'd0: y0 = a;
+			2'd1: y0 = b;
+			2'd2: y0 = c;
+			2'd3: y0 = d;
+		endcase
+		case (s)
+			2'd0: y1 = e;
+			2'd1: y1 = f;
+			2'd2: y1 = g;
+			2'd3: y1 = h;
+		endcase
+	end
+endmodule
+EOT
+proc
+opt_clean
+equiv_opt -assert muxtree_share
+design -load postopt
+select -assert-count 2 t:$pmux

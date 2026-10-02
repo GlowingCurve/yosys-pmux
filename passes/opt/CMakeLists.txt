@@ -91,3 +91,6 @@ yosys_pass(peepopt
 	peepopt.cc
 	${PMGEN_peepopt_OUTPUT}
 )
+yosys_pass(muxtree_share
+	muxtree_share.cc
+)
