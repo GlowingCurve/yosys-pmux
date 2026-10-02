@@ -1,0 +1,58 @@
+# Fig.4: both inputs select between a and b, the second one with swapped inputs
+read_verilog <<EOT
+module top(input s0, s1, s2, input [3:0] a, b, output [3:0] y);
+	assign y = s0 ? (s2 ? a : b) : (s1 ? b : a);
+endmodule
+EOT
+equiv_opt -assert opt_muxcomb
+design -load postopt
+select -assert-count 1 t:$mux r:WIDTH=4 %i
+design -reset
+
+# Fig.6: one input is a or b itself, all four positions
+read_verilog <<EOT
+module top(input s0, s1, input [3:0] a, b, output [3:0] y0, y1, y2, y3);
+	assign y0 = s0 ? b : (s1 ? b : a);
+	assign y1 = s0 ? (s1 ? b : a) : a;
+	assign y2 = s0 ? a : (s1 ? b : a);
+	assign y3 = s0 ? (s1 ? b : a) : b;
+endmodule
+EOT
+equiv_opt -assert opt_muxcomb
+design -load postopt
+select -assert-count 4 t:$mux
+select -assert-count 2 t:$or
+select -assert-count 2 t:$and
+select -assert-count 2 t:$not
+design -reset
+
+# a chain of if/else over two values folds into a single data mux
+read_verilog <<EOT
+module top(input [3:0] s, input [7:0] a, b, output reg [7:0] y);
+	always @* begin
+		if (s[0]) y = a;
+		else if (s[1]) y = b;
+		else if (s[2]) y = a;
+		else if (s[3]) y = b;
+		else y = a;
+	end
+endmodule
+EOT
+proc
+opt -nodffe -nosdff
+equiv_opt -assert opt_muxcomb
+design -load postopt
+select -assert-count 1 t:$mux r:WIDTH=8 %i
+design -reset
+
+# a child that also feeds another cell is kept
+read_verilog <<EOT
+module top(input s0, s1, input [3:0] a, b, output [3:0] y, z);
+	wire [3:0] m = s1 ? b : a;
+	assign y = s0 ? b : m;
+	assign z = m;
+endmodule
+EOT
+equiv_opt -assert opt_muxcomb
+design -load postopt
+select -assert-count 2 t:$mux

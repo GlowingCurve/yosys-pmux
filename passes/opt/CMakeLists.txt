@@ -94,3 +94,6 @@ yosys_pass(peepopt
 yosys_pass(muxtree_share
 	muxtree_share.cc
 )
+yosys_pass(opt_muxcomb
+	opt_muxcomb.cc
+)
