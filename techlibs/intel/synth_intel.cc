@@ -214,6 +214,11 @@ struct SynthIntelPass : public ScriptPass {
 			run("peepopt");
 			run("opt_clean");
 			run("muxtree_share");
+			run("opt_muxinfer");
+			run("opt_muxrebuild");
+			run("opt_muxinfer");
+			run("opt_expr");
+			run("opt_clean");
 			run("techmap -map +/cmp2lut.v -D LUT_WIDTH=4");
 			run("opt_expr");
 			run("opt_clean");

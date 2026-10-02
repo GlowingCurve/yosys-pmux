@@ -97,3 +97,9 @@ yosys_pass(muxtree_share
 yosys_pass(opt_muxcomb
 	opt_muxcomb.cc
 )
+yosys_pass(opt_muxinfer
+	opt_muxinfer.cc
+)
+yosys_pass(opt_muxrebuild
+	opt_muxrebuild.cc
+)
