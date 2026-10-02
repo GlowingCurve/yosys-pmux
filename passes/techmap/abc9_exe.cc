@@ -225,9 +225,9 @@ void abc9_module(RTLIL::Design *design, std::string script_file, std::string exe
 		} else
 			abc9_script += stringf("source %s", script_file);
 	} else if (!lut_costs.empty() || !lut_file.empty()) {
-		abc9_script += RTLIL::constpad.at("abc9.script.default").substr(1,std::string::npos);
+		abc9_script += RTLIL::constpad.at("abc9.script.default.area").substr(1,std::string::npos);
 	} else if (!liberty_files.empty() || !genlib_files.empty()) {
-		abc9_script += RTLIL::constpad.at("abc9.script.default").substr(1,std::string::npos);
+		abc9_script += RTLIL::constpad.at("abc9.script.default.area").substr(1,std::string::npos);
 	} else
 		log_abort();
 
