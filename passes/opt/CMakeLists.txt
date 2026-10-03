@@ -103,3 +103,6 @@ yosys_pass(opt_muxinfer
 yosys_pass(opt_muxrebuild
 	opt_muxrebuild.cc
 )
+yosys_pass(opt_reshape
+	opt_reshape.cc
+)
