@@ -15,6 +15,7 @@ struct OptMuxcombWorker
 	dict<SigBit, int> drivers;
 	dict<SigBit, std::pair<Cell*, int>> mux_driver;
 	pool<Cell*> reserved;
+	int expanded = 0;
 	int merged = 0;
 
 	struct Branch {
@@ -31,6 +32,14 @@ struct OptMuxcombWorker
 		Branch lo, hi;
 	};
 	vector<Combination> combinations;
+
+	struct Expansion {
+		Cell *top;
+		IdString port;
+		SigSpec a, b;
+		SigBit s;
+	};
+	vector<Expansion> expansions;
 
 	OptMuxcombWorker(Module *module) : module(module), sigmap(module)
 	{
@@ -122,49 +131,65 @@ struct OptMuxcombWorker
 		return module->Mux(NEW_ID, lo, hi, s);
 	}
 
-	// Fig.6(a)-(b)：重复的数据输入表示为选择常量 0 或 1 的虚拟 MUX。
-	bool match_branch(Cell *top, const SigSpec &sig, const SigSpec &a, const SigSpec &b, Branch &branch)
+	void find_expansion(Cell *top)
 	{
-		if (sig == a || sig == b) {
-			branch.s = sig == a ? State::S0 : State::S1;
-			return true;
+		for (auto port : {ID::A, ID::B}) {
+			IdString other_port = port == ID::A ? ID::B : ID::A;
+			Branch child = child_mux(top, sigmap(top->getPort(other_port)));
+			if (child.cell == nullptr || child.a == child.b)
+				continue;
+			SigSpec repeated = sigmap(top->getPort(port));
+			if (repeated != child.a && repeated != child.b)
+				continue;
+			SigBit s = repeated == child.a ? State::S0 : State::S1;
+			expansions.push_back({top, port, child.a, child.b, s});
+			reserved.insert(top);
+			reserved.insert(child.cell);
+			return;
 		}
-		branch = child_mux(top, sig);
-		if (branch.cell == nullptr)
-			return false;
-		if (branch.a == a && branch.b == b)
-			return true;
-		if (branch.a == b && branch.b == a) {
-			branch.inverted = true;
-			return true;
+	}
+
+	bool expand()
+	{
+		for (auto cell : module->selected_cells())
+			if (cell->type == ID($mux) && !cell->get_bool_attribute(ID::keep) && !reserved.count(cell))
+				find_expansion(cell);
+		for (const auto &expansion : expansions) {
+			// Fig.6(a)-(b)：创建常量选择 MUX，并用其输出替换父节点的重复输入。
+			Wire *y = module->addWire(NEW_ID, GetSize(expansion.a));
+			Cell *child = module->addMux(NEW_ID, expansion.a, expansion.b, expansion.s, y,
+					expansion.top->get_src_attribute());
+			expansion.top->setPort(expansion.port, y);
+			module->design->select(module, child);
+			module->design->select(module, y);
+			log("  expanding %s.%s with %s (select %s)\n", log_id(expansion.top),
+					log_id(expansion.port), log_id(child), log_signal(expansion.s));
 		}
-		return false;
+		expanded = GetSize(expansions);
+		return expanded != 0;
 	}
 
 	void find_combination(Cell *top)
 	{
-		SigSpec lo = sigmap(top->getPort(ID::A)), hi = sigmap(top->getPort(ID::B));
-		for (const auto &sig : {lo, hi}) {
-			Branch child = child_mux(top, sig);
-			if (child.cell == nullptr || child.a == child.b)
-				continue;
-			Combination comb;
-			comb.top = top;
-			comb.a = child.a;
-			comb.b = child.b;
-			comb.s = sigmap(top->getPort(ID::S)[0]);
-			if (!match_branch(top, lo, comb.a, comb.b, comb.lo) ||
-					!match_branch(top, hi, comb.a, comb.b, comb.hi))
-				continue;
-			log_assert(comb.lo.cell != nullptr || comb.hi.cell != nullptr);
-			combinations.push_back(comb);
-			reserved.insert(top);
-			if (comb.lo.cell != nullptr)
-				reserved.insert(comb.lo.cell);
-			if (comb.hi.cell != nullptr)
-				reserved.insert(comb.hi.cell);
+		Combination comb;
+		comb.top = top;
+		comb.lo = child_mux(top, sigmap(top->getPort(ID::A)));
+		comb.hi = child_mux(top, sigmap(top->getPort(ID::B)));
+		if (comb.lo.cell == nullptr || comb.hi.cell == nullptr || comb.lo.cell == comb.hi.cell)
 			return;
-		}
+		comb.a = comb.lo.a;
+		comb.b = comb.lo.b;
+		comb.s = sigmap(top->getPort(ID::S)[0]);
+		if (comb.a == comb.b)
+			return;
+		if (comb.hi.a == comb.b && comb.hi.b == comb.a)
+			comb.hi.inverted = true;
+		else if (comb.hi.a != comb.a || comb.hi.b != comb.b)
+			return;
+		combinations.push_back(comb);
+		reserved.insert(top);
+		reserved.insert(comb.lo.cell);
+		reserved.insert(comb.hi.cell);
 	}
 
 	bool run()
@@ -181,8 +206,6 @@ struct OptMuxcombWorker
 			comb.top->setPort(ID::B, comb.b);
 			comb.top->setPort(ID::S, mux_bit(comb.s, lo, hi));
 			for (auto child : {comb.lo.cell, comb.hi.cell}) {
-				if (child == nullptr)
-					continue;
 				log("  merging %s into %s\n", log_id(child), log_id(comb.top));
 				module->remove(child);
 			}
@@ -197,7 +220,7 @@ struct OptMuxcombPass : public Pass {
 	void help() override
 	{
 		log("\n");
-		log("    opt_muxcomb [selection]\n");
+		log("    opt_muxcomb [-expand] [selection]\n");
 		log("\n");
 		log("This pass implements the multiplexer combination of Wang et al., ISEDA 2023.\n");
 		log("A $mux whose inputs are both $muxes selecting between the same data 'a' and\n");
@@ -206,8 +229,10 @@ struct OptMuxcombPass : public Pass {
 		log("\n");
 		log("    s0 ? (s2 ? b : a) : (s1 ? b : a)  =>  (s0 ? s2 : s1) ? b : a\n");
 		log("\n");
-		log("Fig.6 treats a repeated data input as a virtual mux with a constant select.\n");
-		log("Combining it with the other branch produces these four equivalent forms:\n");
+		log("Fig.6(a)-(b) expands a repeated data input into a new $mux with the same\n");
+		log("data pair and a constant select (0 for 'a', 1 for 'b'). Its output replaces\n");
+		log("the repeated input of the parent. The resulting circuit is then combined\n");
+		log("using Fig.4, and its constant control branches are simplified:\n");
 		log("\n");
 		log("    s0 ? b : (s1 ? b : a)  =>  (s0 | s1) ? b : a\n");
 		log("    s0 ? a : (s1 ? b : a)  =>  (~s0 & s1) ? b : a\n");
@@ -221,27 +246,51 @@ struct OptMuxcombPass : public Pass {
 		log("are skipped. Run before opt_muxtree and opt_expr to simplify the resulting\n");
 		log("control trees as described in Fig.5 and Fig.7.\n");
 		log("\n");
+		log("    -expand\n");
+		log("        perform only the Fig.6(a)-(b) expansion, retaining the new muxes\n");
+		log("        and their connections for inspection or subsequent combination\n");
+		log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
 		log_header(design, "Executing OPT_MUXCOMB pass (merge muxes over the same input pair).\n");
-		extra_args(args, 1, design);
+		bool expand_only = false;
+		size_t argidx = 1;
+		for (; argidx < args.size(); argidx++) {
+			if (args[argidx] == "-expand") {
+				expand_only = true;
+				continue;
+			}
+			break;
+		}
+		extra_args(args, argidx, design);
 
+		int expanded = 0;
 		int merged = 0;
 		for (auto module : design->selected_modules()) {
 			if (module->has_processes_warn())
 				continue;
 			while (true) {
+				OptMuxcombWorker expansion_worker(module);
+				bool did_expand = expansion_worker.expand();
+				expanded += expansion_worker.expanded;
+				if (expand_only) {
+					if (!did_expand)
+						break;
+					continue;
+				}
+				// 重新建立索引，使用扩展后电路中的实际子节点执行 Fig.4。
 				OptMuxcombWorker worker(module);
 				bool did_something = worker.run();
 				merged += worker.merged;
-				if (!did_something)
+				if (!did_expand && !did_something)
 					break;
 			}
 		}
 
-		if (merged)
+		if (expanded || merged)
 			design->scratchpad_set_bool("opt.did_something", true);
+		log("Expanded %d repeated $mux inputs.\n", expanded);
 		log("Merged %d $mux combinations.\n", merged);
 	}
 } OptMuxcombPass;
