@@ -207,6 +207,8 @@ struct SynthIntelPass : public ScriptPass {
 			run("opt_clean");
 			run("check");
 			run("opt -nodffe -nosdff");
+			run("opt_muxcomb");
+			run("opt");
 			run("fsm");
 			run("opt");
 			run("wreduce");

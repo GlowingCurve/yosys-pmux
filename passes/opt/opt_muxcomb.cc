@@ -12,134 +12,183 @@ struct OptMuxcombWorker
 	Module *module;
 	SigMap sigmap;
 	dict<SigBit, int> users;
-	dict<SigBit, Cell*> mux_driver;
-	pool<Cell*> removed;
+	dict<SigBit, int> drivers;
+	dict<SigBit, std::pair<Cell*, int>> mux_driver;
+	pool<Cell*> reserved;
 	int merged = 0;
+
+	struct Branch {
+		Cell *cell = nullptr;
+		SigSpec a, b;
+		SigBit s;
+		bool inverted = false;
+	};
+
+	struct Combination {
+		Cell *top;
+		SigSpec a, b;
+		SigBit s;
+		Branch lo, hi;
+	};
+	vector<Combination> combinations;
 
 	OptMuxcombWorker(Module *module) : module(module), sigmap(module)
 	{
-		for (auto wire : module->wires())
+		for (auto wire : module->wires()) {
 			if (wire->port_output || wire->get_bool_attribute(ID::keep))
 				for (auto bit : sigmap(wire))
 					users[bit]++;
+			if (wire->port_input)
+				for (auto bit : sigmap(wire))
+					drivers[bit]++;
+		}
 		for (auto cell : module->cells())
 			for (auto &conn : cell->connections()) {
-				// ports of unknown direction count as users
-				if (cell->output(conn.first) && !cell->input(conn.first))
-					continue;
-				for (auto bit : sigmap(conn.second))
-					users[bit]++;
+				// 未知单元的端口同时作为使用者和潜在驱动者。
+				bool input = !cell->known() || cell->input(conn.first);
+				bool output = !cell->known() || cell->output(conn.first);
+				for (auto bit : sigmap(conn.second)) {
+					if (input)
+						users[bit]++;
+					if (output)
+						drivers[bit]++;
+				}
 			}
-		for (auto cell : module->cells())
-			if (cell->type == ID($mux))
-				for (auto bit : sigmap(cell->getPort(ID::Y)))
-					mux_driver[bit] = cell;
+		for (auto cell : module->selected_cells())
+			if (cell->type == ID($mux) && !cell->get_bool_attribute(ID::keep)) {
+				SigSpec y = sigmap(cell->getPort(ID::Y));
+				for (int i = 0; i < GetSize(y); i++)
+					mux_driver[y[i]] = {cell, i};
+			}
 	}
 
-	// the $mux that drives exactly sig and only feeds the input of top
-	Cell *child_mux(Cell *top, const SigSpec &sig)
+	// 按父节点的数据位顺序提取子节点，允许输出切片和位序重排。
+	Branch child_mux(Cell *top, const SigSpec &sig)
 	{
 		if (GetSize(sig) == 0 || !mux_driver.count(sig[0]))
-			return nullptr;
-		Cell *c = mux_driver.at(sig[0]);
-		if (c == top || removed.count(c) || sigmap(c->getPort(ID::Y)) != sig)
-			return nullptr;
-		for (auto bit : sig)
-			if (users.at(bit) != 1)
-				return nullptr;
-		return c;
+			return {};
+		Cell *c = mux_driver.at(sig[0]).first;
+		if (c == top || reserved.count(c))
+			return {};
+		pool<SigBit> used;
+		Branch branch;
+		branch.cell = c;
+		branch.s = sigmap(c->getPort(ID::S)[0]);
+		SigSpec a = sigmap(c->getPort(ID::A)), b = sigmap(c->getPort(ID::B));
+		for (auto bit : sig) {
+			auto it = mux_driver.find(bit);
+			if (!bit.wire || it == mux_driver.end() || it->second.first != c ||
+					drivers.at(bit) != 1 || users.at(bit) != 1 || !used.insert(bit).second)
+				return {};
+			branch.a.append(a[it->second.second]);
+			branch.b.append(b[it->second.second]);
+		}
+		// 删除子节点时，其余输出位必须已经没有使用者。
+		for (auto bit : sigmap(c->getPort(ID::Y)))
+			if (!bit.wire || drivers.at(bit) != 1 || (!used.count(bit) && users[bit] != 0))
+				return {};
+		return branch;
+	}
+
+	SigBit invert(SigBit bit)
+	{
+		if (bit == State::S0)
+			return State::S1;
+		if (bit == State::S1)
+			return State::S0;
+		return module->Not(NEW_ID, bit);
 	}
 
 	SigBit mux_bit(SigBit s, SigBit lo, SigBit hi)
 	{
+		if (s == State::S0)
+			return lo;
+		if (s == State::S1)
+			return hi;
 		if (lo == hi)
 			return lo;
 		if (lo == State::S0 && hi == State::S1)
 			return s;
 		if (lo == State::S1 && hi == State::S0)
-			return module->Not(NEW_ID, s);
+			return invert(s);
 		if (lo == State::S0)
 			return module->And(NEW_ID, s, hi);
 		if (hi == State::S1)
 			return module->Or(NEW_ID, s, lo);
 		if (hi == State::S0)
-			return module->And(NEW_ID, module->Not(NEW_ID, s), lo);
+			return module->And(NEW_ID, invert(s), lo);
 		if (lo == State::S1)
-			return module->Or(NEW_ID, module->Not(NEW_ID, s), hi);
+			return module->Or(NEW_ID, invert(s), hi);
 		return module->Mux(NEW_ID, lo, hi, s);
 	}
 
-	bool try_merge(Cell *top)
+	// Fig.6(a)-(b)：重复的数据输入表示为选择常量 0 或 1 的虚拟 MUX。
+	bool match_branch(Cell *top, const SigSpec &sig, const SigSpec &a, const SigSpec &b, Branch &branch)
 	{
-		SigSpec y_a = sigmap(top->getPort(ID::A));
-		SigSpec y_b = sigmap(top->getPort(ID::B));
-		SigBit s0 = sigmap(top->getPort(ID::S)[0]);
-		Cell *ca = child_mux(top, y_a);
-		Cell *cb = child_mux(top, y_b);
-		if (ca == nullptr && cb == nullptr)
-			return false;
-		if (ca == cb)
-			return false;
-
-		SigSpec a, b;
-		SigBit ctrl_a, ctrl_b;
-		if (ca != nullptr && cb != nullptr) {
-			SigSpec a1 = sigmap(ca->getPort(ID::A)), b1 = sigmap(ca->getPort(ID::B));
-			SigSpec a2 = sigmap(cb->getPort(ID::A)), b2 = sigmap(cb->getPort(ID::B));
-			SigBit s1 = sigmap(ca->getPort(ID::S)[0]), s2 = sigmap(cb->getPort(ID::S)[0]);
-			if (a1 == b1)
-				return false;
-			a = a1, b = b1, ctrl_a = s1;
-			if (a2 == a1 && b2 == b1)
-				ctrl_b = s2;
-			else if (a2 == b1 && b2 == a1)
-				ctrl_b = module->Not(NEW_ID, s2);
-			else
-				return false;
-		} else {
-			// a plain input equal to one side of the child selects that side constantly
-			Cell *c = ca != nullptr ? ca : cb;
-			SigSpec leaf = ca != nullptr ? y_b : y_a;
-			SigSpec ac = sigmap(c->getPort(ID::A)), bc = sigmap(c->getPort(ID::B));
-			SigBit sc = sigmap(c->getPort(ID::S)[0]);
-			if (ac == bc)
-				return false;
-			SigBit ctrl_leaf;
-			if (leaf == ac)
-				ctrl_leaf = State::S0;
-			else if (leaf == bc)
-				ctrl_leaf = State::S1;
-			else
-				return false;
-			a = ac, b = bc;
-			ctrl_a = ca != nullptr ? sc : ctrl_leaf;
-			ctrl_b = ca != nullptr ? ctrl_leaf : sc;
+		if (sig == a || sig == b) {
+			branch.s = sig == a ? State::S0 : State::S1;
+			return true;
 		}
+		branch = child_mux(top, sig);
+		if (branch.cell == nullptr)
+			return false;
+		if (branch.a == a && branch.b == b)
+			return true;
+		if (branch.a == b && branch.b == a) {
+			branch.inverted = true;
+			return true;
+		}
+		return false;
+	}
 
-		log("  merging %s into %s\n", ca != nullptr && cb != nullptr ?
-				stringf("%s and %s", log_id(ca), log_id(cb)) : log_id(ca != nullptr ? ca : cb), log_id(top));
-		top->setPort(ID::A, a);
-		top->setPort(ID::B, b);
-		top->setPort(ID::S, mux_bit(s0, ctrl_a, ctrl_b));
-		if (ca != nullptr)
-			removed.insert(ca);
-		if (cb != nullptr)
-			removed.insert(cb);
-		return true;
+	void find_combination(Cell *top)
+	{
+		SigSpec lo = sigmap(top->getPort(ID::A)), hi = sigmap(top->getPort(ID::B));
+		for (const auto &sig : {lo, hi}) {
+			Branch child = child_mux(top, sig);
+			if (child.cell == nullptr || child.a == child.b)
+				continue;
+			Combination comb;
+			comb.top = top;
+			comb.a = child.a;
+			comb.b = child.b;
+			comb.s = sigmap(top->getPort(ID::S)[0]);
+			if (!match_branch(top, lo, comb.a, comb.b, comb.lo) ||
+					!match_branch(top, hi, comb.a, comb.b, comb.hi))
+				continue;
+			log_assert(comb.lo.cell != nullptr || comb.hi.cell != nullptr);
+			combinations.push_back(comb);
+			reserved.insert(top);
+			if (comb.lo.cell != nullptr)
+				reserved.insert(comb.lo.cell);
+			if (comb.hi.cell != nullptr)
+				reserved.insert(comb.hi.cell);
+			return;
+		}
 	}
 
 	bool run()
 	{
-		bool did_something = false;
+		// 匹配期间保持连接关系不变，每个单元只参加一次变换。
 		for (auto cell : module->selected_cells())
-			if (cell->type == ID($mux) && !removed.count(cell) && try_merge(cell)) {
-				did_something = true;
-				merged++;
+			if (cell->type == ID($mux) && !cell->get_bool_attribute(ID::keep) && !reserved.count(cell))
+				find_combination(cell);
+		for (const auto &comb : combinations) {
+			// Fig.4、Fig.6(b)-(d)：把数据选择转移到一位控制信号，并化简常量支路。
+			SigBit lo = comb.lo.inverted ? invert(comb.lo.s) : comb.lo.s;
+			SigBit hi = comb.hi.inverted ? invert(comb.hi.s) : comb.hi.s;
+			comb.top->setPort(ID::A, comb.a);
+			comb.top->setPort(ID::B, comb.b);
+			comb.top->setPort(ID::S, mux_bit(comb.s, lo, hi));
+			for (auto child : {comb.lo.cell, comb.hi.cell}) {
+				if (child == nullptr)
+					continue;
+				log("  merging %s into %s\n", log_id(child), log_id(comb.top));
+				module->remove(child);
 			}
-		for (auto cell : removed)
-			module->remove(cell);
-		removed.clear();
-		return did_something;
+		}
+		merged = GetSize(combinations);
+		return merged != 0;
 	}
 };
 
@@ -147,7 +196,6 @@ struct OptMuxcombPass : public Pass {
 	OptMuxcombPass() : Pass("opt_muxcomb", "merge $mux cells that select between the same pair of inputs") { }
 	void help() override
 	{
-		//   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
 		log("\n");
 		log("    opt_muxcomb [selection]\n");
 		log("\n");
@@ -158,13 +206,20 @@ struct OptMuxcombPass : public Pass {
 		log("\n");
 		log("    s0 ? (s2 ? b : a) : (s1 ? b : a)  =>  (s0 ? s2 : s1) ? b : a\n");
 		log("\n");
-		log("An input that is 'a' or 'b' itself selects it with a constant, so the select\n");
-		log("logic becomes an AND, OR or NOT gate, e.g.:\n");
+		log("Fig.6 treats a repeated data input as a virtual mux with a constant select.\n");
+		log("Combining it with the other branch produces these four equivalent forms:\n");
 		log("\n");
 		log("    s0 ? b : (s1 ? b : a)  =>  (s0 | s1) ? b : a\n");
+		log("    s0 ? a : (s1 ? b : a)  =>  (~s0 & s1) ? b : a\n");
+		log("    s0 ? (s1 ? b : a) : a  =>  (s0 & s1) ? b : a\n");
+		log("    s0 ? (s1 ? b : a) : b  =>  (~s0 | s1) ? b : a\n");
 		log("\n");
-		log("Children are only merged if they feed nothing else. The rewrite is repeated\n");
-		log("until no more cells can be merged, so whole mux trees are folded bottom-up.\n");
+		log("Both input orders, aliases, output slices and bit permutations are supported.\n");
+		log("Only selected cells without 'keep' are combined. Removed children must have\n");
+		log("unique output drivers and feed only their parent; unused output bits are OK.\n");
+		log("The rewrite repeats until no combinations remain. Modules with processes\n");
+		log("are skipped. Run before opt_muxtree and opt_expr to simplify the resulting\n");
+		log("control trees as described in Fig.5 and Fig.7.\n");
 		log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
@@ -173,7 +228,9 @@ struct OptMuxcombPass : public Pass {
 		extra_args(args, 1, design);
 
 		int merged = 0;
-		for (auto module : design->selected_modules())
+		for (auto module : design->selected_modules()) {
+			if (module->has_processes_warn())
+				continue;
 			while (true) {
 				OptMuxcombWorker worker(module);
 				bool did_something = worker.run();
@@ -181,7 +238,10 @@ struct OptMuxcombPass : public Pass {
 				if (!did_something)
 					break;
 			}
+		}
 
+		if (merged)
+			design->scratchpad_set_bool("opt.did_something", true);
 		log("Merged %d $mux combinations.\n", merged);
 	}
 } OptMuxcombPass;
