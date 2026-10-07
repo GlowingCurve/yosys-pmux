@@ -1,6 +1,7 @@
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
 #include "passes/opt/muxtree_index.h"
+#include "passes/opt/muxledger.h"
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
@@ -8,7 +9,7 @@ PRIVATE_NAMESPACE_BEGIN
 // smaRTLy section III: a muxtree whose control ports are eq/logic_not/reduce_or of a few
 // signal bits is a function from those bits to the leaf data words. Build its ADD with the
 // heuristic "split on the bit that minimizes the terminal kinds of both children" and
-// replace the tree when the ADD needs fewer mux bits than the tree and its comparators.
+// replace the tree when the shared mux ledger reports a positive gain.
 static const int TERM_DC = -1;
 static const int TERM_CONFLICT = -2;
 
@@ -29,6 +30,8 @@ struct RebuildWorker
 	SigMap &sigmap;
 	Module *module;
 	int max_vars;
+	bool dry_run;
+	bool force;
 
 	// 当前树
 	vector<TreeNode> nodes;
@@ -48,9 +51,12 @@ struct RebuildWorker
 	dict<std::pair<vector<int>, vector<int>>, int> build_cache;
 
 	int rebuilt = 0;
+	// 已输出的候选记录序号，从 1 开始，按模块内记录的先后递增
+	int cand = 0;
 
-	RebuildWorker(MuxTreeIndex &idx, int max_vars) :
-			idx(idx), sigmap(idx.sigmap), module(idx.module), max_vars(max_vars) { }
+	RebuildWorker(MuxTreeIndex &idx, int max_vars, bool dry_run, bool force) :
+			idx(idx), sigmap(idx.sigmap), module(idx.module), max_vars(max_vars),
+			dry_run(dry_run), force(force) { }
 
 	int term_id(const SigSpec &sig)
 	{
@@ -251,7 +257,9 @@ struct RebuildWorker
 				}
 				((m >> k) & 1 ? hi : lo)[rest] = table[m];
 			}
-			int cost = kinds(lo) + kinds(hi);
+			int lo_kinds = kinds(lo), hi_kinds = kinds(hi);
+			// 某一侧的叶子种类数小于 2 时，build() 为这一侧返回叶子，它不会再新增节点
+			int cost = (lo_kinds < 2 ? 0 : lo_kinds) + (hi_kinds < 2 ? 0 : hi_kinds);
 			if (best < 0 || cost < best_cost) {
 				best = k;
 				best_cost = cost;
@@ -285,42 +293,12 @@ struct RebuildWorker
 		return count;
 	}
 
-	// 只被树和其他可删除控制单元使用的控制单元会在重建后失去全部使用者
-	int removable_ctrl_cost()
+	// 输出一条候选记录：前缀固定，空格分隔 k=v
+	void log_candidate(int cand, const char *decision, int64_t gain, int64_t removed, int64_t dead, int64_t added, const char *note)
 	{
-		pool<Cell *> removable = ctrl_cells;
-		for (bool changed = true; changed;) {
-			changed = false;
-			for (auto cell : ctrl_cells) {
-				if (!removable.count(cell))
-					continue;
-				bool ok = true;
-				for (auto bit : sigmap(cell->getPort(ID::Y))) {
-					if (idx.port_bits.count(bit))
-						ok = false;
-					auto uit = idx.users.find(bit);
-					if (uit != idx.users.end())
-						for (auto user : uit->second)
-							if (!tree_cells.count(user) && !removable.count(user))
-								ok = false;
-				}
-				if (!ok) {
-					removable.erase(cell);
-					changed = true;
-				}
-			}
-		}
-		int cost = 0;
-		for (auto cell : removable) {
-			int width = 0;
-			for (auto bit : sigmap(cell->getPort(ID::A)))
-				width += bit.wire != nullptr;
-			if (cell->hasPort(ID::B))
-				for (auto bit : sigmap(cell->getPort(ID::B)))
-					width += bit.wire != nullptr;
-			cost += std::max(width - 1, 0);
-		}
-		return cost;
+		log("MUXLEDGER pass=opt_muxrebuild module=%s cand=%d decision=%s gain=%lld removed=%lld dead=%lld added=%lld note=%s\n",
+				log_id(module), cand, decision, (long long)gain, (long long)removed, (long long)dead,
+				(long long)added, note);
 	}
 
 	SigSpec emit(int n, int width, dict<int, SigSpec> &emitted)
@@ -361,25 +339,31 @@ struct RebuildWorker
 		build_cache.clear();
 
 		collect(root);
-		if (GetSize(nodes) < 2 && (root->type == ID($mux) || mux_port_count(root) < 3))
+		if (GetSize(nodes) < 2 && mux_port_count(root) < 3)
 			return;
 
-		for (auto &tn : nodes) {
+		for (auto &tn : nodes)
 			for (auto bit : sigmap(tn.cell->getPort(ID::S)))
 				classify(bit);
-			if (!ctrl_ok)
-				return;
-		}
+		// 控制位与树单元无关的树不在本 Pass 的处理范围内，变量数超限只在有控制单元时才算候选
 		if (ctrl_cells.empty() || vars.empty())
 			return;
+		if (!ctrl_ok) {
+			cand++;
+			log_candidate(cand, "infeasible", 0, 0, 0, 0, "too_wide");
+			return;
+		}
 
 		int nv = GetSize(vars);
 		vector<int> table(1 << nv);
 		for (int mask = 0; mask < (1 << nv); mask++) {
 			memo.clear();
 			table[mask] = eval_tree(0, mask);
-			if (table[mask] == TERM_CONFLICT)
+			if (table[mask] == TERM_CONFLICT) {
+				cand++;
+				log_candidate(cand, "infeasible", 0, 0, 0, 0, "conflict");
 				return;
+			}
 		}
 
 		vector<int> vlist;
@@ -390,18 +374,52 @@ struct RebuildWorker
 			return;
 
 		int width = mux_width(root);
-		int removed_cost = removable_ctrl_cost();
-		int old_mux_cost = 0;
+		MuxLedger ledger(module);
 		for (auto &tn : nodes)
-			old_mux_cost += 3 * width * (mux_port_count(tn.cell) - 1);
-		int old_cost = old_mux_cost + removed_cost;
-		int new_cost = 3 * width * count_muxes(add_root);
+			ledger.drop_cell(tn.cell);
+		// 新的决策图会用到这些数据字与控制位，不占用它们会让死亡传播把驱动单元误判成死亡
+		for (auto &term : terms)
+			ledger.acquire(term);
+		for (auto &var : vars)
+			ledger.acquire(var);
+		// 树单元的删除所得与账本口径一致，按同样的 cell_cost 单独求和
+		int64_t removed_mux = 0;
+		for (auto &tn : nodes)
+			removed_mux += MuxLedger::cell_cost(tn.cell);
+		int64_t added_mux = (int64_t)count_muxes(add_root) * width;
+		ledger.add_cost(added_mux);
+		int64_t removed_ctrl = ledger.dead_cost();
+		int64_t gain = ledger.net_gain();
 
-		log_debug("  root %s: %d vars, old cost %d, new cost %d\n", log_id(root), nv, old_cost, new_cost);
-		if (new_cost >= old_cost)
-			return;
-		// 论文的 Check：比较器全部保留时，mux 位数至少减半才值得改变树的结构
-		if (removed_cost == 0 && 2 * new_cost > old_mux_cost)
+		log_debug("  root %s: %d vars, removed %lld, dead %lld, added %lld, gain %lld\n",
+				log_id(root), nv, (long long)removed_mux, (long long)removed_ctrl,
+				(long long)added_mux, (long long)gain);
+
+		bool rebuild;
+		const char *decision;
+		const char *note;
+		if (force) {
+			// -force 忽略门槛，可以评估的候选全部施加
+			rebuild = true;
+			decision = "forced";
+			note = "kept";
+		} else if (gain <= 0) {
+			rebuild = false;
+			decision = "reject";
+			note = "no_gain";
+		} else if (removed_ctrl == 0 && 2 * added_mux > removed_mux) {
+			// 论文的 Check：比较器全部保留时，mux 位数至少减半才值得改变树的结构
+			rebuild = false;
+			decision = "reject";
+			note = "half_rule";
+		} else {
+			rebuild = true;
+			decision = "accept";
+			note = "kept";
+		}
+		cand++;
+		log_candidate(cand, decision, gain, removed_mux, removed_ctrl, added_mux, note);
+		if (!rebuild)
 			return;
 
 		Plan plan;
@@ -412,8 +430,8 @@ struct RebuildWorker
 		plans.push_back(plan);
 		plan_vars.push_back(vars);
 		plan_terms.push_back(terms);
-		log("  rebuilding %s: %d mux cells, %d vars, cost %d -> %d\n",
-				log_id(root), GetSize(nodes), nv, old_cost, new_cost);
+		log("  accepted %s: %d mux cells, %d vars, ledger gain %lld\n",
+				log_id(root), GetSize(nodes), nv, (long long)gain);
 	}
 
 	vector<vector<SigBit>> plan_vars;
@@ -421,6 +439,8 @@ struct RebuildWorker
 
 	void apply()
 	{
+		if (dry_run)
+			return;
 		for (int i = 0; i < GetSize(plans); i++) {
 			Plan &plan = plans[i];
 			vars = plan_vars[i];
@@ -448,18 +468,35 @@ struct OptMuxRebuildPass : public Pass {
 		log("few signal bits by $eq/$ne/$logic_not/$reduce_or/$reduce_bool/$not cells. The\n");
 		log("tree is evaluated for every assignment of those bits and the resulting function\n");
 		log("is rebuilt as an algebraic decision diagram of $mux cells. At every node the bit\n");
-		log("that minimizes the number of distinct leaves of both children is selected. The\n");
-		log("tree is replaced when the new mux bits cost less than the old mux bits together\n");
-		log("with the comparators that lose all their users. When no comparator is removed,\n");
-		log("the new mux bits must be at most half of the old mux bits.\n");
+		log("that minimizes the number of distinct leaves of both children is selected.\n");
+		log("\n");
+		log("Every candidate is settled with the shared mux ledger. The tree cells, the data\n");
+		log("words and the control bits of the new diagram and the new $mux cells are booked\n");
+		log("with one cost model, and the comparators that lose all their users follow from\n");
+		log("the dead propagation of the ledger. The tree is replaced when the ledger gain is\n");
+		log("positive. When no comparator is removed, the new mux bits must be at most half\n");
+		log("of the old mux bits. Each candidate is reported on a line starting with\n");
+		log("\"MUXLEDGER\".\n");
 		log("\n");
 		log("    -max_vars <n>\n");
 		log("        maximum number of control variables of a tree (default 10)\n");
+		log("\n");
+		log("    -dry-run\n");
+		log("        analyze every candidate and print its ledger record without modifying the\n");
+		log("        design\n");
+		log("\n");
+		log("    -force\n");
+		log("        ignore the gain threshold and the half rule and rebuild every candidate\n");
+		log("        that can be evaluated; those records use decision=forced. A candidate\n");
+		log("        with too many control variables or with conflicting leaf values stays\n");
+		log("        infeasible. Given together with -dry-run, the pass behaves as with\n");
+		log("        -dry-run alone.\n");
 		log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
 		int max_vars = 10;
+		bool dry_run = false, force = false;
 
 		log_header(design, "Executing OPT_MUXREBUILD pass (rebuild muxtrees as decision diagrams).\n");
 
@@ -467,21 +504,41 @@ struct OptMuxRebuildPass : public Pass {
 		for (argidx = 1; argidx < args.size(); argidx++) {
 			if (args[argidx] == "-max_vars" && argidx + 1 < args.size()) {
 				max_vars = atoi(args[++argidx].c_str());
+				if (max_vars < 1)
+					log_error("Invalid -max_vars value \"%s\": need at least one control variable.\n", args[argidx].c_str());
+				// 真值表有 2^n 项，n 超过 30 时 1 << n 在 int 中溢出
+				if (max_vars > 30)
+					log_error("Invalid -max_vars value \"%s\": 1 << n overflows an int.\n", args[argidx].c_str());
+				continue;
+			}
+			if (args[argidx] == "-dry-run") {
+				dry_run = true;
+				continue;
+			}
+			if (args[argidx] == "-force") {
+				force = true;
 				continue;
 			}
 			break;
 		}
 		extra_args(args, argidx, design);
 
+		// 两个选项同时给出时按 -dry-run 处理，-force 不参与判断
+		if (dry_run)
+			force = false;
+
 		for (auto module : design->selected_modules()) {
 			if (module->has_processes_warn())
 				continue;
 			MuxTreeIndex idx(module);
-			RebuildWorker worker(idx, max_vars);
+			RebuildWorker worker(idx, max_vars, dry_run, force);
 			for (auto root : idx.roots)
 				worker.analyze(root);
 			worker.apply();
-			log("  %s: rebuilt %d muxtrees.\n", log_id(module), worker.rebuilt);
+			if (dry_run)
+				log("  %s: dry run, %d muxtrees would be rebuilt.\n", log_id(module), GetSize(worker.plans));
+			else
+				log("  %s: rebuilt %d muxtrees.\n", log_id(module), worker.rebuilt);
 		}
 	}
 } OptMuxRebuildPass;

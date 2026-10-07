@@ -2,6 +2,7 @@
 #include "kernel/sigtools.h"
 #include "kernel/satgen.h"
 #include "passes/opt/muxtree_index.h"
+#include "passes/opt/muxledger.h"
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
@@ -9,6 +10,9 @@ PRIVATE_NAMESPACE_BEGIN
 // smaRTLy section II: walk each muxtree from the root, collect the control values implied
 // by the path, and prove further control/data bits constant on a small sub-graph with
 // inference rules first and SAT second
+//
+// 每一处改写都先用 MuxLedger 结算收益，账本判定收益为正才施加，-force 时无条件施加；
+// SAT 求解的传播步数受 opt_muxinfer.sat_effort 限制，预算耗尽之后不再发起新的求解
 struct Cone {
 	pool<SigBit> bits;
 	pool<Cell *> cells;
@@ -20,6 +24,12 @@ struct InferWorker
 	SigMap &sigmap;
 	int max_depth, max_cells, max_inputs;
 	bool infer_data;
+	bool dry_run;        // 只做遍历、推断与记录，不改写模块
+	bool force;          // 忽略账本门槛，施加全部改写
+	int64_t sat_effort;  // SAT 求解的传播步数预算，0 表示不限
+	int64_t sat_spent = 0;
+	bool solve_budget_abort = false;  // 本次求解是否达到传播步数上限而放弃
+	bool infer_budget_abort = false;  // 本次推断是否因为预算而返回 -1
 
 	dict<SigBit, Cone> cone_cache;
 
@@ -27,12 +37,19 @@ struct InferWorker
 	dict<std::pair<Cell *, int>, bool> sel_fix;
 	// (cell, data port, offset) -> constant value
 	dict<std::tuple<Cell *, IdString, int>, bool> data_fix;
+	// 推断因为预算耗尽而放弃的候选：选择位按单元记录，数据位按 (单元, 端口) 记录
+	pool<Cell *> sel_budget;
+	pool<std::pair<Cell *, IdString>> data_budget;
 
 	int sat_calls = 0, rule_hits = 0, sat_hits = 0;
+	int rewrites = 0;       // 已经施加（dry_run 时为账本预测会施加）的改写次数
+	int removed_cells = 0;  // 账本预测删除的单元数
 
-	InferWorker(MuxTreeIndex &idx, int max_depth, int max_cells, int max_inputs, bool infer_data) :
+	InferWorker(MuxTreeIndex &idx, int max_depth, int max_cells, int max_inputs, bool infer_data,
+			bool dry_run, bool force, int64_t sat_effort) :
 			idx(idx), sigmap(idx.sigmap), max_depth(max_depth), max_cells(max_cells),
-			max_inputs(max_inputs), infer_data(infer_data) { }
+			max_inputs(max_inputs), infer_data(infer_data), dry_run(dry_run), force(force),
+			sat_effort(sat_effort) { }
 
 	// 从 bit 向输入方向展开 max_depth 层组合逻辑，得到 bit 的祖先集合
 	const Cone &cone(SigBit bit)
@@ -354,9 +371,38 @@ struct InferWorker
 		return -1;
 	}
 
+	// 预算是否已经用尽
+	bool budget_spent()
+	{
+		return sat_effort > 0 && sat_spent >= sat_effort;
+	}
+
+	// 在剩余预算内求解一次。预算已经用尽、或者本次求解达到传播步数上限而放弃时，
+	// 把 solve_budget_abort 置位并返回假；达到上限的求解结果不可信，调用者必须放弃整次推断
+	bool solve_with_budget(ezSAT *ez, const std::vector<int> &model_exprs, std::vector<bool> &model_values,
+			const std::vector<int> &assumptions)
+	{
+		solve_budget_abort = false;
+		if (budget_spent()) {
+			solve_budget_abort = true;
+			return false;
+		}
+
+		if (sat_effort > 0)
+			ez->setSolverPropLimit(sat_effort - sat_spent);
+		bool result = ez->solve(model_exprs, model_values, assumptions);
+		if (sat_effort > 0) {
+			sat_spent += ez->getSolverProps();
+			if (ez->getSolverPropLimitStatus())
+				solve_budget_abort = true;
+		}
+		return result;
+	}
+
 	// 在 known 条件下 target 是否恒为常量
 	int infer(SigBit target, const dict<SigBit, bool> &known)
 	{
+		infer_budget_abort = false;
 		target = sigmap(target);
 		if (!target.wire)
 			return target == State::S0 ? 0 : target == State::S1 ? 1 : -1;
@@ -420,6 +466,12 @@ struct InferWorker
 		if (GetSize(inputs) > max_inputs)
 			return -1;
 
+		// 预算已经用尽：不再发起新的 SAT 调用，也不构造求解器
+		if (budget_spent()) {
+			infer_budget_abort = true;
+			return -1;
+		}
+
 		sat_calls++;
 		ezSatPtr ez;
 		SatGen satgen(ez.get(), &sigmap);
@@ -436,9 +488,17 @@ struct InferWorker
 		vector<int> model_exprs;
 		vector<bool> model_values;
 		assumptions.push_back(t);
-		bool can_one = ez->solve(model_exprs, model_values, assumptions);
+		bool can_one = solve_with_budget(ez.get(), model_exprs, model_values, assumptions);
+		if (solve_budget_abort) {
+			infer_budget_abort = true;
+			return -1;
+		}
 		assumptions.back() = ez->NOT(t);
-		bool can_zero = ez->solve(model_exprs, model_values, assumptions);
+		bool can_zero = solve_with_budget(ez.get(), model_exprs, model_values, assumptions);
+		if (solve_budget_abort) {
+			infer_budget_abort = true;
+			return -1;
+		}
 		if (can_one && can_zero)
 			return -1;
 		sat_hits++;
@@ -469,6 +529,8 @@ struct InferWorker
 			int v = infer(bit, known);
 			if (v >= 0)
 				data_fix[std::make_tuple(cell, port, base + i)] = v;
+			else if (infer_budget_abort)
+				data_budget.insert({cell, port});
 		}
 	}
 
@@ -482,6 +544,8 @@ struct InferWorker
 				visit_port(cell, v, known);
 				return;
 			}
+			if (s.wire && infer_budget_abort)
+				sel_budget.insert(cell);
 			for (int side = 0; side < 2; side++) {
 				dict<SigBit, bool> sub = known;
 				if (s.wire)
@@ -499,6 +563,8 @@ struct InferWorker
 			sv[i] = s[i].wire ? infer(s[i], known) : -1;
 			if (sv[i] >= 0)
 				sel_fix[{cell, i}] = sv[i];
+			else if (s[i].wire && infer_budget_abort)
+				sel_budget.insert(cell);
 			ones += sv[i] == 1;
 			zeros += sv[i] == 0;
 		}
@@ -519,41 +585,113 @@ struct InferWorker
 		}
 	}
 
+	// 输出一条候选记录：前缀固定，空格分隔 k=v
+	void log_candidate(int cand, const char *decision, int64_t gain, int64_t removed, int64_t dead, int64_t added, const char *note)
+	{
+		log("MUXLEDGER pass=opt_muxinfer module=%s cand=%d decision=%s gain=%lld removed=%lld dead=%lld added=%lld note=%s\n",
+				log_id(idx.module), cand, decision, (long long)gain, (long long)removed, (long long)dead,
+				(long long)added, note);
+	}
+
+	// 整只删除一个 mux 单元：账本记入删除所得并释放输入端口，保留的那一段数据重新占用。
+	// 收益至少是 WIDTH，账本不会判定没有收益；dry_run 时只结算与记录
+	void apply_drop(Cell *cell, const SigSpec &kept, int cand)
+	{
+		MuxLedger ledger(idx.module);
+		ledger.drop_cell(cell);
+		ledger.acquire(kept);
+		int64_t dead = ledger.dead_cost();
+		int64_t gain = ledger.net_gain();
+		int64_t removed = MuxLedger::cell_cost(cell);
+
+		log_candidate(cand, force ? "forced" : "accept", gain, removed, dead, 0, "kept");
+		rewrites++;
+		removed_cells++;
+		if (dry_run)
+			return;
+		idx.module->connect(cell->getPort(ID::Y), kept);
+		idx.module->remove(cell);
+	}
+
 	void apply()
 	{
 		Module *module = idx.module;
+		int cand = 0;
 
-		for (auto &it : data_fix) {
-			Cell *cell = std::get<0>(it.first);
-			IdString port = std::get<1>(it.first);
-			SigSpec sig = cell->getPort(port);
-			sig[std::get<2>(it.first)] = it.second ? State::S1 : State::S0;
-			cell->setPort(port, sig);
+		// 数据位改写按 (单元, 端口) 分组：一组一次决策、一次端口写回。
+		// 端口值里被换成常量的位释放出去，收益来自因此失去全部使用者的驱动单元
+		dict<std::pair<Cell *, IdString>, vector<std::pair<int, bool>>> by_port;
+		for (auto &it : data_fix)
+			by_port[{std::get<0>(it.first), std::get<1>(it.first)}].push_back({std::get<2>(it.first), it.second});
+
+		for (auto &it : by_port) {
+			Cell *cell = it.first.first;
+			IdString port = it.first.second;
+			cand++;
+
+			SigSpec old_sig = cell->getPort(port);
+			SigSpec new_sig = old_sig;
+			for (auto &bit : it.second)
+				new_sig[bit.first] = bit.second ? State::S1 : State::S0;
+
+			// 端口旧值的信号位释放掉，改写后的端口值重新占用；单元本身代价不变
+			MuxLedger ledger(module);
+			ledger.drop_port(cell, port);
+			ledger.acquire(new_sig);
+			int64_t dead = ledger.dead_cost();
+			int64_t gain = ledger.net_gain();
+			bool enough = gain > 0;
+
+			log_candidate(cand, force ? "forced" : (enough ? "accept" : "reject"), gain, 0, dead, 0,
+					enough ? "kept" : "no_gain");
+			if (dry_run || !(enough || force))
+				continue;
+			cell->setPort(port, new_sig);
+			rewrites++;
+		}
+
+		// 数据位推断因为预算耗尽而没有结论的候选
+		for (auto &it : data_budget) {
+			if (by_port.count(it))
+				continue;
+			cand++;
+			log_candidate(cand, "reject", 0, 0, 0, 0, "budget");
 		}
 
 		dict<Cell *, vector<std::pair<int, bool>>> by_cell;
 		for (auto &it : sel_fix)
 			by_cell[it.first.first].push_back({it.first.second, it.second});
+		// 选择位推断因为预算耗尽而没有结论的单元，候选列表里记为没有可用结论
+		for (auto cell : sel_budget)
+			if (!by_cell.count(cell))
+				by_cell[cell] = vector<std::pair<int, bool>>();
 
 		for (auto &it : by_cell) {
 			Cell *cell = it.first;
+			vector<std::pair<int, bool>> &fixes = it.second;
+			cand++;
+
+			if (fixes.empty()) {
+				log_candidate(cand, "reject", 0, 0, 0, 0, "budget");
+				continue;
+			}
+
 			if (cell->type == ID($mux)) {
-				bool v = it.second[0].second;
-				module->connect(cell->getPort(ID::Y), cell->getPort(v ? ID::B : ID::A));
-				module->remove(cell);
+				bool select_value = fixes[0].second;
+				apply_drop(cell, cell->getPort(select_value ? ID::B : ID::A), cand);
 				continue;
 			}
 
 			int width = mux_width(cell);
-			SigSpec s = cell->getPort(ID::S);
-			SigSpec b = cell->getPort(ID::B);
+			SigSpec old_select = cell->getPort(ID::S);
+			SigSpec old_data = cell->getPort(ID::B);
 			dict<int, bool> fixed;
-			for (auto &f : it.second)
-				fixed[f.first] = f.second;
+			for (auto &fix : fixes)
+				fixed[fix.first] = fix.second;
 
 			int ones = 0, one_index = -1;
 			bool all_known = true;
-			for (int i = 0; i < GetSize(s); i++) {
+			for (int i = 0; i < GetSize(old_select); i++) {
 				if (!fixed.count(i))
 					all_known = false;
 				else if (fixed[i]) {
@@ -561,35 +699,49 @@ struct InferWorker
 					one_index = i;
 				}
 			}
-			if (all_known && ones == 0) {
-				module->connect(cell->getPort(ID::Y), cell->getPort(ID::A));
-				module->remove(cell);
-				continue;
-			}
-			if (all_known && ones == 1) {
-				module->connect(cell->getPort(ID::Y), b.extract(one_index * width, width));
-				module->remove(cell);
+
+			// 选择位全已知：没有 1 时整只单元等价于 A，恰好一个 1 时等价于那一段 B
+			if (all_known && ones <= 1) {
+				SigSpec kept = ones == 0 ? cell->getPort(ID::A) : old_data.extract(one_index * width, width);
+				apply_drop(cell, kept, cand);
 				continue;
 			}
 
 			// 删除恒为 0 的选择位，其余选择位保持原样
-			SigSpec new_s, new_b;
-			for (int i = 0; i < GetSize(s); i++) {
+			SigSpec new_select, new_data;
+			for (int i = 0; i < GetSize(old_select); i++) {
 				if (fixed.count(i) && !fixed[i])
 					continue;
-				new_s.append(s[i]);
-				new_b.append(b.extract(i * width, width));
+				new_select.append(old_select[i]);
+				new_data.append(old_data.extract(i * width, width));
 			}
-			if (GetSize(new_s) == GetSize(s))
-				continue;
-			if (GetSize(new_s) == 0) {
-				module->connect(cell->getPort(ID::Y), cell->getPort(ID::A));
-				module->remove(cell);
+			// 选择位全部为 0 时等价于整只删除，上面的分支已经覆盖，这里兜底
+			if (GetSize(new_select) == 0) {
+				apply_drop(cell, cell->getPort(ID::A), cand);
 				continue;
 			}
-			cell->setPort(ID::S, new_s);
-			cell->setPort(ID::B, new_b);
-			cell->setParam(ID::S_WIDTH, GetSize(new_s));
+
+			// $pmux 的代价是 WIDTH * (S_WIDTH - 1)，选择位变短省下的部分记入减少所得
+			MuxLedger ledger(module);
+			ledger.drop_port(cell, ID::S);
+			ledger.drop_port(cell, ID::B);
+			ledger.acquire(new_select);
+			ledger.acquire(new_data);
+			ledger.sub_cost((int64_t)width * (GetSize(old_select) - GetSize(new_select)));
+			int64_t dead = ledger.dead_cost();
+			int64_t gain = ledger.net_gain();
+			bool enough = gain > 0;
+			// 已知的选择位全部为 1 时长度没有变化，账本判定收益为零
+			bool changed = GetSize(new_select) != GetSize(old_select);
+
+			log_candidate(cand, force ? "forced" : (enough ? "accept" : "reject"), gain, 0, dead, 0,
+					enough ? "kept" : "no_gain");
+			if (dry_run || !(enough || force) || !changed)
+				continue;
+			cell->setPort(ID::S, new_select);
+			cell->setPort(ID::B, new_data);
+			cell->setParam(ID::S_WIDTH, GetSize(new_select));
+			rewrites++;
 		}
 	}
 };
@@ -608,6 +760,10 @@ struct OptMuxInferPass : public Pass {
 		log("sub-graph made of the cones of the target bit and of the related known bits,\n");
 		log("first by constant propagation rules and then by a SAT solver.\n");
 		log("\n");
+		log("Every rewrite is priced with a ledger of the signal bits that lose or gain a\n");
+		log("user, and is applied only when the predicted gain is positive. Each candidate\n");
+		log("is reported on a line starting with \"MUXLEDGER\".\n");
+		log("\n");
 		log("    -depth <n>\n");
 		log("        number of logic levels in the cone of each bit (default 6)\n");
 		log("\n");
@@ -620,11 +776,25 @@ struct OptMuxInferPass : public Pass {
 		log("    -nodata\n");
 		log("        only infer control bits, keep data bits unchanged\n");
 		log("\n");
+		log("    -dry-run\n");
+		log("        traverse and infer, report every candidate, leave the module unchanged\n");
+		log("\n");
+		log("    -force\n");
+		log("        ignore the ledger threshold and apply every rewrite, reported with\n");
+		log("        decision=forced; given together with -dry-run the module stays unchanged\n");
+		log("\n");
+		log("The solver effort is limited by the number of solver propagation steps held in\n");
+		log("the scratchpad key opt_muxinfer.sat_effort (default 1000000000, 0 means\n");
+		log("unlimited). Once the budget is used up no further SAT call is made and the\n");
+		log("remaining candidates are left unproven.\n");
+		log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
 		int max_depth = 6, max_cells = 64, max_inputs = 64;
 		bool infer_data = true;
+		bool dry_run = false, force = false;
+		int64_t sat_effort = design->scratchpad_get_int("opt_muxinfer.sat_effort", 1000000000);
 
 		log_header(design, "Executing OPT_MUXINFER pass (path condition inference on muxtrees).\n");
 
@@ -646,21 +816,40 @@ struct OptMuxInferPass : public Pass {
 				infer_data = false;
 				continue;
 			}
+			if (args[argidx] == "-dry-run") {
+				dry_run = true;
+				continue;
+			}
+			if (args[argidx] == "-force") {
+				force = true;
+				continue;
+			}
 			break;
 		}
 		extra_args(args, argidx, design);
+
+		// 同时给出 -dry-run 与 -force 时按 -dry-run 处理
+		if (dry_run)
+			force = false;
 
 		for (auto module : design->selected_modules()) {
 			if (module->has_processes_warn())
 				continue;
 			MuxTreeIndex idx(module);
-			InferWorker worker(idx, max_depth, max_cells, max_inputs, infer_data);
+			InferWorker worker(idx, max_depth, max_cells, max_inputs, infer_data, dry_run, force, sat_effort);
 			for (auto root : idx.roots)
 				worker.visit(root, dict<SigBit, bool>());
-			log("  %s: %d control bits and %d data bits fixed (%d by rules, %d by %d SAT calls).\n",
-					log_id(module), GetSize(worker.sel_fix), GetSize(worker.data_fix),
-					worker.rule_hits, worker.sat_hits, worker.sat_calls);
 			worker.apply();
+
+			std::string effort;
+			if (sat_effort > 0)
+				effort = stringf("sat effort %lld of %lld left", (long long)std::max<int64_t>(sat_effort - worker.sat_spent, 0),
+						(long long)sat_effort);
+			else
+				effort = "sat effort unlimited";
+			log("  %s: %d rewrites, ledger predicted %d removed cells, %d rule hits, %d sat hits, %d sat calls, %s.\n",
+					log_id(module), worker.rewrites, worker.removed_cells,
+					worker.rule_hits, worker.sat_hits, worker.sat_calls, effort.c_str());
 		}
 	}
 } OptMuxInferPass;

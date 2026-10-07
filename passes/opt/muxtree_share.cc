@@ -1,5 +1,6 @@
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
+#include "passes/opt/muxledger.h"
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
@@ -93,10 +94,24 @@ struct MuxtreeShareWorker
 	Module *module;
 	SigMap sigmap;
 	dict<SigBit, Cell*> driver;
-	int shared_pairs = 0;
-	int saved_muxes = 0;
+	bool dry_run;                 // 只做匹配与账本结算，不改动模块
+	bool force;                   // 取消 gain 大于零的门槛，全部候选都参与配对
+	int shared_pairs = 0;         // 被选中并施加的候选个数
+	int candidate_count = 0;      // 枚举出的候选个数
+	int64_t predicted_gain = 0;   // 选中候选的账本收益之和
 
-	MuxtreeShareWorker(Module *module) : module(module)
+	// 一个 (p, q, j) 候选的结算记录，最后逐行输出
+	struct Candidate {
+		int p, q, j;
+		int64_t gain;      // 账本收益：删除所得 + 连带死亡所得 - 共享树代价
+		int64_t removed;   // 删除所得，两个 $pmux 的代价之和
+		int64_t dead;      // 连带死亡所得，失去全部使用者的单元代价之和
+		int64_t added;     // 共享树的代价，按字级 mux 个数折算
+		const char *decision = "reject";
+		const char *note = "no_gain";
+	};
+
+	MuxtreeShareWorker(Module *module, bool dry_run, bool force) : module(module), dry_run(dry_run), force(force)
 	{
 		dict<std::pair<SigSpec, int>, vector<PmuxTable>> groups;
 		update_index();
@@ -203,20 +218,6 @@ struct MuxtreeShareWorker
 		return true;
 	}
 
-	// the plain mux trees of p and q, built in one DAG so identical subtrees are counted once
-	int plain_cost(const PmuxTable &p, const PmuxTable &q)
-	{
-		MuxDag dag;
-		vector<int> dp, dq;
-		for (auto &sig : p.data)
-			dp.push_back(dag.leaf(sig));
-		for (auto &sig : q.data)
-			dq.push_back(dag.leaf(sig));
-		dag.tree(dp, p.base);
-		dag.tree(dq, q.base);
-		return dag.mux_count;
-	}
-
 	// q(v) == p(v ^ 2^j) for most v: select the common words with the other bits, then swap on bit j
 	std::pair<int, int> share(MuxDag &dag, const PmuxTable &p, const PmuxTable &q, int j)
 	{
@@ -287,40 +288,100 @@ struct MuxtreeShareWorker
 		return !depends_on(p_data, q_y) && !depends_on(q_data, p_y);
 	}
 
+	// 枚举同一组内的全部 (p, q, j) 候选，用账本结算每个候选的收益，再按收益降序贪心配对。
+	// 账本把拆除两个 $pmux 的所得、驱动它们选择端的 $eq/$logic_not 失去全部使用者之后的
+	// 所得、以及共享树新增的代价放在一起比较，其中死亡比较器这一笔正是字级 mux 计数漏掉的。
 	void share_group(const vector<PmuxTable> &tables)
 	{
-		// (gain, p, q, j), larger gain first
-		vector<std::tuple<int, int, int, int>> candidates;
 		int n = GetSize(tables[0].base);
+
+		vector<Candidate> rows;
 		for (int p = 0; p < GetSize(tables); p++)
 		for (int q = p + 1; q < GetSize(tables); q++) {
-			int plain = plain_cost(tables[p], tables[q]);
+			// 一对 (p, q) 新建一个账本：计划删除两个 $pmux，共享树接管两者的全部数据字与 base。
+			// 账本自己不建 sigmap，acquire 进来的是解码时已经做过 sigmap 的 tables，删除与释放
+			// 走的是单元端口上的原始信号位，与 muxledger.h 的约定一致。
+			MuxLedger ledger(module);
+			ledger.drop_cell(tables[p].cell);
+			ledger.drop_cell(tables[q].cell);
+			for (auto &sig : tables[p].data)
+				ledger.acquire(sig);
+			for (auto &sig : tables[q].data)
+				ledger.acquire(sig);
+			ledger.acquire(tables[p].base);
+
+			// base_gain 与 j 无关：共享树在所有的 j 下读的都是同一批叶子，也就是两个 $pmux
+			// 全部数据字的并集，选择端用的还是同一个 base，acquire 记下的使用者集合因此与 j
+			// 无关，dead_cost() 传播出来的死亡单元与 j 无关；removed 也只跟两个 $pmux 有关。
+			// acquire 只影响使用者计数，不产生代价，所以此处 net_gain() 等于删除所得加连带
+			// 死亡所得；唯一随 j 变化的是共享树新增的 mux 个数，它在下面按 j 逐个扣除。
+			int64_t base_gain = ledger.net_gain();
+
+			int width = tables[p].cell->getParam(ID::WIDTH).as_int();
 			for (int j = 0; j < n; j++) {
 				MuxDag dag;
 				share(dag, tables[p], tables[q], j);
-				if (dag.mux_count < plain)
-					candidates.push_back(std::make_tuple(plain - dag.mux_count, p, q, j));
+
+				Candidate c;
+				c.p = p;
+				c.q = q;
+				c.j = j;
+				c.removed = ledger.removed_gain;
+				c.dead = ledger.dead_cost();
+				c.added = (int64_t)dag.mux_count * width;
+				c.gain = base_gain - c.added;
+				rows.push_back(c);
 			}
 		}
-		std::sort(candidates.begin(), candidates.end(), [](const std::tuple<int, int, int, int> &a, const std::tuple<int, int, int, int> &b) {
-			if (std::get<0>(a) != std::get<0>(b))
-				return std::get<0>(a) > std::get<0>(b);
-			return std::make_tuple(std::get<1>(a), std::get<2>(a), std::get<3>(a)) < std::make_tuple(std::get<1>(b), std::get<2>(b), std::get<3>(b));
+
+		// 进入贪心配对的是 gain 大于零的候选，-force 时门槛取消、全部候选都参与。
+		// 按 gain 降序排序，gain 相同时按 (p, q, j) 升序，配对结果与枚举顺序无关。
+		vector<int> order;
+		for (int i = 0; i < GetSize(rows); i++)
+			if (force || rows[i].gain > 0)
+				order.push_back(i);
+		std::sort(order.begin(), order.end(), [&](int a, int b) {
+			const Candidate &x = rows[a], &y = rows[b];
+			if (x.gain != y.gain)
+				return x.gain > y.gain;
+			return std::make_tuple(x.p, x.q, x.j) < std::make_tuple(y.p, y.q, y.j);
 		});
 
 		pool<int> used;
-		for (auto &c : candidates) {
-			int gain = std::get<0>(c), p = std::get<1>(c), q = std::get<2>(c), j = std::get<3>(c);
-			if (used.count(p) || used.count(q) || !may_share(tables[p], tables[q]))
+		for (auto i : order) {
+			Candidate &c = rows[i];
+			if (used.count(c.p) || used.count(c.q)) {
+				c.note = "conflict";
 				continue;
-			used.insert(p);
-			used.insert(q);
-			log("  %s and %s: shared on %s, %d fewer word muxes\n", log_id(tables[p].cell), log_id(tables[q].cell),
-					log_signal(tables[p].base[j]), gain);
-			apply(tables[p], tables[q], j);
+			}
+			if (!may_share(tables[c.p], tables[c.q])) {
+				c.note = "cycle";
+				continue;
+			}
+
+			used.insert(c.p);
+			used.insert(c.q);
+			c.decision = force ? "forced" : "accept";
+			c.note = "kept";
+			if (!dry_run) {
+				apply(tables[c.p], tables[c.q], c.j);
+				update_index();
+			}
 			shared_pairs++;
-			saved_muxes += gain;
-			update_index();
+			predicted_gain += c.gain;
+		}
+
+		// 候选指枚举出的全部 (p, q, j) 三元组：gain 不大于零的三元组同样输出一行 reject/no_gain，
+		// 方便核对账本口径，它们不参与贪心配对；-force 时门槛取消，全部三元组都参与。
+		candidate_count += GetSize(rows);
+
+		// 每个候选输出一行：被选中的记 kept，因为 cell 已被别的候选占用而落选的记 conflict，
+		// 会成环的记 cycle，没进贪心的 gain 不大于零的三元组保持默认的 reject/no_gain
+		for (int i = 0; i < GetSize(rows); i++) {
+			const Candidate &c = rows[i];
+			log("MUXLEDGER pass=muxtree_share module=%s cand=%d decision=%s gain=%lld removed=%lld dead=%lld added=%lld note=%s\n",
+					log_id(module), i, c.decision, (long long)c.gain, (long long)c.removed,
+					(long long)c.dead, (long long)c.added, c.note);
 		}
 	}
 
@@ -346,30 +407,69 @@ struct MuxtreeSharePass : public Pass {
 	{
 		//   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
 		log("\n");
-		log("    muxtree_share [selection]\n");
+		log("    muxtree_share [options] [selection]\n");
 		log("\n");
 		log("This pass looks for pairs of $pmux cells whose select bits are $eq/$logic_not\n");
 		log("cells comparing the same signal 'base' against constants, and where the second\n");
 		log("$pmux mostly selects the data the first one selects with bit 'base[j]' inverted.\n");
 		log("Both cells are then rebuilt as two mux trees over the other bits of 'base',\n");
 		log("shared by both outputs and swapped by 'base[j]' at the root. Values where the\n");
-		log("two cells disagree get an extra mux on 'base[j]' at the leaves. A pair is only\n");
-		log("rebuilt if this needs fewer word-level $mux cells than two separate trees.\n");
+		log("two cells disagree get an extra mux on 'base[j]' at the leaves.\n");
+		log("\n");
+		log("A pair is only rebuilt if the sharing pays off, measured with the MuxLedger of\n");
+		log("passes/opt/muxledger.h: the gain of dropping the two $pmux cells plus the gain\n");
+		log("of the $eq/$logic_not cells that lose all their users, minus the cost of the\n");
+		log("muxes of the new shared tree, has to be greater than zero.\n");
+		log("\n");
+		log("Every candidate (a pair of cells together with one bit 'base[j]') is reported\n");
+		log("as a log line starting with 'MUXLEDGER', holding the gain and the reason for the\n");
+		log("decision (kept, no_gain, cycle or conflict).\n");
+		log("\n");
+		log("    -dry-run\n");
+		log("        Match the candidates and report the ledger results, do not modify the\n");
+		log("        module.\n");
+		log("\n");
+		log("    -force\n");
+		log("        Ignore the 'gain greater than zero' requirement and apply all\n");
+		log("        candidates, reporting their decisions as 'forced'.\n");
 		log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
-		log_header(design, "Executing MUXTREE_SHARE pass (share select trees of $pmux pairs).\n");
-		extra_args(args, 1, design);
+		bool dry_run = false, force = false;
 
-		int shared_pairs = 0, saved_muxes = 0;
+		size_t argidx;
+		for (argidx = 1; argidx < args.size(); argidx++) {
+			if (args[argidx] == "-dry-run") {
+				dry_run = true;
+				continue;
+			}
+			if (args[argidx] == "-force") {
+				force = true;
+				continue;
+			}
+			break;
+		}
+		extra_args(args, argidx, design);
+
+		// 两个选项同时给出时按 -dry-run 处理：门槛也不取消，记录行反映账本原本的决定
+		if (dry_run)
+			force = false;
+
+		log_header(design, "Executing MUXTREE_SHARE pass (share select trees of $pmux pairs).\n");
+
+		int candidate_count = 0, shared_pairs = 0;
+		int64_t predicted_gain = 0;
 		for (auto module : design->selected_modules()) {
-			MuxtreeShareWorker worker(module);
+			MuxtreeShareWorker worker(module, dry_run, force);
+			candidate_count += worker.candidate_count;
 			shared_pairs += worker.shared_pairs;
-			saved_muxes += worker.saved_muxes;
+			predicted_gain += worker.predicted_gain;
 		}
 
-		log("Shared %d $pmux pairs, %d fewer word-level muxes.\n", shared_pairs, saved_muxes);
+		if (dry_run)
+			log("Dry run: no module is modified.\n");
+		log("%d candidates, %d accepted, predicted ledger gain %lld.\n", candidate_count, shared_pairs, (long long)predicted_gain);
 	}
 } MuxtreeSharePass;
 

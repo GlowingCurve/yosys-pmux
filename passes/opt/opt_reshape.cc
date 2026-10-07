@@ -3,6 +3,7 @@
 #include "kernel/consteval.h"
 #include "kernel/ffinit.h"
 #include "kernel/ff.h"
+#include "passes/opt/muxledger.h"
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
@@ -21,9 +22,8 @@ struct Func {
 	std::vector<bool> table;
 };
 
-// 锥中的一个 $mux/$pmux
+// 锥中的一个 $mux/$pmux；单元指针记在 ReshapeWorker::cone_cells 里
 struct Node {
-	Cell *cell;
 	// 数据槽：>=0 为子节点下标，-1 为全 x，<=-2 为数据源 -2-slot
 	std::vector<int> slots;
 	// 选择位：>=0 为 ctrl 下标，-1 为常量 0，-2 为常量 1
@@ -38,21 +38,22 @@ struct Plan {
 	std::vector<Func> sel_funcs;
 	bool has_en;
 	Func en_func;
-	int cost;
+	// 新增逻辑的估计代价，结算时用账本的 add_cost 记入
+	int64_t cost;
 };
 
 static const int R_DC = -1, R_FAIL = -2;
 
-// n 输入函数映射到 LUT4 的估计个数
-static int lut_cost(int n)
+// 预测 emit_lut 将会发射的 $lut 的代价，整个过程不创建任何单元。
+// 分支与 emit_lut 一一对应：输入位数为空时返回常量，输入位数为 1 且真值表是恒等映射时直接返回该输入，
+// 这两种情况都不发射单元，代价为零；其余情况发射 WIDTH 等于输入位数的 $lut，按账本的 $lut 折算规则计价。
+static int64_t predict_lut_cost(const SigSpec &inputs, const std::vector<bool> &table)
 {
-	return n <= 1 ? 0 : (n + 1) / 3;
-}
-
-// k:1 MUX 映射到 LUT4 的估计个数（4:1 需要 2 个，8:1 需要 5 个）
-static int mux_cost(int k)
-{
-	return k <= 1 ? 0 : (2 * (k - 1) + 2) / 3;
+	if (inputs.empty())
+		return 0;
+	if (GetSize(inputs) == 1 && !table[0] && table[1])
+		return 0;
+	return (int64_t)1 << std::max(GetSize(inputs) - 4, 0);
 }
 
 struct ReshapeWorker
@@ -62,12 +63,20 @@ struct ReshapeWorker
 	SigMap &sigmap;
 	FfInitVals initvals;
 	int max_leaves, max_cells;
+	bool force;
+
+	// 拒绝原因计数：cone_fail 与 no_gain 按寄存器计，too_wide 与 infeasible 按候选方案计
+	int count_cone_fail = 0;    // D 端无法展开成锥的寄存器数
+	int count_too_wide = 0;     // 控制量超过 -max_leaves 而放弃的候选方案数
+	int count_infeasible = 0;   // 制表冲突或 make_plan 给不出方案的候选方案数
+	int count_no_gain = 0;      // 账本判定收益不大于零而拒绝的寄存器数
 
 	dict<SigBit, Cell *> mux_driver;
 	dict<SigBit, int> fanout;
 	pool<Cell *> claimed;
 
 	std::vector<Node> nodes;
+	std::vector<Cell *> cone_cells;   // 当前寄存器锥内的单元，add_node 依次记录
 	std::vector<SigBit> ctrl;
 	dict<SigBit, int> ctrl_idx;
 	std::vector<SigSpec> sources;
@@ -76,8 +85,9 @@ struct ReshapeWorker
 	std::vector<Plan> plans;
 	dict<std::pair<SigSpec, Const>, SigBit> func_cache;
 
-	ReshapeWorker(Module *module, int max_leaves, int max_cells) :
-			module(module), ce(module), sigmap(ce.assign_map), max_leaves(max_leaves), max_cells(max_cells)
+	ReshapeWorker(Module *module, int max_leaves, int max_cells, bool force) :
+			module(module), ce(module), sigmap(ce.assign_map), max_leaves(max_leaves), max_cells(max_cells),
+			force(force)
 	{
 		initvals.set(&sigmap, module);
 		for (auto cell : module->cells()) {
@@ -94,6 +104,21 @@ struct ReshapeWorker
 			if (wire->port_output)
 				for (auto bit : sigmap(wire))
 					fanout[bit]++;
+	}
+
+	// 每个寄存器一行账本记录，字段固定、空格分隔
+	void log_record(int cand, const char *decision, int64_t gain, int64_t removed, int64_t dead, int64_t added, const char *note)
+	{
+		log("MUXLEDGER pass=opt_reshape module=%s cand=%d decision=%s gain=%lld removed=%lld dead=%lld added=%lld note=%s\n",
+				log_id(module), cand, decision, (long long)gain, (long long)removed, (long long)dead,
+				(long long)added, note);
+	}
+
+	// 模块级汇总：四类放弃原因的计数与已经定下的计划数
+	void log_summary()
+	{
+		log("MUXLEDGER pass=opt_reshape module=%s cone_fail=%d too_wide=%d infeasible=%d no_gain=%d planned=%d\n",
+				log_id(module), count_cone_fail, count_too_wide, count_infeasible, count_no_gain, GetSize(plans));
 	}
 
 	int source_slot(const SigSpec &sig)
@@ -150,7 +175,7 @@ struct ReshapeWorker
 		claimed.insert(cell);
 		int id = GetSize(nodes);
 		nodes.push_back(Node());
-		nodes[id].cell = cell;
+		cone_cells.push_back(cell);
 
 		SigSpec sig_a = sigmap(cell->getPort(ID::A));
 		SigSpec sig_b = sigmap(cell->getPort(ID::B));
@@ -325,9 +350,19 @@ struct ReshapeWorker
 		return base + (1 << b) < k;
 	}
 
-	// table[p] 为取值 p 下的数据源；q_src 为 Q 反馈的数据源下标（没有则为 -1）
-	bool make_plan(Plan &plan, const SigSpec &leaves, const std::vector<int> &table, int q_src, int width, bool old_ce)
+	// 控制函数的输入信号：support 决定取哪些叶子位，emit_lut 与代价预测共用
+	SigSpec func_inputs(const SigSpec &leaves, const Func &f)
 	{
+		SigSpec inputs;
+		for (auto v : f.support)
+			inputs.append(leaves[v]);
+		return inputs;
+	}
+
+	// table[p] 为取值 p 下的数据源；q_src 为 Q 反馈的数据源下标（没有则为 -1）
+	bool make_plan(Plan &plan, const SigSpec &leaves, const std::vector<int> &table, int q_src, const FfData &ff)
+	{
+		int width = ff.width;
 		int n = GetSize(leaves);
 		std::vector<int> data;
 		for (auto r : table)
@@ -339,13 +374,20 @@ struct ReshapeWorker
 
 		plan.leaves = leaves;
 		plan.has_en = std::find(table.begin(), table.end(), q_src) != table.end() && q_src >= 0;
-		plan.cost = 0;
+		int64_t cost = 0;
 		if (plan.has_en) {
 			std::vector<TV> en(1 << n);
 			for (int p = 0; p < (1 << n); p++)
 				en[p] = table[p] == R_DC ? TD : table[p] == q_src ? T0 : T1;
 			plan.en_func = minimize(en, n);
-			plan.cost += lut_cost(GetSize(plan.en_func.support) + (old_ce ? 1 : 0));
+			cost += predict_lut_cost(func_inputs(leaves, plan.en_func), plan.en_func.table);
+			// 已有 CE 时，apply() 还会发射一个把原 CE 与 en 相与的 $lut，表下标为 {en, 原 CE}。
+			// en 在计划阶段还没有信号位，这里用两位常量占位；两位输入的代价与具体信号无关。
+			if (ff.has_ce) {
+				SigSpec and_inputs(State::S0, 2);
+				std::vector<bool> and_table = {false, false, !ff.pol_ce, ff.pol_ce};
+				cost += predict_lut_cost(and_inputs, and_table);
+			}
 		}
 
 		int k = GetSize(data);
@@ -357,14 +399,14 @@ struct ReshapeWorker
 		// 数据源到码的分配：k 较小时枚举全部排列，取控制函数总代价最小者
 		std::vector<int> best_order;
 		std::vector<Func> best_funcs;
-		int best_cost = INT_MAX;
+		int64_t best_cost = INT64_MAX;
 		std::vector<int> order = data;
 		do {
 			dict<int, int> code;
 			for (int c = 0; c < k; c++)
 				code[order[c]] = c;
 			std::vector<Func> funcs;
-			int cost = 0;
+			int64_t cost_bits = 0;
 			for (int b = 0; b < nbits; b++) {
 				std::vector<TV> sel(1 << n);
 				for (int p = 0; p < (1 << n); p++) {
@@ -375,10 +417,10 @@ struct ReshapeWorker
 						sel[p] = (code[r] >> b) & 1 ? T1 : T0;
 				}
 				funcs.push_back(minimize(sel, n));
-				cost += lut_cost(GetSize(funcs.back().support));
+				cost_bits += predict_lut_cost(func_inputs(leaves, funcs.back()), funcs.back().table);
 			}
-			if (cost < best_cost) {
-				best_cost = cost;
+			if (cost_bits < best_cost) {
+				best_cost = cost_bits;
 				best_order = order;
 				best_funcs = funcs;
 			}
@@ -388,7 +430,9 @@ struct ReshapeWorker
 		for (auto r : best_order)
 			plan.data.push_back(sources[r]);
 		plan.sel_funcs = best_funcs;
-		plan.cost += best_cost + width * mux_cost(k);
+		// k 选 1 的 mux 树恰好由 k-1 个 $mux 单元组成，每个单元的代价是 WIDTH
+		cost += best_cost + (int64_t)(k - 1) * width;
+		plan.cost = cost;
 		return true;
 	}
 
@@ -401,47 +445,116 @@ struct ReshapeWorker
 		SigSpec sig_q = sigmap(ff.sig_q);
 
 		nodes.clear();
+		cone_cells.clear();
 		ctrl.clear();
 		ctrl_idx.clear();
 		sources.clear();
 		source_idx.clear();
 
 		int root = add_slot(sig_d);
-		if (root < 0)
+		if (root < 0) {
+			// 锥构造失败：D 端的驱动不能并入锥
+			count_cone_fail++;
+			log_record(-1, "infeasible", 0, 0, 0, 0, "infeasible");
 			return;
+		}
 		int q_src = source_idx.count(sig_q) ? source_idx.at(sig_q) : -1;
 
-		// 原结构的估计代价：每个数据位一条 2:1 MUX 链
-		int arms = 0;
-		for (auto &node : nodes)
-			arms += GetSize(node.sel);
-		int old_cost = ff.width * mux_cost(arms + 1);
-
+		// 候选叶子集合：原始控制位，以及沿组合逻辑向输入方向展开之后的控制位
 		std::vector<SigSpec> options;
 		if (GetSize(ctrl) <= max_leaves)
 			options.push_back(SigSpec(ctrl));
-		pool<SigBit> deep = expand(pool<SigBit>(ctrl.begin(), ctrl.end()));
-		if (GetSize(deep) <= max_leaves && deep != pool<SigBit>(ctrl.begin(), ctrl.end())) {
-			std::vector<SigBit> bits(deep.begin(), deep.end());
-			std::sort(bits.begin(), bits.end());
-			options.push_back(SigSpec(bits));
+		else
+			count_too_wide++;
+		pool<SigBit> ctrl_leaves(ctrl.begin(), ctrl.end());
+		pool<SigBit> deep = expand(ctrl_leaves);
+		if (deep != ctrl_leaves) {
+			if (GetSize(deep) <= max_leaves) {
+				std::vector<SigBit> deep_bits(deep.begin(), deep.end());
+				std::sort(deep_bits.begin(), deep_bits.end());
+				options.push_back(SigSpec(deep_bits));
+			} else {
+				count_too_wide++;
+			}
 		}
 
 		Plan best;
-		best.cost = INT_MAX;
+		bool have_best = false;
+		int64_t best_gain = 0, best_removed = 0, best_dead = 0, best_added = 0;
+		int best_cand = -1;
+		int first_infeasible = -1;
+		int cand = 0;
 		for (auto &leaves : options) {
 			std::vector<int> table = tabulate(leaves, root);
-			if (table.empty())
+			if (table.empty()) {
+				// 枚举叶子取值时控制位无法求值，或者 $pmux 同时有效的分支给出不同数据源
+				count_infeasible++;
+				if (first_infeasible < 0)
+					first_infeasible = cand;
+				cand++;
 				continue;
+			}
 			Plan plan;
 			plan.ff = cell;
-			if (make_plan(plan, leaves, table, q_src, ff.width, ff.has_ce) && plan.cost < best.cost)
+			if (!make_plan(plan, leaves, table, q_src, ff)) {
+				// 控制函数的关闭取值之外没有剩下任何数据源
+				count_infeasible++;
+				if (first_infeasible < 0)
+					first_infeasible = cand;
+				cand++;
+				continue;
+			}
+
+			// 每个候选方案各用一个新建的账本：叶子集合不同，释放之后又被占用的信号位就不同。
+			// 用原始控制位作叶子时比较器仍然被占用；用展开后的叶子时比较器失去使用者，
+			// 它的代价由 dead_cost 给出，这是本 Pass 最大的收益来源。
+			MuxLedger ledger(module);
+			int64_t removed = 0;
+			for (auto cone_cell : cone_cells) {
+				ledger.drop_cell(cone_cell);
+				removed += MuxLedger::cell_cost(cone_cell);
+			}
+			ledger.acquire(leaves);
+			for (auto &source : plan.data)
+				ledger.acquire(source);
+			// 寄存器本身会被重建，Q 仍然由它驱动；不占用 Q 的话，Q 的使用者只剩下
+			// 被删除的锥内单元时，这个寄存器会被当成失去全部使用者而虚增收益。
+			ledger.acquire(sig_q);
+			ledger.add_cost(plan.cost);
+			int64_t dead = ledger.dead_cost();
+			int64_t gain = ledger.net_gain();
+
+			if (!have_best || gain > best_gain) {
+				have_best = true;
 				best = plan;
+				best_gain = gain;
+				best_removed = removed;
+				best_dead = dead;
+				best_added = plan.cost;
+				best_cand = cand;
+			}
+			cand++;
 		}
-		if (best.cost >= old_cost)
+
+		if (!have_best) {
+			// 没有可用方案：控制量超过 max_leaves，或者全部候选方案都不可行
+			if (first_infeasible >= 0)
+				log_record(first_infeasible, "infeasible", 0, 0, 0, 0, "infeasible");
+			else
+				log_record(-1, "reject", 0, 0, 0, 0, "too_wide");
 			return;
-		log_debug("  %s: %d arms -> %d sources over %d leaves, cost %d -> %d\n", log_id(cell), arms,
-				GetSize(best.data), GetSize(best.leaves), old_cost, best.cost);
+		}
+
+		if (!force && best_gain <= 0) {
+			count_no_gain++;
+			log_record(best_cand, "reject", best_gain, best_removed, best_dead, best_added, "no_gain");
+			return;
+		}
+
+		log_debug("  %s: %d sources over %d leaves, added %lld, gain %lld (removed %lld, dead %lld)\n",
+				log_id(cell), GetSize(best.data), GetSize(best.leaves), (long long)best_added,
+				(long long)best_gain, (long long)best_removed, (long long)best_dead);
+		log_record(best_cand, force ? "forced" : "accept", best_gain, best_removed, best_dead, best_added, "kept");
 		plans.push_back(best);
 	}
 
@@ -468,10 +581,7 @@ struct ReshapeWorker
 
 	SigBit emit_func(const Plan &plan, const Func &f)
 	{
-		SigSpec inputs;
-		for (auto v : f.support)
-			inputs.append(plan.leaves[v]);
-		return emit_lut(inputs, f.table);
+		return emit_lut(func_inputs(plan.leaves, f), f.table);
 	}
 
 	SigSpec build_mux(const std::vector<SigSpec> &data, const SigSpec &sel, int lo, int b)
@@ -526,16 +636,32 @@ struct OptReshapePass : public Pass {
 		log("functions shared by all data bits, using the disabled assignments as don't-cares.\n");
 		log("Each data bit is left with a single k:1 multiplexer.\n");
 		log("\n");
+		log("The decision for each register is made with the shared mux ledger: the $mux/$pmux\n");
+		log("cells of the cone are released, a comparator absorbed by the expansion of the\n");
+		log("control variables counts towards the gain as well, and the restructuring is kept\n");
+		log("only when the ledger reports a positive gain.\n");
+		log("\n");
 		log("    -max_leaves <n>\n");
-		log("        maximum number of control variables enumerated per register (default 10)\n");
+		log("        maximum number of control variables enumerated per register (default 10,\n");
+		log("        allowed range 1 to 20)\n");
 		log("\n");
 		log("    -max_cells <n>\n");
 		log("        maximum number of $mux/$pmux cells in one cone (default 64)\n");
+		log("\n");
+		log("    -dry-run\n");
+		log("        analyze the registers and print the ledger records without modifying the\n");
+		log("        module\n");
+		log("\n");
+		log("    -force\n");
+		log("        ignore the ledger threshold and apply every plan, the records are written\n");
+		log("        with decision=forced. Given together with -dry-run, -force is ignored and\n");
+		log("        the records show what the ledger would decide.\n");
 		log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
 		int max_leaves = 10, max_cells = 64;
+		bool dry_run = false, force = false;
 
 		log_header(design, "Executing OPT_RESHAPE pass (register control logic restructuring).\n");
 
@@ -543,27 +669,46 @@ struct OptReshapePass : public Pass {
 		for (argidx = 1; argidx < args.size(); argidx++) {
 			if (args[argidx] == "-max_leaves" && argidx + 1 < args.size()) {
 				max_leaves = std::stoi(args[++argidx]);
+				if (max_leaves < 1 || max_leaves > 20)
+					log_error("Invalid -max_leaves value %d: expected a value between 1 and 20.\n", max_leaves);
 				continue;
 			}
 			if (args[argidx] == "-max_cells" && argidx + 1 < args.size()) {
 				max_cells = std::stoi(args[++argidx]);
 				continue;
 			}
+			if (args[argidx] == "-dry-run") {
+				dry_run = true;
+				continue;
+			}
+			if (args[argidx] == "-force") {
+				force = true;
+				continue;
+			}
 			break;
 		}
 		extra_args(args, argidx, design);
 
+		// 两个选项同时给出时按 -dry-run 处理：门槛也不取消，记录行反映账本原本的决定
+		if (dry_run)
+			force = false;
+
 		int total = 0;
 		for (auto module : design->selected_modules()) {
-			ReshapeWorker worker(module, max_leaves, max_cells);
+			ReshapeWorker worker(module, max_leaves, max_cells, force);
 			for (auto cell : module->selected_cells())
 				if (StaticCellTypes::categories.is_ff(cell->type))
 					worker.analyze(cell);
-			for (auto &plan : worker.plans)
-				worker.apply(plan);
+			if (!dry_run)
+				for (auto &plan : worker.plans)
+					worker.apply(plan);
+			worker.log_summary();
 			total += GetSize(worker.plans);
 		}
-		log("Restructured %d registers.\n", total);
+		if (dry_run)
+			log("Planned %d registers (dry run, modules unchanged).\n", total);
+		else
+			log("Restructured %d registers.\n", total);
 	}
 } OptReshapePass;
 
