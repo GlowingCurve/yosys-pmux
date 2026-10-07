@@ -373,19 +373,22 @@ struct RebuildWorker
 		if (add_root < 0)
 			return;
 
+		// 树里每个单元的 Y 都完整接入父节点的数据端口（collect 比对过整个信号），
+		// 所以整棵树都是 width 位有效的；把 mux_width(root) 当有效位宽传给账本，
+		// 与下面按 count_muxes * width 计价的新树同口径，同时省掉端口遍历。
 		int width = mux_width(root);
 		MuxLedger ledger(module);
 		for (auto &tn : nodes)
-			ledger.drop_cell(tn.cell);
+			ledger.drop_cell(tn.cell, width);
 		// 新的决策图会用到这些数据字与控制位，不占用它们会让死亡传播把驱动单元误判成死亡
 		for (auto &term : terms)
 			ledger.acquire(term);
 		for (auto &var : vars)
 			ledger.acquire(var);
-		// 树单元的删除所得与账本口径一致，按同样的 cell_cost 单独求和
+		// 树单元的删除所得与账本口径一致，按同样的 cell_cost 与同样的有效位宽单独求和
 		int64_t removed_mux = 0;
 		for (auto &tn : nodes)
-			removed_mux += MuxLedger::cell_cost(tn.cell);
+			removed_mux += MuxLedger::cell_cost(tn.cell, width);
 		int64_t added_mux = (int64_t)count_muxes(add_root) * width;
 		ledger.add_cost(added_mux);
 		int64_t removed_ctrl = ledger.dead_cost();

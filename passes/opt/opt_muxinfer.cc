@@ -597,12 +597,15 @@ struct InferWorker
 	// 收益至少是 WIDTH，账本不会判定没有收益；dry_run 时只结算与记录
 	void apply_drop(Cell *cell, const SigSpec &kept, int cand)
 	{
+		// kept 是保留下来那一段数据，它的位宽就是这只 mux 真正用到的位宽，
+		// 传给账本做有效位宽，省掉一次端口遍历
+		int64_t used_width = GetSize(kept);
 		MuxLedger ledger(idx.module);
-		ledger.drop_cell(cell);
+		ledger.drop_cell(cell, used_width);
 		ledger.acquire(kept);
 		int64_t dead = ledger.dead_cost();
 		int64_t gain = ledger.net_gain();
-		int64_t removed = MuxLedger::cell_cost(cell);
+		int64_t removed = MuxLedger::cell_cost(cell, used_width);
 
 		log_candidate(cand, force ? "forced" : "accept", gain, removed, dead, 0, "kept");
 		rewrites++;
@@ -721,13 +724,16 @@ struct InferWorker
 				continue;
 			}
 
-			// $pmux 的代价是 WIDTH * (S_WIDTH - 1)，选择位变短省下的部分记入减少所得
+			// $pmux 的代价是 used_width * max(S_WIDTH-1,1)，选择位变短省下的部分按同样的
+			// 口径记入减少所得：used_width 用账本推断的有效数据位宽（常量位、没有使用者的
+			// 位不计价），与 cell_cost 对 $pmux 的计价一致
+			int64_t used_width = MuxLedger::used_bits(cell);
 			MuxLedger ledger(module);
 			ledger.drop_port(cell, ID::S);
 			ledger.drop_port(cell, ID::B);
 			ledger.acquire(new_select);
 			ledger.acquire(new_data);
-			ledger.sub_cost((int64_t)width * (GetSize(old_select) - GetSize(new_select)));
+			ledger.sub_cost(used_width * (GetSize(old_select) - GetSize(new_select)));
 			int64_t dead = ledger.dead_cost();
 			int64_t gain = ledger.net_gain();
 			bool enough = gain > 0;

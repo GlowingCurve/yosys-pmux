@@ -207,12 +207,44 @@ struct SynthIntelPass : public ScriptPass {
 			run("opt_clean");
 			run("check");
 			run("opt -nodffe -nosdff");
+			run("opt_dff -sat -nodffe -nosdff");
+			run("opt_clean");
+			run("opt_muxinfer");
+			run("opt_expr");
+			run("opt_clean");
+			run("opt_muxcomb");
+			run("opt_muxtree");
+			run("opt_expr");
+			run("opt_clean");
+			run("opt_muxrebuild");
+			run("opt_expr");
+			run("opt_clean");
+			run("opt_reshape");
+			run("opt_expr");
+			run("opt_clean");
 			run("fsm");
 			run("opt");
 			run("wreduce");
 			run("peepopt");
+			run("opt_dff -sat -nodffe -nosdff");
+			run("opt_clean");
+			run("opt_muxinfer");
+			run("opt_expr");
+			run("opt_clean");
+			run("opt_muxcomb");
+			run("opt_muxtree");
+			run("opt_expr");
+			run("opt_clean");
+			run("opt_muxrebuild");
+			run("opt_expr");
+			run("opt_clean");
+			run("opt_reshape");
+			run("opt_expr");
+			run("opt_clean");
+			run("share");
 			run("opt_clean");
 			run("techmap -map +/cmp2lut.v -D LUT_WIDTH=4");
+			run("opt_reshape");
 			run("opt_expr");
 			run("opt_clean");
 
@@ -250,6 +282,8 @@ struct SynthIntelPass : public ScriptPass {
 		if (check_label("map_ffram")) {
 			run("opt -fast -mux_undef -undriven -fine -full");
 			run("memory_map");
+			run("opt_dff -sat");
+			run("opt_clean");
 			run("opt -undriven -fine");
 			run("techmap -map +/techmap.v");
 			run("opt -full");
@@ -263,9 +297,34 @@ struct SynthIntelPass : public ScriptPass {
 		}
 
 		if (check_label("map_luts")) {
+			run("abc -g simple");
+			run("opt_clean");
 			run("abc9 -lut 4 -W 300" + string(dff ? " -dff" : ""));
 			run("clean");
 			run("opt -fast");
+			run("opt_lut");
+			run("opt_clean");
+			run("lut2mux");
+			run("opt -full");
+			run("abc9 -lut 4 -W 300" + string(dff ? " -dff" : ""));
+			run("clean");
+			run("opt -fast");
+			run("opt_lut");
+			run("opt_clean");
+			run("lut2mux");
+			run("opt -full");
+			run("abc9 -lut 4 -W 300" + string(dff ? " -dff" : ""));
+			run("clean");
+			run("opt -fast");
+			run("opt_lut");
+			run("opt_clean");
+			run("lut2mux");
+			run("opt -full");
+			run("abc9 -lut 4 -W 300" + string(dff ? " -dff" : ""));
+			run("clean");
+			run("opt -fast");
+			run("opt_lut");
+			run("opt_clean");
 			run("autoname");
 			run("clean");
 		}

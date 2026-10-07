@@ -292,16 +292,19 @@ struct OptMuxcombWorker
 		for (int index = 0; index < GetSize(combinations); index++) {
 			const Combination &comb = combinations[index];
 
-			// 新建控制逻辑的代价先预测出来，账本判定通过之后才真的创建
+			// 新建控制逻辑的代价先预测出来，账本判定通过之后才真的创建。
+			// 两个子节点真正被父节点用到的位宽是 comb.a：child_mux 已经确认子节点其余
+			// 输出位都没有使用者，所以它可以当有效位宽传给账本，同时省掉一次端口遍历。
+			int64_t used_width = GetSize(comb.a);
 			int64_t added = select_cost(comb);
-			int64_t removed = MuxLedger::cell_cost(comb.lo.cell) + MuxLedger::cell_cost(comb.hi.cell);
+			int64_t removed = MuxLedger::cell_cost(comb.lo.cell, used_width) + MuxLedger::cell_cost(comb.hi.cell, used_width);
 
 			// 一次决策用一个新建的账本：先计划删除两个子节点、改写父节点的两个数据端口，
 			// 再计划占用合并之后的数据信号与新的选择逻辑读到的控制信号，最后结算。
 			// 父节点保留，$mux 按位宽计价，端口改写不改变它的代价，所以不用 sub_cost。
 			MuxLedger ledger(module);
-			ledger.drop_cell(comb.lo.cell);
-			ledger.drop_cell(comb.hi.cell);
+			ledger.drop_cell(comb.lo.cell, used_width);
+			ledger.drop_cell(comb.hi.cell, used_width);
 			ledger.drop_port(comb.top, ID::A);
 			ledger.drop_port(comb.top, ID::B);
 			ledger.acquire(comb.a);
@@ -489,8 +492,9 @@ struct OptMuxcombPass : public Pass {
 						recycled_here++;
 						continue;
 					}
-					// 新建单元的成本按账本口径记为新增代价，撤销之后这笔代价不再存在
-					int64_t cost = MuxLedger::cell_cost(cell);
+					// 新建单元的成本按账本口径记为新增代价，撤销之后这笔代价不再存在；
+					// 这个展开 mux 的位宽就是 GetSize(expansion.a)，直接当有效位宽传进去
+					int64_t cost = MuxLedger::cell_cost(cell, GetSize(expansion.a));
 					expansion_worker.log_candidate("reject", -cost, 0, 0, cost, "rollback");
 					// 父节点被别的合并删掉时端口已经没有意义，只清掉新建的单元
 					Cell *top = module->cell(expansion.top_name);

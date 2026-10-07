@@ -508,11 +508,13 @@ struct ReshapeWorker
 			// 每个候选方案各用一个新建的账本：叶子集合不同，释放之后又被占用的信号位就不同。
 			// 用原始控制位作叶子时比较器仍然被占用；用展开后的叶子时比较器失去使用者，
 			// 它的代价由 dead_cost 给出，这是本 Pass 最大的收益来源。
+			// 锥内单元都是 add_slot 核对过整个 Y 信号之后并进来的 mux，宽度都是 ff.width，
+			// 把它当有效位宽传给账本，与下面按 (k-1)*width 计价的新建 mux 树同口径。
 			MuxLedger ledger(module);
 			int64_t removed = 0;
 			for (auto cone_cell : cone_cells) {
-				ledger.drop_cell(cone_cell);
-				removed += MuxLedger::cell_cost(cone_cell);
+				ledger.drop_cell(cone_cell, ff.width);
+				removed += MuxLedger::cell_cost(cone_cell, ff.width);
 			}
 			ledger.acquire(leaves);
 			for (auto &source : plan.data)
