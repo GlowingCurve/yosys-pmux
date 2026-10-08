@@ -209,6 +209,9 @@ struct SynthIntelPass : public ScriptPass {
 			run("opt -nodffe -nosdff");
 			run("opt_dff -sat -nodffe -nosdff");
 			run("opt_clean");
+			run("muxtree_share");
+			run("opt_expr");
+			run("opt_clean");
 			run("opt_muxinfer");
 			run("opt_expr");
 			run("opt_clean");
