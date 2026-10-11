@@ -60,8 +60,35 @@ yosys_pass(rmports
 yosys_pass(opt_lut
 	opt_lut.cc
 )
+yosys_pass(opt_abc9_area
+	opt_abc9_area.cc
+	REQUIRES
+		abc9
+		check
+		opt_clean
+)
 yosys_pass(opt_lut_ins
 	opt_lut_ins.cc
+)
+yosys_pass(opt_lutresyn
+	opt_lutresyn.cc
+)
+yosys_pass(opt_lutresub
+	opt_lutresub.cc
+	REQUIRES
+		kernel
+)
+yosys_pass(opt_fsm_lut4
+	opt_fsm_lut4.cc
+	REQUIRES
+		fsm
+		fsm_map
+		kernel
+)
+yosys_pass(opt_cycloneiv_carry
+	opt_cycloneiv_carry.cc
+	REQUIRES
+		kernel
 )
 yosys_pass(opt_ffinv
 	opt_ffinv.cc

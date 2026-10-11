@@ -20,6 +20,10 @@ endmodule
 EOT
 equiv_opt -assert opt_muxcomb
 design -load postopt
+select -assert-count 8 t:$mux
+design -load preopt
+equiv_opt -assert opt_muxcomb -force
+design -load postopt
 select -assert-count 4 t:$mux
 select -assert-count 2 t:$or
 select -assert-count 2 t:$and
