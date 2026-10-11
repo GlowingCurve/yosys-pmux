@@ -5,7 +5,7 @@
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
 
-// 使用共享节点的字级 MUX DAG。
+// a hash-consed DAG of word-level 2:1 muxes, id -1 is an all-x word
 struct MuxDag
 {
 	struct Node {
@@ -17,9 +17,12 @@ struct MuxDag
 	vector<Node> nodes;
 	dict<SigSpec, int> leaf_cache;
 	dict<std::tuple<SigBit, int, int>, int> mux_cache;
+	int mux_count = 0;
 
 	int leaf(const SigSpec &sig)
 	{
+		if (sig.is_fully_undef())
+			return -1;
 		auto it = leaf_cache.find(sig);
 		if (it != leaf_cache.end())
 			return it->second;
@@ -28,12 +31,12 @@ struct MuxDag
 		return leaf_cache[sig] = GetSize(nodes) - 1;
 	}
 
-	// 保留每个数据字的实际常量状态。
+	// sel ? hi : lo, an all-x side is a don't care
 	int mux(SigBit sel, int lo, int hi)
 	{
-		if (sel == State::S0 || lo == hi)
+		if (lo == hi || hi == -1)
 			return lo;
-		if (sel == State::S1)
+		if (lo == -1)
 			return hi;
 		auto key = std::make_tuple(sel, lo, hi);
 		auto it = mux_cache.find(key);
@@ -43,6 +46,7 @@ struct MuxDag
 		nodes.back().sel = sel;
 		nodes.back().lo = lo;
 		nodes.back().hi = hi;
+		mux_count++;
 		return mux_cache[key] = GetSize(nodes) - 1;
 	}
 
@@ -60,30 +64,18 @@ struct MuxDag
 	}
 
 	// children are always created before their parents
-	vector<SigSpec> emit(Module *module, int width, std::pair<int, int> roots)
+	vector<SigSpec> emit(Module *module, int width)
 	{
-		pool<int> reachable;
-		vector<int> todo = {roots.first, roots.second};
-		while (!todo.empty()) {
-			int id = todo.back(); todo.pop_back();
-			if (!reachable.insert(id).second)
-				continue;
-			if (nodes[id].lo != -1) {
-				todo.push_back(nodes[id].lo);
-				todo.push_back(nodes[id].hi);
-			}
-		}
 		vector<SigSpec> sig(GetSize(nodes));
+		auto get = [&](int id) { return id == -1 ? SigSpec(State::Sx, width) : sig[id]; };
 		for (int id = 0; id < GetSize(nodes); id++) {
-			if (!reachable.count(id))
-				continue;
 			const Node &n = nodes[id];
 			if (n.lo == -1 && n.hi == -1) {
 				sig[id] = n.leaf;
 				continue;
 			}
 			sig[id] = module->addWire(NEW_ID, width);
-			module->addMux(NEW_ID, sig[n.lo], sig[n.hi], n.sel, sig[id]);
+			module->addMux(NEW_ID, get(n.lo), get(n.hi), n.sel, sig[id]);
 		}
 		return sig;
 	}
@@ -100,35 +92,29 @@ struct PmuxTable
 struct MuxtreeShareWorker
 {
 	Module *module;
-	MuxCostContext &costs;
-	SigMap &sigmap;
+	SigMap sigmap;
+	dict<SigBit, Cell*> driver;
 	bool dry_run;                 // 只做匹配与账本结算，不改动模块
 	bool force;                   // 取消 gain 大于零的门槛，全部候选都参与配对
 	int shared_pairs = 0;         // 被选中并施加的候选个数
 	int candidate_count = 0;      // 枚举出的候选个数
 	int64_t predicted_gain = 0;   // 选中候选的账本收益之和
-	int candidate_budget = 20000;
-	MuxWorkspace workspace;
 
 	// 一个 (p, q, j) 候选的结算记录，最后逐行输出
 	struct Candidate {
 		int p, q, j;
-		int64_t gain = 0;      // 账本收益：删除所得 + 连带死亡所得 - 共享树代价
-		int64_t removed = 0;   // 删除集合释放的共享 LUT4 函数
-		int64_t dead = 0;      // 连带死亡所得，失去全部使用者的单元代价之和
-		int64_t added = 0;     // 新增 LUT4 函数的代价
-		int64_t update_work = 0;
-		bool feasible = true;
+		int64_t gain;      // 账本收益：删除所得 + 连带死亡所得 - 共享树代价
+		int64_t removed;   // 删除所得，两个 $pmux 的代价之和
+		int64_t dead;      // 连带死亡所得，失去全部使用者的单元代价之和
+		int64_t added;     // 共享树的代价，按字级 mux 个数折算
 		const char *decision = "reject";
 		const char *note = "no_gain";
 	};
 
-	MuxtreeShareWorker(Module *module, MuxCostContext &costs, bool dry_run, bool force) :
-			module(module), costs(costs), sigmap(costs.sigmap), dry_run(dry_run), force(force), workspace(costs.resources) { }
-
-	void run()
+	MuxtreeShareWorker(Module *module, bool dry_run, bool force) : module(module), dry_run(dry_run), force(force)
 	{
 		dict<std::pair<SigSpec, int>, vector<PmuxTable>> groups;
+		update_index();
 		for (auto cell : module->selected_cells()) {
 			PmuxTable t;
 			if (cell->type == ID($pmux) && decode(cell, t))
@@ -139,13 +125,25 @@ struct MuxtreeShareWorker
 			if (GetSize(it.second) >= 2)
 				share_group(it.second);
 	}
+
+	void update_index()
+	{
+		sigmap.set(module);
+		driver.clear();
+		for (auto cell : module->cells())
+		for (auto &conn : cell->connections())
+			if (cell->output(conn.first))
+				for (auto bit : sigmap(conn.second))
+					driver[bit] = cell;
+	}
 	// decompose a select bit into "base == value", value == -1 if the compare is never true
 	bool match_select(SigBit s, SigSpec &base, int &value)
 	{
-		Cell *cmp = costs.unique_driver(s);
-		if (cmp == nullptr)
+		auto it = driver.find(sigmap(s));
+		if (it == driver.end())
 			return false;
 
+		Cell *cmp = it->second;
 		if (!cmp->type.in(ID($eq), ID($logic_not)) || sigmap(cmp->getPort(ID::Y)[0]) != sigmap(s))
 			return false;
 
@@ -153,7 +151,7 @@ struct MuxtreeShareWorker
 		SigSpec b;
 		if (cmp->type == ID($logic_not)) {
 			b = Const(0, GetSize(a));
-		} else {
+		} else if (cmp->type == ID($eq)) {
 			b = sigmap(cmp->getPort(ID::B));
 			if (a.is_fully_const())
 				std::swap(a, b);
@@ -162,7 +160,8 @@ struct MuxtreeShareWorker
 			bool is_signed = cmp->getParam(ID::A_SIGNED).as_bool() && cmp->getParam(ID::B_SIGNED).as_bool();
 			if (is_signed && GetSize(a) != GetSize(b))
 				return false;
-		}
+		} else
+			return false;
 
 		if (GetSize(a) == 0 || GetSize(a) > 8)
 			return false;
@@ -184,10 +183,6 @@ struct MuxtreeShareWorker
 
 	bool decode(Cell *cell, PmuxTable &t)
 	{
-		if (!costs.resources.charge(32))
-			return false;
-		if (!costs.mutable_cell(cell))
-			return false;
 		int width = cell->getParam(ID::WIDTH).as_int();
 		SigSpec sig_a = sigmap(cell->getPort(ID::A));
 		SigSpec sig_b = sigmap(cell->getPort(ID::B));
@@ -207,16 +202,10 @@ struct MuxtreeShareWorker
 		}
 		if (t.base.empty())
 			return false;
-		for (SigBit bit : t.base)
-			if (!bit.wire && bit != State::S0 && bit != State::S1)
-				return false;
 
 		// values not matched by any select bit take A, two bits with the same value would be active at once
 		t.cell = cell;
-		int64_t entries = int64_t(1) << GetSize(t.base);
-		if (!workspace.reserve(entries * (64 + width * 16)) || !costs.resources.charge(entries))
-			return false;
-		t.data.assign(entries, sig_a);
+		t.data.assign(1 << GetSize(t.base), sig_a);
 		pool<int> seen;
 		for (int i = 0; i < GetSize(values); i++) {
 			if (values[i] < 0)
@@ -262,8 +251,6 @@ struct MuxtreeShareWorker
 				queue.push_back(bit);
 
 		while (!queue.empty()) {
-			if (!costs.resources.charge(1))
-				return true;
 			SigBit bit = queue.back();
 			queue.pop_back();
 			if (target.count(bit))
@@ -272,11 +259,11 @@ struct MuxtreeShareWorker
 				continue;
 			visited.insert(bit);
 
-			Cell *cell = costs.unique_driver(bit);
-			if (cell == nullptr || RTLIL::builtin_ff_cell_types().count(cell->type))
+			auto it = driver.find(bit);
+			if (it == driver.end() || RTLIL::builtin_ff_cell_types().count(it->second->type))
 				continue;
-			for (auto &conn : cell->connections())
-				if (cell->input(conn.first))
+			for (auto &conn : it->second->connections())
+				if (it->second->input(conn.first))
 					for (auto in : sigmap(conn.second))
 						if (in.wire)
 							queue.push_back(in);
@@ -301,72 +288,48 @@ struct MuxtreeShareWorker
 		return !depends_on(p_data, q_y) && !depends_on(q_data, p_y);
 	}
 
-	void price(Candidate &candidate, const PmuxTable &p, const PmuxTable &q)
-	{
-		MuxWorkspace scratch(costs.resources);
-		int64_t entries = GetSize(p.data), width = GetSize(p.data.front());
-		if (!costs.resources.charge(entries * 4) || !scratch.reserve(entries * (512 + width * 64))) {
-			candidate.feasible = false;
-			candidate.note = "budget";
-			return;
-		}
-		MuxLedger ledger(costs);
-		ledger.alias_commit = true;
-		ledger.drop_cell(p.cell);
-		ledger.drop_cell(q.cell);
-		MuxDag dag;
-		auto roots = share(dag, p, q, candidate.j);
-		using Word = Lut4Functions::Word;
-		dict<int, Word> memo;
-		std::function<Word(int)> build = [&](int id) -> Word {
-			auto found = memo.find(id);
-			if (found != memo.end())
-				return found->second;
-			const auto &node = dag.nodes[id];
-			if (node.lo == -1 && node.hi == -1)
-				return memo[id] = costs.word(node.leaf);
-			Word lo = build(node.lo), hi = build(node.hi), result;
-			for (int child : {node.lo, node.hi})
-				if (dag.nodes[child].lo == -1 && dag.nodes[child].hi == -1)
-					ledger.acquire(dag.nodes[child].leaf);
-			ledger.acquire(node.sel);
-			auto select = costs.word(node.sel).at(0);
-			for (int i = 0; i < GetSize(lo); i++)
-				result.push_back(costs.functions.mux(lo[i], hi[i], select));
-			costs.functions.boundary(result);
-			return memo[id] = result;
-		};
-		ledger.add_outputs(p.cell->getPort(ID::Y), build(roots.first));
-		ledger.add_outputs(q.cell->getPort(ID::Y), build(roots.second));
-		for (int root : {roots.first, roots.second})
-			if (dag.nodes[root].lo == -1 && dag.nodes[root].hi == -1)
-				ledger.acquire(dag.nodes[root].leaf);
-		candidate.feasible = ledger.settle();
-		candidate.update_work = costs.resources.commit_reserved;
-		candidate.removed = ledger.removed_gain;
-		candidate.dead = ledger.dead_result;
-		candidate.added = ledger.added_cost;
-		candidate.gain = ledger.gain;
-		if (!candidate.feasible)
-			candidate.note = "unsupported";
-	}
-
-	// 每个候选按待发射 DAG 的实际连接结算，再按收益顺序配对。
+	// 枚举同一组内的全部 (p, q, j) 候选，用账本结算每个候选的收益，再按收益降序贪心配对。
+	// 账本把拆除两个 $pmux 的所得、驱动它们选择端的 $eq/$logic_not 失去全部使用者之后的
+	// 所得、以及共享树新增的代价放在一起比较，其中死亡比较器这一笔正是字级 mux 计数漏掉的。
 	void share_group(const vector<PmuxTable> &tables)
 	{
 		int n = GetSize(tables[0].base);
 
 		vector<Candidate> rows;
-		for (int p = 0; p < GetSize(tables) && candidate_budget > 0 && !costs.resources.exhausted; p++)
-		for (int q = p + 1; q < GetSize(tables) && candidate_budget > 0 && !costs.resources.exhausted; q++) {
-			for (int j = 0; j < n && candidate_budget > 0 && !costs.resources.exhausted; j++, candidate_budget--) {
-				if (!workspace.reserve(sizeof(Candidate) * 2 + 32))
-					break;
+		for (int p = 0; p < GetSize(tables); p++)
+		for (int q = p + 1; q < GetSize(tables); q++) {
+			// 一对 (p, q) 新建一个账本：计划删除两个 $pmux，共享树接管两者的全部数据字与 base。
+			// 账本自己不建 sigmap，acquire 进来的是解码时已经做过 sigmap 的 tables，删除与释放
+			// 走的是单元端口上的原始信号位，与 muxledger.h 的约定一致。
+			MuxLedger ledger(module);
+			ledger.drop_cell(tables[p].cell);
+			ledger.drop_cell(tables[q].cell);
+			for (auto &sig : tables[p].data)
+				ledger.acquire(sig);
+			for (auto &sig : tables[q].data)
+				ledger.acquire(sig);
+			ledger.acquire(tables[p].base);
+
+			// base_gain 与 j 无关：共享树在所有的 j 下读的都是同一批叶子，也就是两个 $pmux
+			// 全部数据字的并集，选择端用的还是同一个 base，acquire 记下的使用者集合因此与 j
+			// 无关，dead_cost() 传播出来的死亡单元与 j 无关；removed 也只跟两个 $pmux 有关。
+			// acquire 只影响使用者计数，不产生代价，所以此处 net_gain() 等于删除所得加连带
+			// 死亡所得；唯一随 j 变化的是共享树新增的 mux 个数，它在下面按 j 逐个扣除。
+			int64_t base_gain = ledger.net_gain();
+
+			int width = tables[p].cell->getParam(ID::WIDTH).as_int();
+			for (int j = 0; j < n; j++) {
+				MuxDag dag;
+				share(dag, tables[p], tables[q], j);
+
 				Candidate c;
 				c.p = p;
 				c.q = q;
 				c.j = j;
-				price(c, tables[p], tables[q]);
+				c.removed = ledger.removed_gain;
+				c.dead = ledger.dead_cost();
+				c.added = (int64_t)dag.mux_count * width;
+				c.gain = base_gain - c.added;
 				rows.push_back(c);
 			}
 		}
@@ -375,7 +338,7 @@ struct MuxtreeShareWorker
 		// 按 gain 降序排序，gain 相同时按 (p, q, j) 升序，配对结果与枚举顺序无关。
 		vector<int> order;
 		for (int i = 0; i < GetSize(rows); i++)
-			if (rows[i].feasible && (force || rows[i].gain > 0))
+			if (force || rows[i].gain > 0)
 				order.push_back(i);
 		std::sort(order.begin(), order.end(), [&](int a, int b) {
 			const Candidate &x = rows[a], &y = rows[b];
@@ -395,23 +358,14 @@ struct MuxtreeShareWorker
 				c.note = "cycle";
 				continue;
 			}
-			if (!dry_run) {
-				price(c, tables[c.p], tables[c.q]);
-				if (!c.feasible || (!force && c.gain <= 0)) {
-					c.note = c.feasible ? "no_gain" : "unsupported";
-					continue;
-				}
-			}
 
 			used.insert(c.p);
 			used.insert(c.q);
 			c.decision = force ? "forced" : "accept";
 			c.note = "kept";
 			if (!dry_run) {
-				log_assert(costs.resources.reserve_commit(c.update_work));
 				apply(tables[c.p], tables[c.q], c.j);
-				costs.refresh();
-				costs.resources.commit_reserved = 0;
+				update_index();
 			}
 			shared_pairs++;
 			predicted_gain += c.gain;
@@ -436,14 +390,14 @@ struct MuxtreeShareWorker
 		int width = p.cell->getParam(ID::WIDTH).as_int();
 		MuxDag dag;
 		auto roots = share(dag, p, q, j);
-		vector<SigSpec> sig = dag.emit(module, width, roots);
+		vector<SigSpec> sig = dag.emit(module, width);
 
 		SigSpec p_y = p.cell->getPort(ID::Y);
 		SigSpec q_y = q.cell->getPort(ID::Y);
 		module->remove(p.cell);
 		module->remove(q.cell);
-		module->connect(p_y, sig[roots.first]);
-		module->connect(q_y, sig[roots.second]);
+		module->connect(p_y, roots.first == -1 ? SigSpec(State::Sx, width) : sig[roots.first]);
+		module->connect(q_y, roots.second == -1 ? SigSpec(State::Sx, width) : sig[roots.second]);
 	}
 };
 
@@ -451,6 +405,7 @@ struct MuxtreeSharePass : public Pass {
 	MuxtreeSharePass() : Pass("muxtree_share", "share the select trees of $pmux pairs that differ in one select bit") { }
 	void help() override
 	{
+		//   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
 		log("\n");
 		log("    muxtree_share [options] [selection]\n");
 		log("\n");
@@ -506,13 +461,7 @@ struct MuxtreeSharePass : public Pass {
 		int candidate_count = 0, shared_pairs = 0;
 		int64_t predicted_gain = 0;
 		for (auto module : design->selected_modules()) {
-			// 候选类型集合为{$pmux}，至少两个选中对象；达到阈值立即停止扫描。
-			MuxCostContext costs(module);
-			if (!costs.type_scan([](const Cell *cell) { return cell->type == ID($pmux); }, 2, "muxtree_share"))
-				continue;
-			costs.refresh();
-			MuxtreeShareWorker worker(module, costs, dry_run, force);
-			worker.run();
+			MuxtreeShareWorker worker(module, dry_run, force);
 			candidate_count += worker.candidate_count;
 			shared_pairs += worker.shared_pairs;
 			predicted_gain += worker.predicted_gain;

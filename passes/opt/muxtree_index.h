@@ -1,10 +1,13 @@
 #ifndef MUXTREE_INDEX_H
 #define MUXTREE_INDEX_H
 
-#include "passes/opt/muxledger.h"
+#include "kernel/yosys.h"
+#include "kernel/sigtools.h"
+#include "kernel/celltypes.h"
 
 YOSYS_NAMESPACE_BEGIN
 
+// 一个 $mux/$pmux 的数据端口：$mux 的 0 是 A、1 是 B；$pmux 的 0 是 A、i+1 是 B 的第 i 段
 struct MuxPort {
 	Cell *cell;
 	int index;
@@ -27,6 +30,7 @@ static inline int mux_width(const Cell *cell)
 	return cell->getParam(ID::WIDTH).as_int();
 }
 
+// 数据端口在 cell 上的信号，sigmap 之后
 static inline SigSpec mux_port_sig(const SigMap &sigmap, Cell *cell, int index)
 {
 	if (index == 0)
@@ -36,80 +40,103 @@ static inline SigSpec mux_port_sig(const SigMap &sigmap, Cell *cell, int index)
 	return sigmap(cell->getPort(ID::B).extract((index - 1) * mux_width(cell), mux_width(cell)));
 }
 
+// 数据端口被选中的条件位：$mux 的 B 是 S，$pmux 的 B_i 是 S[i]；A 端口没有单独的条件位
 static inline SigBit mux_port_ctrl(const SigMap &sigmap, Cell *cell, int index)
 {
 	log_assert(index > 0);
-	return sigmap(cell->getPort(ID::S)[cell->type == ID($mux) ? 0 : index - 1]);
+	if (cell->type == ID($mux))
+		return sigmap(cell->getPort(ID::S)[0]);
+	return sigmap(cell->getPort(ID::S)[index - 1]);
 }
 
-// 父子关系复用模块成本索引中的唯一驱动、端口位置与保护信息。
+// muxtree 的父子关系：子节点的每个输出位只被父节点的某一个数据端口使用一次，并且不是模块输出
 struct MuxTreeIndex
 {
 	Module *module;
-	MuxCostContext costs;
-	SigMap &sigmap;
+	SigMap sigmap;
+	CellTypes comb_ct;
 	dict<SigBit, Cell *> driver;
+	dict<SigBit, int> use_count;
+	dict<SigBit, pool<Cell *>> users;
+	pool<SigBit> port_bits;
 	dict<Cell *, MuxPort> parent;
-	dict<MuxPort, std::vector<Cell *>> children;
-	std::vector<Cell *> roots;
-	// 推断开始之前登记的证明支持单元并集。
-	pool<IdString> registered;
+	dict<MuxPort, vector<Cell *>> children;
+	vector<Cell *> roots;
 
-	// 延迟索引：先完成真实必要条件扫描，资格成立之后才建立一次完整成本索引。
-	explicit MuxTreeIndex(Module *module) : module(module), costs(module), sigmap(costs.sigmap) { }
-
-	void rebuild()
+	MuxTreeIndex(Module *module) : module(module), sigmap(module)
 	{
-		driver.clear(); parent.clear(); children.clear(); roots.clear();
-		for (const auto &entry : costs.drivers) {
-			Cell *cell = costs.unique_driver(entry.first);
-			if (cell != nullptr)
-				driver[entry.first] = cell;
-		}
+		comb_ct.setup_internals_eval();
+		comb_ct.setup_stdcells_eval();
 
-		for (Cell *cell : module->selected_cells()) {
-			if (!is_mux_node(cell) || !costs.mutable_cell(cell))
+		for (auto wire : module->wires())
+			if (wire->port_output)
+				for (auto bit : sigmap(wire))
+					if (bit.wire)
+						port_bits.insert(bit);
+
+		for (auto cell : module->cells())
+			for (auto &conn : cell->connections()) {
+				bool is_output = cell->output(conn.first);
+				for (auto bit : sigmap(conn.second)) {
+					if (!bit.wire)
+						continue;
+					if (is_output)
+						driver[bit] = cell;
+					else {
+						use_count[bit]++;
+						users[bit].insert(cell);
+					}
+				}
+			}
+
+		for (auto cell : module->selected_cells()) {
+			if (!is_mux_node(cell))
 				continue;
 			MuxPort found = {nullptr, -1};
-			bool valid = true;
-			for (SigBit bit : sigmap(cell->getPort(ID::Y))) {
-				MuxPort candidate = find_parent_port(bit);
-				if (candidate.cell == nullptr || candidate.cell == cell ||
-					(found.cell != nullptr && !(found == candidate))) {
-					valid = false;
+			bool ok = true;
+			for (auto bit : sigmap(cell->getPort(ID::Y))) {
+				MuxPort p = find_parent_port(bit);
+				if (p.cell == nullptr || p.cell == cell || (found.cell != nullptr && !(found == p))) {
+					ok = false;
 					break;
 				}
-				found = candidate;
+				found = p;
 			}
-			if (valid && found.cell != nullptr) {
+			if (ok && found.cell != nullptr) {
 				parent[cell] = found;
 				children[found].push_back(cell);
 			}
 		}
-		for (Cell *cell : module->selected_cells())
-			if (is_mux_node(cell) && costs.mutable_cell(cell) && !parent.count(cell))
+
+		for (auto cell : module->selected_cells())
+			if (is_mux_node(cell) && !parent.count(cell))
 				roots.push_back(cell);
 	}
 
-	// 只有全部Y位具有唯一驱动、use_count=1、没有模块输出或保护观察、
-	// 唯一使用者是父MUX的A/B端口时才登记父子路径。
+	// bit 只有一个使用者并且是某个 mux 数据端口里的唯一一次出现时，返回该端口
 	MuxPort find_parent_port(SigBit bit)
 	{
-		if (!bit.wire || costs.output_bits.count(bit) || costs.protected_bits.count(bit) ||
-			costs.use_count.at(bit, 0) != 1 || costs.unique_driver(bit) == nullptr)
+		if (!bit.wire || port_bits.count(bit) || use_count[bit] != 1)
 			return {nullptr, -1};
-		const auto &ports = costs.users.at(bit);
-		if (GetSize(ports) != 1)
+		Cell *user = *users[bit].begin();
+		if (!is_mux_node(user) || !module->selected(user))
 			return {nullptr, -1};
-		const auto &port = ports.front();
-		Cell *user = module->cell(port.cell);
-		if (user == nullptr || !is_mux_node(user) || !module->selected(user) ||
-			!costs.mutable_cell(user) || !port.port.in(ID::A, ID::B))
-			return {nullptr, -1};
-		int index = port.port == ID::A ? 0 : user->type == ID($mux) ? 1 : 1 + port.offset / mux_width(user);
-		return {user, index};
+		for (auto bit_s : sigmap(user->getPort(ID::S)))
+			if (bit_s == bit)
+				return {nullptr, -1};
+		int n = mux_port_count(user);
+		MuxPort found = {nullptr, -1};
+		for (int i = 0; i < n; i++)
+			for (auto b : mux_port_sig(sigmap, user, i))
+				if (b == bit) {
+					if (found.cell != nullptr)
+						return {nullptr, -1};
+					found = {user, i};
+				}
+		return found;
 	}
 };
 
 YOSYS_NAMESPACE_END
+
 #endif

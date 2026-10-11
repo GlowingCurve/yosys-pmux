@@ -10,6 +10,7 @@ PRIVATE_NAMESPACE_BEGIN
 // signal bits is a function from those bits to the leaf data words. Build its ADD with the
 // heuristic "split on the bit that minimizes the terminal kinds of both children" and
 // replace the tree when the shared mux ledger reports a positive gain.
+static const int TERM_DC = -1;
 static const int TERM_CONFLICT = -2;
 
 struct TreeNode {
@@ -43,10 +44,6 @@ struct RebuildWorker
 	dict<SigBit, int> var_ids;
 	pool<Cell *> ctrl_cells;
 	bool ctrl_ok;
-	bool collect_ok = true;
-	int64_t table_budget = 1000000;
-	MuxWorkspace workspace;
-	MuxWorkspace *candidate_workspace = nullptr;
 
 	// ADD，叶子编号 t 的节点为 {-1, t, t}
 	vector<AddNode> add;
@@ -59,10 +56,12 @@ struct RebuildWorker
 
 	RebuildWorker(MuxTreeIndex &idx, int max_vars, bool dry_run, bool force) :
 			idx(idx), sigmap(idx.sigmap), module(idx.module), max_vars(max_vars),
-			dry_run(dry_run), force(force), workspace(idx.costs.resources) { }
+			dry_run(dry_run), force(force) { }
 
 	int term_id(const SigSpec &sig)
 	{
+		if (sig.is_fully_undef())
+			return TERM_DC;
 		auto it = term_ids.find(sig);
 		if (it != term_ids.end())
 			return it->second;
@@ -70,13 +69,8 @@ struct RebuildWorker
 		return term_ids[sig] = GetSize(terms) - 1;
 	}
 
-	int collect(Cell *cell, int depth = 0)
+	int collect(Cell *cell)
 	{
-		if (depth > 256 || GetSize(nodes) >= 4096 || !idx.costs.resources.charge(32) ||
-			!candidate_workspace->reserve(256 + GetSize(cell->getPort(ID::Y)) * 32)) {
-			collect_ok = false;
-			return 0;
-		}
 		int id = GetSize(nodes);
 		nodes.push_back({cell, {}});
 		tree_cells.insert(cell);
@@ -87,7 +81,7 @@ struct RebuildWorker
 			auto cit = idx.children.find({cell, i});
 			if (cit != idx.children.end() && GetSize(cit->second) == 1 &&
 					sigmap(cit->second[0]->getPort(ID::Y)) == sig)
-				ports.push_back(~collect(cit->second[0], depth + 1));
+				ports.push_back(~collect(cit->second[0]));
 			else
 				ports.push_back(term_id(sig));
 		}
@@ -96,33 +90,29 @@ struct RebuildWorker
 	}
 
 	// 控制位由 eq/ne/logic_not/reduce_or/reduce_bool/not 组成的表达式计算，表达式的叶子是变量
-	void classify(SigBit bit, int depth = 0)
+	void classify(SigBit bit)
 	{
-		if ((!bit.wire && bit != State::S0 && bit != State::S1) || depth > 256 || GetSize(ctrl_cells) > 4096 ||
-			!idx.costs.resources.charge(8)) {
-			ctrl_ok = false;
-			return;
-		}
 		if (!bit.wire || var_ids.count(bit))
 			return;
 		auto drv = idx.driver.find(bit);
 		Cell *cell = drv == idx.driver.end() ? nullptr : drv->second;
 		if (cell != nullptr && !tree_cells.count(cell) &&
-				idx.costs.mutable_cell(cell) &&
 				cell->type.in(ID($eq), ID($ne), ID($logic_not), ID($reduce_or), ID($reduce_bool), ID($not))) {
 			if (ctrl_cells.insert(cell).second) {
 				for (auto in : sigmap(cell->getPort(ID::A)))
-					classify(in, depth + 1);
+					classify(in);
 				if (cell->hasPort(ID::B))
 					for (auto in : sigmap(cell->getPort(ID::B)))
-						classify(in, depth + 1);
+						classify(in);
 			}
 			return;
 		}
-		var_ids[bit] = GetSize(vars);
-		vars.push_back(bit);
-		if (GetSize(vars) > max_vars)
-			ctrl_ok = false;
+		if (!var_ids.count(bit)) {
+			var_ids[bit] = GetSize(vars);
+			vars.push_back(bit);
+			if (GetSize(vars) > max_vars)
+				ctrl_ok = false;
+		}
 	}
 
 	// 在变量赋值 mask 下计算一位控制信号
@@ -130,7 +120,6 @@ struct RebuildWorker
 
 	bool eval_bit(SigBit bit, int mask)
 	{
-		idx.costs.resources.charge(1);
 		if (!bit.wire)
 			return bit == State::S1;
 		auto vit = var_ids.find(bit);
@@ -181,9 +170,8 @@ struct RebuildWorker
 	{
 		const TreeNode &tn = nodes[node];
 		auto leaf_of = [&](int i) {
-			// 端口是叶子编号（>=0）或子节点下标取反（<=-2）
 			int p = tn.ports[i];
-			return p >= 0 ? p : eval_tree(~p, mask);
+			return p >= 0 || p == TERM_DC ? p : eval_tree(~p, mask);
 		};
 		Cell *cell = tn.cell;
 		if (cell->type == ID($mux)) {
@@ -191,7 +179,7 @@ struct RebuildWorker
 			return leaf_of(s ? 1 : 0);
 		}
 		SigSpec s = sigmap(cell->getPort(ID::S));
-		int result = 0;
+		int result = TERM_DC;
 		bool any = false;
 		for (int i = 0; i < GetSize(s); i++) {
 			if (!eval_bit(s[i], mask))
@@ -216,8 +204,6 @@ struct RebuildWorker
 		auto it = add_cache.find(key);
 		if (it != add_cache.end())
 			return it->second;
-		if (!workspace.reserve(256))
-			return lo;
 		add.push_back({var, lo, hi});
 		return add_cache[key] = GetSize(add) - 1;
 	}
@@ -229,8 +215,6 @@ struct RebuildWorker
 		auto it = leaf_nodes.find(term);
 		if (it != leaf_nodes.end())
 			return it->second;
-		if (!workspace.reserve(128))
-			return -1;
 		add.push_back({-1, term, term});
 		return leaf_nodes[term] = GetSize(add) - 1;
 	}
@@ -239,19 +223,18 @@ struct RebuildWorker
 	{
 		pool<int> seen;
 		for (int t : table)
-			seen.insert(t);
+			if (t != TERM_DC)
+				seen.insert(t);
 		return GetSize(seen);
 	}
 
 	// table 的第 k 位对应 vlist 中的第 k 个变量；返回 ADD 节点，-1 表示全部无关
 	int build(const vector<int> &table, const vector<int> &vlist)
 	{
-		if (!idx.costs.resources.charge(GetSize(table) * (GetSize(vlist) + 1)) ||
-			!candidate_workspace->reserve(128 + (GetSize(table) + GetSize(vlist)) * 16))
-			return -1;
 		pool<int> seen;
 		for (int t : table)
-			seen.insert(t);
+			if (t != TERM_DC)
+				seen.insert(t);
 		if (seen.empty())
 			return -1;
 		if (GetSize(seen) == 1)
@@ -293,6 +276,23 @@ struct RebuildWorker
 		return build_cache[key] = res;
 	}
 
+	int count_muxes(int root)
+	{
+		pool<int> seen;
+		vector<int> todo = {root};
+		int count = 0;
+		while (!todo.empty()) {
+			int n = todo.back();
+			todo.pop_back();
+			if (!seen.insert(n).second || add[n].var < 0)
+				continue;
+			count++;
+			todo.push_back(add[n].lo);
+			todo.push_back(add[n].hi);
+		}
+		return count;
+	}
+
 	// 输出一条候选记录：前缀固定，空格分隔 k=v
 	void log_candidate(int cand, const char *decision, int64_t gain, int64_t removed, int64_t dead, int64_t added, const char *note)
 	{
@@ -301,7 +301,7 @@ struct RebuildWorker
 				(long long)added, note);
 	}
 
-	SigSpec emit(int n, dict<int, SigSpec> &emitted)
+	SigSpec emit(int n, int width, dict<int, SigSpec> &emitted)
 	{
 		auto it = emitted.find(n);
 		if (it != emitted.end())
@@ -310,8 +310,8 @@ struct RebuildWorker
 		if (add[n].var < 0)
 			res = terms[add[n].lo];
 		else {
-			SigSpec lo = emit(add[n].lo, emitted);
-			SigSpec hi = emit(add[n].hi, emitted);
+			SigSpec lo = emit(add[n].lo, width, emitted);
+			SigSpec hi = emit(add[n].hi, width, emitted);
 			res = module->Mux(NEW_ID, lo, hi, vars[add[n].var]);
 		}
 		return emitted[n] = res;
@@ -321,65 +321,11 @@ struct RebuildWorker
 		Cell *root;
 		int add_root;
 		vector<Cell *> cells;
-		vector<SigBit> vars;
-		vector<SigSpec> terms;
 	};
 	vector<Plan> plans;
 
-	struct Cost {
-		bool feasible;
-		int64_t removed, dead, added, gain;
-		int64_t update_work;
-	};
-
-	// 提交判据，与 analyze() 的判定链同义：不可行拒绝，-force 放行，否则要求正收益
-	// 且比较器全部保留时新增的 LUT4 成本不超过删除所得的一半。analyze() 与 apply() 共用。
-	bool accepts(const Cost &cost, bool force) const
-	{
-		if (!cost.feasible)
-			return false;
-		return force || (cost.gain > 0 && !(cost.dead == 0 && 2 * cost.added > cost.removed));
-	}
-
-	Cost price(Cell *root, int add_root, const vector<Cell *> &removed)
-	{
-		MuxLedger ledger(idx.costs);
-		ledger.alias_commit = true;
-		for (Cell *cell : removed)
-			ledger.drop_cell(cell);
-		using Word = Lut4Functions::Word;
-		dict<int, Word> memo;
-		std::function<Word(int)> build_cost = [&](int n) -> Word {
-			auto found = memo.find(n);
-			if (found != memo.end())
-				return found->second;
-			const AddNode &node = add[n];
-			if (node.var < 0)
-				return memo[n] = idx.costs.word(terms[node.lo]);
-			Word lo = build_cost(node.lo), hi = build_cost(node.hi), outputs;
-			for (int child : {node.lo, node.hi})
-				if (add[child].var < 0)
-					ledger.acquire(terms[add[child].lo]);
-			ledger.acquire(vars[node.var]);
-			auto select = idx.costs.word(vars[node.var]).at(0);
-			for (int i = 0; i < GetSize(lo); i++)
-				outputs.push_back(idx.costs.functions.mux(lo[i], hi[i], select));
-			idx.costs.functions.boundary(outputs);
-			return memo[n] = outputs;
-		};
-		ledger.add_outputs(root->getPort(ID::Y), build_cost(add_root));
-		if (add[add_root].var < 0)
-			ledger.acquire(terms[add[add_root].lo]);
-		bool feasible = ledger.settle();
-		return {feasible, ledger.removed_gain, ledger.dead_result, ledger.added_cost, ledger.gain, idx.costs.resources.commit_reserved};
-	}
-
 	void analyze(Cell *root)
 	{
-		if (idx.costs.resources.exhausted || !idx.costs.mutable_cell(root))
-			return;
-		MuxWorkspace scratch(idx.costs.resources);
-		candidate_workspace = &scratch;
 		nodes.clear();
 		terms.clear();
 		term_ids.clear();
@@ -388,16 +334,11 @@ struct RebuildWorker
 		var_ids.clear();
 		ctrl_cells.clear();
 		ctrl_ok = true;
-		collect_ok = true;
 		// 叶子编号只在一棵树内有效
 		leaf_nodes.clear();
 		build_cache.clear();
 
 		collect(root);
-		if (!collect_ok) {
-			log_candidate(++cand, "infeasible", 0, 0, 0, 0, "budget");
-			return;
-		}
 		if (GetSize(nodes) < 2 && mux_port_count(root) < 3)
 			return;
 
@@ -414,13 +355,6 @@ struct RebuildWorker
 		}
 
 		int nv = GetSize(vars);
-		if (nv > 20 || (int64_t(1) << nv) > table_budget ||
-			!scratch.reserve((int64_t(1) << nv) * 16) ||
-			!idx.costs.resources.charge((int64_t(1) << nv) * GetSize(nodes))) {
-			log_candidate(++cand, "infeasible", 0, 0, 0, 0, "budget");
-			return;
-		}
-		table_budget -= int64_t(1) << nv;
 		vector<int> table(1 << nv);
 		for (int mask = 0; mask < (1 << nv); mask++) {
 			memo.clear();
@@ -436,36 +370,53 @@ struct RebuildWorker
 		for (int i = 0; i < nv; i++)
 			vlist.push_back(i);
 		int add_root = build(table, vlist);
-		if (add_root < 0 || idx.costs.resources.exhausted)
+		if (add_root < 0)
 			return;
 
-		vector<Cell *> removed;
+		// 树里每个单元的 Y 都完整接入父节点的数据端口（collect 比对过整个信号），
+		// 所以整棵树都是 width 位有效的；把 mux_width(root) 当有效位宽传给账本，
+		// 与下面按 count_muxes * width 计价的新树同口径，同时省掉端口遍历。
+		int width = mux_width(root);
+		MuxLedger ledger(module);
 		for (auto &tn : nodes)
-			removed.push_back(tn.cell);
-		Cost cost = price(root, add_root, removed);
-		int64_t removed_mux = cost.removed, added_mux = cost.added, removed_ctrl = cost.dead, gain = cost.gain;
+			ledger.drop_cell(tn.cell, width);
+		// 新的决策图会用到这些数据字与控制位，不占用它们会让死亡传播把驱动单元误判成死亡
+		for (auto &term : terms)
+			ledger.acquire(term);
+		for (auto &var : vars)
+			ledger.acquire(var);
+		// 树单元的删除所得与账本口径一致，按同样的 cell_cost 与同样的有效位宽单独求和
+		int64_t removed_mux = 0;
+		for (auto &tn : nodes)
+			removed_mux += MuxLedger::cell_cost(tn.cell, width);
+		int64_t added_mux = (int64_t)count_muxes(add_root) * width;
+		ledger.add_cost(added_mux);
+		int64_t removed_ctrl = ledger.dead_cost();
+		int64_t gain = ledger.net_gain();
 
 		log_debug("  root %s: %d vars, removed %lld, dead %lld, added %lld, gain %lld\n",
 				log_id(root), nv, (long long)removed_mux, (long long)removed_ctrl,
 				(long long)added_mux, (long long)gain);
 
-		bool rebuild = accepts(cost, force);
-		const char *decision, *note;
-		if (!cost.feasible) {
-			decision = "infeasible";
-			note = "unsupported";
-		} else if (force) {
+		bool rebuild;
+		const char *decision;
+		const char *note;
+		if (force) {
 			// -force 忽略门槛，可以评估的候选全部施加
+			rebuild = true;
 			decision = "forced";
 			note = "kept";
 		} else if (gain <= 0) {
+			rebuild = false;
 			decision = "reject";
 			note = "no_gain";
 		} else if (removed_ctrl == 0 && 2 * added_mux > removed_mux) {
-			// 比较器全部保留时，新图的新增 LUT4 成本限制为删除所得的一半。
+			// 论文的 Check：比较器全部保留时，mux 位数至少减半才值得改变树的结构
+			rebuild = false;
 			decision = "reject";
 			note = "half_rule";
 		} else {
+			rebuild = true;
 			decision = "accept";
 			note = "kept";
 		}
@@ -475,37 +426,34 @@ struct RebuildWorker
 			return;
 
 		Plan plan;
-		if (!workspace.reserve(256 + GetSize(nodes) * 32 + GetSize(vars) * 32 + GetSize(terms) * 128))
-			return;
 		plan.root = root;
 		plan.add_root = add_root;
-		plan.cells = std::move(removed);
-		plan.vars = vars;
-		plan.terms = terms;
+		for (auto &tn : nodes)
+			plan.cells.push_back(tn.cell);
 		plans.push_back(plan);
+		plan_vars.push_back(vars);
+		plan_terms.push_back(terms);
 		log("  accepted %s: %d mux cells, %d vars, ledger gain %lld\n",
 				log_id(root), GetSize(nodes), nv, (long long)gain);
 	}
+
+	vector<vector<SigBit>> plan_vars;
+	vector<vector<SigSpec>> plan_terms;
 
 	void apply()
 	{
 		if (dry_run)
 			return;
-		for (Plan &plan : plans) {
-			vars = plan.vars;
-			terms = plan.terms;
-			Cost cost = price(plan.root, plan.add_root, plan.cells);
-			if (!accepts(cost, force))
-				continue;
-			log_assert(idx.costs.resources.reserve_commit(cost.update_work));
+		for (int i = 0; i < GetSize(plans); i++) {
+			Plan &plan = plans[i];
+			vars = plan_vars[i];
+			terms = plan_terms[i];
 			dict<int, SigSpec> emitted;
 			SigSpec y = plan.root->getPort(ID::Y);
-			SigSpec res = emit(plan.add_root, emitted);
+			SigSpec res = emit(plan.add_root, GetSize(y), emitted);
 			for (auto cell : plan.cells)
 				module->remove(cell);
 			module->connect(y, res);
-			idx.costs.refresh();
-			idx.costs.resources.commit_reserved = 0;
 			rebuilt++;
 		}
 	}
@@ -515,6 +463,7 @@ struct OptMuxRebuildPass : public Pass {
 	OptMuxRebuildPass() : Pass("opt_muxrebuild", "rebuild muxtrees controlled by comparators") { }
 	void help() override
 	{
+		//   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
 		log("\n");
 		log("    opt_muxrebuild [options] [selection]\n");
 		log("\n");
@@ -528,8 +477,8 @@ struct OptMuxRebuildPass : public Pass {
 		log("words and the control bits of the new diagram and the new $mux cells are booked\n");
 		log("with one cost model, and the comparators that lose all their users follow from\n");
 		log("the dead propagation of the ledger. The tree is replaced when the ledger gain is\n");
-		log("positive. When no comparator is removed, newly needed LUT4 functions must cost\n");
-		log("at most half the removed functions. Each candidate is reported starting with\n");
+		log("positive. When no comparator is removed, the new mux bits must be at most half\n");
+		log("of the old mux bits. Each candidate is reported on a line starting with\n");
 		log("\"MUXLEDGER\".\n");
 		log("\n");
 		log("    -max_vars <n>\n");
@@ -585,10 +534,6 @@ struct OptMuxRebuildPass : public Pass {
 			if (module->has_processes_warn())
 				continue;
 			MuxTreeIndex idx(module);
-			if (!idx.costs.type_scan([](const Cell *cell) { return cell->type.in(ID($mux), ID($pmux)); }, 1, "muxrebuild"))
-				continue;
-			idx.costs.refresh();
-			idx.rebuild();
 			RebuildWorker worker(idx, max_vars, dry_run, force);
 			for (auto root : idx.roots)
 				worker.analyze(root);

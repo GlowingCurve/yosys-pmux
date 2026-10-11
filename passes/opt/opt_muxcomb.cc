@@ -5,34 +5,13 @@
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
 
-struct MuxcombWireCleanup
-{
-	Module *module;
-	pool<IdString> unused;
-	explicit MuxcombWireCleanup(Module *module) : module(module) { }
-	~MuxcombWireCleanup()
-	{
-		// 全部 SigBit 索引与函数缓存销毁之后，统一删除临时输出线。
-		pool<Wire *> wires;
-		for (IdString name : unused) {
-			Wire *wire = module->wire(name);
-			log_assert(wire != nullptr);
-			wires.insert(wire);
-		}
-		module->remove(wires);
-	}
-};
-
 // Wang et al., "Optimization of Multiplexer Combination in RTL Logic Synthesis", ISEDA 2023.
 // s0 ? (s2 ? b : a) : (s1 ? b : a)  =>  (s0 ? s2 : s1) ? b : a     (Fig.4)
 // s0 ? b : (s1 ? b : a)             =>  (s0 | s1) ? b : a          (Fig.6)
 struct OptMuxcombWorker
 {
 	Module *module;
-	MuxCostContext &costs;
-	SigMap &sigmap;
-	MuxWorkspace workspace;
-	MuxWorkspace &wire_workspace;
+	SigMap sigmap;
 	bool dry_run;
 	bool force;
 	int &cand;
@@ -75,22 +54,31 @@ struct OptMuxcombWorker
 	};
 	vector<Expansion> expansions;
 
-	OptMuxcombWorker(Module *module, MuxCostContext &costs, MuxWorkspace &wire_workspace, bool dry_run, bool force, int &cand) : module(module), costs(costs), sigmap(costs.sigmap),
-			workspace(costs.resources), wire_workspace(wire_workspace), dry_run(dry_run), force(force), cand(cand)
+	OptMuxcombWorker(Module *module, bool dry_run, bool force, int &cand) : module(module), sigmap(module),
+			dry_run(dry_run), force(force), cand(cand)
 	{
-		if (!workspace.reserve(1024 + (GetSize(costs.use_count) + GetSize(costs.drivers)) * 256))
-			return;
-		users = costs.use_count;
-		for (SigBit bit : costs.output_bits)
-			users[bit]++;
-		for (SigBit bit : costs.protected_bits)
-			if (!costs.output_bits.count(bit))
-				users[bit]++;
-		for (const auto &entry : costs.drivers)
-			drivers[entry.first] = GetSize(entry.second);
-		costs.resources.charge(GetSize(users) + GetSize(drivers));
+		for (auto wire : module->wires()) {
+			if (wire->port_output || wire->get_bool_attribute(ID::keep))
+				for (auto bit : sigmap(wire))
+					users[bit]++;
+			if (wire->port_input)
+				for (auto bit : sigmap(wire))
+					drivers[bit]++;
+		}
+		for (auto cell : module->cells())
+			for (auto &conn : cell->connections()) {
+				// 未知单元的端口同时作为使用者和潜在驱动者。
+				bool input = !cell->known() || cell->input(conn.first);
+				bool output = !cell->known() || cell->output(conn.first);
+				for (auto bit : sigmap(conn.second)) {
+					if (input)
+						users[bit]++;
+					if (output)
+						drivers[bit]++;
+				}
+			}
 		for (auto cell : module->selected_cells())
-			if (cell->type == ID($mux) && costs.mutable_cell(cell)) {
+			if (cell->type == ID($mux) && !cell->get_bool_attribute(ID::keep)) {
 				SigSpec y = sigmap(cell->getPort(ID::Y));
 				for (int i = 0; i < GetSize(y); i++)
 					mux_driver[y[i]] = {cell, i};
@@ -103,7 +91,7 @@ struct OptMuxcombWorker
 		if (GetSize(sig) == 0 || !mux_driver.count(sig[0]))
 			return {};
 		Cell *c = mux_driver.at(sig[0]).first;
-		if (c == top || reserved.count(c) || !costs.mutable_cell(c))
+		if (c == top || reserved.count(c))
 			return {};
 		pool<SigBit> used;
 		Branch branch;
@@ -125,119 +113,92 @@ struct OptMuxcombWorker
 		return branch;
 	}
 
-	// 同一选择计划提供函数成本、实际输入出现次数与最终发射结构。
-	struct ControlPlan {
-		struct Node {
-			IdString type;
-			SigBit signal;
-			vector<int> inputs;
-			Lut4Functions::Ref function;
-		};
-		MuxCostContext &costs;
-		vector<Node> nodes;
-		dict<SigBit, int> leaves;
-		ControlPlan(MuxCostContext &costs) : costs(costs) { }
-		int leaf(SigBit signal)
-		{
-			if (leaves.count(signal))
-				return leaves.at(signal);
-			int id = GetSize(nodes);
-			nodes.push_back({IdString(), signal, {}, costs.word(signal).at(0)});
-			return leaves[signal] = id;
-		}
-		int operation(IdString type, vector<int> inputs)
-		{
-			Lut4Functions::Word functions;
-			for (int input : inputs)
-				functions.push_back(nodes[input].function);
-			auto function = costs.functions.apply(type, functions);
-			costs.functions.boundary({function});
-			int id = GetSize(nodes);
-			nodes.push_back({type, SigBit(), inputs, function});
-			return id;
-		}
-		int invert(int id)
-		{
-			if (nodes[id].type.empty()) {
-				if (nodes[id].signal == State::S0)
-					return leaf(State::S1);
-				if (nodes[id].signal == State::S1)
-					return leaf(State::S0);
-			}
-			return operation(ID($not), {id});
-		}
-		int mux(int select, int lo, int hi)
-		{
-			auto is = [&](int id, State state) { return nodes[id].type.empty() && nodes[id].signal == state; };
-			if (is(select, State::S0) || lo == hi)
-				return lo;
-			if (is(select, State::S1))
-				return hi;
-			if (is(lo, State::S0) && is(hi, State::S1))
-				return select;
-			if (is(lo, State::S1) && is(hi, State::S0))
-				return invert(select);
-			if (is(lo, State::S0))
-				return operation(ID($and), {select, hi});
-			if (is(hi, State::S1))
-				return operation(ID($or), {select, lo});
-			if (is(hi, State::S0))
-				return operation(ID($and), {invert(select), lo});
-			if (is(lo, State::S1))
-				return operation(ID($or), {invert(select), hi});
-			return operation(ID($mux), {lo, hi, select});
-		}
-		void account(int root, MuxLedger &ledger)
-		{
-			pool<int> seen;
-			vector<int> todo = {root};
-			if (nodes[root].type.empty())
-				ledger.acquire(nodes[root].signal);
-			while (!todo.empty()) {
-				int id = todo.back(); todo.pop_back();
-				if (!seen.insert(id).second)
-					continue;
-				for (int input : nodes[id].inputs) {
-					if (nodes[input].type.empty())
-						ledger.acquire(nodes[input].signal);
-					else
-						todo.push_back(input);
-				}
-			}
-		}
-		SigBit emit(int root, pool<IdString> &modified)
-		{
-			dict<int, SigBit> memo;
-			std::function<SigBit(int)> build = [&](int id) -> SigBit {
-				if (memo.count(id))
-					return memo.at(id);
-				const Node &node = nodes[id];
-				if (node.type.empty())
-					return node.signal;
-				vector<SigBit> inputs;
-				for (int input : node.inputs)
-					inputs.push_back(build(input));
-				Wire *wire = costs.module->addWire(NEW_ID);
-				Cell *cell;
-				if (node.type == ID($not))
-					cell = costs.module->addNot(NEW_ID, inputs[0], wire);
-				else if (node.type == ID($and))
-					cell = costs.module->addAnd(NEW_ID, inputs[0], inputs[1], wire);
-				else if (node.type == ID($or))
-					cell = costs.module->addOr(NEW_ID, inputs[0], inputs[1], wire);
-				else
-					cell = costs.module->addMux(NEW_ID, inputs[0], inputs[1], inputs[2], wire);
-				modified.insert(cell->name);
-				return memo[id] = SigBit(wire);
-			};
-			return build(root);
-		}
-	};
+	// invert() 将要新建的单元个数：常量取反不新建单元，其余情形一个一位宽 $not
+	int64_t invert_cost(SigBit bit)
+	{
+		return (bit == State::S0 || bit == State::S1) ? 0 : 1;
+	}
+
+	// invert() 的预测版本：常量取反的结果还是常量，其余情形新建一个 $not 单元。
+	// 新建出来的信号位非恒定，也不会与 lo 相等，用一个与 lo 不同的无连线状态位代表它
+	static SigBit predicted_invert(SigBit bit, SigBit lo)
+	{
+		if (bit == State::S0)
+			return State::S1;
+		if (bit == State::S1)
+			return State::S0;
+		return lo == State::Sx ? SigBit(State::Sz) : SigBit(State::Sx);
+	}
+
+	// mux_bit 的预测版本：不创建任何单元，返回它将会创建的单元的代价之和。
+	// 分支结构与 mux_bit 逐字对应；新建的门都是一位宽，按 muxledger.h 的口径各记 1
+	int64_t control_cost(SigBit s, SigBit lo, SigBit hi)
+	{
+		if (s == State::S0)
+			return 0;                    // 直接返回 lo
+		if (s == State::S1)
+			return 0;                    // 直接返回 hi
+		if (lo == hi)
+			return 0;                    // 直接返回 lo
+		if (lo == State::S0 && hi == State::S1)
+			return 0;                    // 直接返回 s
+		if (lo == State::S1 && hi == State::S0)
+			return invert_cost(s);       // Not(s)
+		if (lo == State::S0)
+			return 1;                    // And(s, hi)
+		if (hi == State::S1)
+			return 1;                    // Or(s, lo)
+		if (hi == State::S0)
+			return invert_cost(s) + 1;   // And(Not(s), lo)
+		if (lo == State::S1)
+			return invert_cost(s) + 1;   // Or(Not(s), hi)
+		return 1;                        // Mux(lo, hi, s)
+	}
+
+	// 这次合并新建的整个选择信号的代价：hi 分支反相时先取反一位，再进 mux_bit
+	int64_t select_cost(const Combination &comb)
+	{
+		// comb.lo.inverted 恒为 false，lo 就是 comb.lo.s
+		if (!comb.hi.inverted)
+			return control_cost(comb.s, comb.lo.s, comb.hi.s);
+		return invert_cost(comb.hi.s)
+				+ control_cost(comb.s, comb.lo.s, predicted_invert(comb.hi.s, comb.lo.s));
+	}
+
+	SigBit invert(SigBit bit)
+	{
+		if (bit == State::S0)
+			return State::S1;
+		if (bit == State::S1)
+			return State::S0;
+		return module->Not(NEW_ID, bit);
+	}
+
+	SigBit mux_bit(SigBit s, SigBit lo, SigBit hi)
+	{
+		if (s == State::S0)
+			return lo;
+		if (s == State::S1)
+			return hi;
+		if (lo == hi)
+			return lo;
+		if (lo == State::S0 && hi == State::S1)
+			return s;
+		if (lo == State::S1 && hi == State::S0)
+			return invert(s);
+		if (lo == State::S0)
+			return module->And(NEW_ID, s, hi);
+		if (hi == State::S1)
+			return module->Or(NEW_ID, s, lo);
+		if (hi == State::S0)
+			return module->And(NEW_ID, invert(s), lo);
+		if (lo == State::S1)
+			return module->Or(NEW_ID, invert(s), hi);
+		return module->Mux(NEW_ID, lo, hi, s);
+	}
 
 	void find_expansion(Cell *top)
 	{
-		if (!costs.resources.charge(32))
-			return;
 		for (auto port : {ID::A, ID::B}) {
 			IdString other_port = port == ID::A ? ID::B : ID::A;
 			Branch child = child_mux(top, sigmap(top->getPort(other_port)));
@@ -248,8 +209,6 @@ struct OptMuxcombWorker
 				continue;
 			SigBit s = repeated == child.a ? State::S0 : State::S1;
 			Expansion expansion;
-			if (!workspace.reserve(512 + GetSize(repeated) * 32))
-				return;
 			expansion.top = top;
 			expansion.top_name = top->name;
 			expansion.port = port;
@@ -267,32 +226,14 @@ struct OptMuxcombWorker
 	bool expand()
 	{
 		// -dry-run 不创建单元，也不改写端口
-		if (dry_run || costs.resources.exhausted)
+		if (dry_run)
 			return false;
 		for (auto cell : module->selected_cells())
-			if (cell->type == ID($mux) && costs.mutable_cell(cell) && !reserved.count(cell))
+			if (cell->type == ID($mux) && !cell->get_bool_attribute(ID::keep) && !reserved.count(cell))
 				find_expansion(cell);
-		if (expansions.empty())
-			return false;
-		int64_t update_work = 1024 + costs.index_work() * 3;
-		int64_t wire_bytes = 0;
-		for (const auto &expansion : expansions) {
-			update_work += GetSize(expansion.a) * 64;
-			// 延迟删除的 Wire、稳定名字集合和新增索引条目保持到成本上下文结束。
-			wire_bytes += 512 + GetSize(expansion.a) * 256;
-		}
-		if (costs.resources.limit > 0 && update_work * 2 > costs.resources.limit - costs.resources.used)
-			return false;
-		if (!costs.resources.reserve_commit(update_work))
-			return false;
-		costs.resources.restore_reserved = update_work;
-		if (!wire_workspace.reserve(wire_bytes)) {
-			costs.resources.commit_reserved = 0;
-			costs.resources.restore_reserved = 0;
-			return false;
-		}
-		pool<IdString> modified;
 		for (auto &expansion : expansions) {
+			if (!expansion.cell_name.empty())
+				continue;
 			// Fig.6(a)-(b)：创建常量选择 MUX，并用其输出替换父节点的重复输入。
 			Wire *y = module->addWire(NEW_ID, GetSize(expansion.a));
 			Cell *child = module->addMux(NEW_ID, expansion.a, expansion.b, expansion.s, y,
@@ -301,24 +242,17 @@ struct OptMuxcombWorker
 			expansion.top->setPort(expansion.port, y);
 			expansion.cell_name = child->name;
 			expansion.wire_name = y->name;
-			modified.insert(child->name);
-			modified.insert(expansion.top->name);
 			module->design->select(module, child);
 			module->design->select(module, y);
 			log("  expanding %s.%s with %s (select %s)\n", log_id(expansion.top),
 					log_id(expansion.port), log_id(child), log_signal(expansion.s));
 		}
-		if (!modified.empty())
-			costs.update(modified);
-		costs.resources.commit_reserved = 0;
 		expanded = GetSize(expansions);
 		return expanded != 0;
 	}
 
 	void find_combination(Cell *top)
 	{
-		if (!costs.resources.charge(32))
-			return;
 		Combination comb;
 		comb.top = top;
 		comb.lo = child_mux(top, sigmap(top->getPort(ID::A)));
@@ -333,8 +267,6 @@ struct OptMuxcombWorker
 		if (comb.hi.a == comb.b && comb.hi.b == comb.a)
 			comb.hi.inverted = true;
 		else if (comb.hi.a != comb.a || comb.hi.b != comb.b)
-			return;
-		if (!workspace.reserve(512 + GetSize(comb.a) * 32))
 			return;
 		combinations.push_back(comb);
 		reserved.insert(top);
@@ -355,51 +287,57 @@ struct OptMuxcombWorker
 	{
 		// 匹配期间保持连接关系不变，每个单元只参加一次变换。
 		for (auto cell : module->selected_cells())
-			if (cell->type == ID($mux) && costs.mutable_cell(cell) && !reserved.count(cell))
+			if (cell->type == ID($mux) && !cell->get_bool_attribute(ID::keep) && !reserved.count(cell))
 				find_combination(cell);
 		for (int index = 0; index < GetSize(combinations); index++) {
-			if (costs.resources.exhausted)
-				break;
 			const Combination &comb = combinations[index];
 
-			MuxLedger ledger(costs);
-			ControlPlan plan(costs);
-			int lo = plan.leaf(comb.lo.s), hi = plan.leaf(comb.hi.s);
-			if (comb.hi.inverted)
-				hi = plan.invert(hi);
-			int select = plan.mux(plan.leaf(comb.s), lo, hi);
-			Lut4Functions::Word a = costs.word(comb.a), b = costs.word(comb.b), outputs;
-			for (int i = 0; i < GetSize(a); i++)
-				outputs.push_back(costs.functions.mux(a[i], b[i], plan.nodes[select].function));
-			ledger.drop_cell(comb.lo.cell);
-			ledger.drop_cell(comb.hi.cell);
-			ledger.replace_outputs(comb.top, outputs);
+			// 新建控制逻辑的代价先预测出来，账本判定通过之后才真的创建。
+			// 两个子节点真正被父节点用到的位宽是 comb.a：child_mux 已经确认子节点其余
+			// 输出位都没有使用者，所以它可以当有效位宽传给账本，同时省掉一次端口遍历。
+			int64_t used_width = GetSize(comb.a);
+			int64_t added = select_cost(comb);
+			int64_t removed = MuxLedger::cell_cost(comb.lo.cell, used_width) + MuxLedger::cell_cost(comb.hi.cell, used_width);
+
+			// 一次决策用一个新建的账本：先计划删除两个子节点、改写父节点的两个数据端口，
+			// 再计划占用合并之后的数据信号与新的选择逻辑读到的控制信号，最后结算。
+			// 父节点保留，$mux 按位宽计价，端口改写不改变它的代价，所以不用 sub_cost。
+			MuxLedger ledger(module);
+			ledger.drop_cell(comb.lo.cell, used_width);
+			ledger.drop_cell(comb.hi.cell, used_width);
+			ledger.drop_port(comb.top, ID::A);
+			ledger.drop_port(comb.top, ID::B);
 			ledger.acquire(comb.a);
 			ledger.acquire(comb.b);
-			plan.account(select, ledger);
-			ledger.settle();
-			int64_t gain = ledger.gain, dead = ledger.dead_result;
-			int64_t removed = ledger.removed_gain, added = ledger.added_cost;
+			// 两个子节点的选择端被删除之后，驱动它们的单元仍然被新的选择逻辑读到。
+			// 这一笔漏记会让还活着的驱动单元在 dead_cost() 里被算成死亡，收益因此虚高。
+			ledger.acquire(comb.s);
+			ledger.acquire(comb.lo.s);
+			ledger.acquire(comb.hi.s);
+			ledger.add_cost(added);
+			int64_t gain = ledger.net_gain();
+			int64_t dead = ledger.dead_cost();
 
 			// 账本预测的净收益大于零才施加，-force 取消这道门槛
-			bool accept = ledger.valid && (force || gain > 0);
+			bool accept = force || gain > 0;
 			log_candidate(!accept ? "reject" : (force ? "forced" : "accept"),
-					gain, removed, dead, added, !ledger.valid ? "unsupported" : accept ? "kept" : "no_gain");
+					gain, removed, dead, added, accept ? "kept" : "no_gain");
 			if (!accept)
 				continue;
 
 			if (!dry_run) {
-				pool<IdString> modified = {comb.top->name, comb.lo.cell->name, comb.hi.cell->name};
-				SigBit selected = plan.emit(select, modified);
+				// Fig.4、Fig.6(b)-(d)：把数据选择转移到一位控制信号，并化简常量支路。
+				// 反相的 hi 分支在这里才创建取反单元，select_cost() 已经把它计入代价。
+				SigBit lo = comb.lo.s;
+				SigBit hi = comb.hi.inverted ? invert(comb.hi.s) : comb.hi.s;
 				comb.top->setPort(ID::A, comb.a);
 				comb.top->setPort(ID::B, comb.b);
-				comb.top->setPort(ID::S, selected);
+				comb.top->setPort(ID::S, mux_bit(comb.s, lo, hi));
 				for (auto child : {comb.lo.cell, comb.hi.cell}) {
 					log("  merging %s into %s\n", log_id(child), log_id(comb.top));
 					module->remove(child);
 				}
 				merged_tops.insert(comb.top->name);
-				costs.update(modified);
 				merged++;
 			}
 			predicted_gain += gain;
@@ -439,10 +377,12 @@ struct OptMuxcombPass : public Pass {
 		log("are skipped. Run before opt_muxtree and opt_expr to simplify the resulting\n");
 		log("control trees as described in Fig.5 and Fig.7.\n");
 		log("\n");
-		log("MuxLedger prices the original and replacement LUT4 function DAGs, including\n");
-		log("the changed parent mux, selection logic and shared functions. A normal\n");
-		log("candidate requires positive gain. Protected signals, multiple drivers and\n");
-		log("combinational cycles remain boundaries, including with -force.\n");
+		log("Whether a combination pays off is decided with the MuxLedger of\n");
+		log("passes/opt/muxledger.h: the cost of the two child $mux cells plus the cost of\n");
+		log("the cells that lose all their users, minus the cost of the new select logic,\n");
+		log("has to be greater than zero. The new select logic covers the $not, $and and\n");
+		log("$or gates for the constant data branches, the 1-bit $mux of the two child\n");
+		log("select signals, and the $not inverting a swapped child select.\n");
 		log("\n");
 		log("An expansion that the same round does not combine away is rolled back: the\n");
 		log("rewritten port gets its old value back, and the new $mux cell and its output\n");
@@ -505,39 +445,30 @@ struct OptMuxcombPass : public Pass {
 			if (module->has_processes_warn())
 				continue;
 
-			// 候选类型集合为{$mux}，至少两个选中对象；达到阈值立即停止扫描。
-			MuxCostContext costs(module);
-			if (!costs.type_scan([](const Cell *cell) { return cell->type == ID($mux); }, 2, "muxcomb"))
-				continue;
-			costs.refresh();
-
 			// 候选序号在一个模块内跨轮次递增，便于在日志里对照
 			int cand = 0;
-			MuxcombWireCleanup wire_cleanup(module);
-			MuxWorkspace wire_workspace(costs.resources);
 
 			if (dry_run) {
 				// 展开会新建单元并改写端口，-dry-run 下只做匹配与结算，
 				// 列出当前连接上的候选
-				OptMuxcombWorker worker(module, costs, wire_workspace, dry_run, force, cand);
+				OptMuxcombWorker worker(module, dry_run, force, cand);
 				worker.run();
 				merged += worker.merged;
 				predicted_gain += worker.predicted_gain;
 				continue;
 			}
 
-			while (!costs.resources.exhausted) {
-				OptMuxcombWorker expansion_worker(module, costs, wire_workspace, dry_run, force, cand);
+			while (true) {
+				OptMuxcombWorker expansion_worker(module, dry_run, force, cand);
 				bool did_expand = expansion_worker.expand();
 				expanded += expansion_worker.expanded;
 				if (expand_only) {
-					costs.resources.restore_reserved = 0;
 					if (!did_expand)
 						break;
 					continue;
 				}
 				// 重新建立索引，使用扩展后电路中的实际子节点执行 Fig.4。
-				OptMuxcombWorker worker(module, costs, wire_workspace, dry_run, force, cand);
+				OptMuxcombWorker worker(module, dry_run, force, cand);
 				bool did_something = worker.run();
 				merged += worker.merged;
 				predicted_gain += worker.predicted_gain;
@@ -547,7 +478,6 @@ struct OptMuxcombPass : public Pass {
 				// 新建的单元一律按名字查回来：run() 可能已经把它删掉，此时它的地址会被
 				// 后来的单元复用，按指针判断会认错单元、删掉别人的驱动。
 				int recycled_here = 0;
-				pool<IdString> restored;
 				for (auto &expansion : expansion_worker.expansions) {
 					if (expansion.cell_name.empty())
 						continue;
@@ -562,8 +492,9 @@ struct OptMuxcombPass : public Pass {
 						recycled_here++;
 						continue;
 					}
-					// 未使用的展开按实际函数依赖记录成本，并恢复原有连接。
-					int64_t cost = GetSize(expansion_worker.costs.cells.at(cell->name).dependencies);
+					// 新建单元的成本按账本口径记为新增代价，撤销之后这笔代价不再存在；
+					// 这个展开 mux 的位宽就是 GetSize(expansion.a)，直接当有效位宽传进去
+					int64_t cost = MuxLedger::cell_cost(cell, GetSize(expansion.a));
 					expansion_worker.log_candidate("reject", -cost, 0, 0, cost, "rollback");
 					// 父节点被别的合并删掉时端口已经没有意义，只清掉新建的单元
 					Cell *top = module->cell(expansion.top_name);
@@ -571,23 +502,16 @@ struct OptMuxcombPass : public Pass {
 						log("  removing expansion %s, its parent is gone\n", log_id(cell));
 					} else {
 						top->setPort(expansion.port, expansion.saved);
-						restored.insert(top->name);
 						log("  rolling back expansion %s of %s.%s\n", log_id(cell),
 								log_id(top), log_id(expansion.port));
 					}
-					restored.insert(cell->name);
 					module->remove(cell);
-					wire_cleanup.unused.insert(expansion.wire_name);
+					Wire *w = module->wire(expansion.wire_name);
+					if (w != nullptr)
+						module->remove({w});
 					rolled_back++;
 				}
 				recycled += recycled_here;
-				costs.resources.commit_reserved = costs.resources.restore_reserved;
-				costs.resources.restore_reserved = 0;
-				if (!restored.empty()) {
-					costs.update(restored);
-					costs.resources.account(costs.index_work(), MuxResources::Commit);
-				}
-				costs.resources.commit_reserved = 0;
 
 				// 展开全部被撤销、又没有发生别的合并时，电路与这一轮开始时一样，
 				// 再循环一次只会重复同样的展开，就此结束
@@ -604,7 +528,7 @@ struct OptMuxcombPass : public Pass {
 		log("Merged %d $mux combinations.\n", merged);
 		log("Expanded %d repeated $mux inputs.\n", expanded);
 		log("Recycled %d expansions, rolled back %d.\n", recycled, rolled_back);
-		log("Ledger predicted gain %lld LUT4 units in total.\n", (long long)predicted_gain);
+		log("Ledger predicted gain %lld cells in total.\n", (long long)predicted_gain);
 	}
 } OptMuxcombPass;
 
