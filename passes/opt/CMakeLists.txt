@@ -91,18 +91,3 @@ yosys_pass(peepopt
 	peepopt.cc
 	${PMGEN_peepopt_OUTPUT}
 )
-yosys_pass(muxtree_share
-	muxtree_share.cc
-)
-yosys_pass(opt_muxcomb
-	opt_muxcomb.cc
-)
-yosys_pass(opt_muxinfer
-	opt_muxinfer.cc
-)
-yosys_pass(opt_muxrebuild
-	opt_muxrebuild.cc
-)
-yosys_pass(opt_reshape
-	opt_reshape.cc
-)
