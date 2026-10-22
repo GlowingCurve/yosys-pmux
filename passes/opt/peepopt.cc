@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// peepopt 按模式化简局部逻辑；shiftpow2 通过边界索引一次提取移位量，减少连续删除信号位的开销。
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
 #include "kernel/utils.h"

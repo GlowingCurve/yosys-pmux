@@ -1,5 +1,5 @@
 pattern shiftpow2
-//
+// 为 peepopt 化简二次幂比例的移位；通过边界索引一次提取有效移位量，减少信号位移动。
 // Optimize shifts that result from expressions such as foo[s*W+:W]
 // when W is a power of two and the multiply has been folded away.
 //
@@ -19,19 +19,20 @@ code
 	if (amount.bits().back() != State::S0)
 		reject;
 
-	while (GetSize(amount) > 1 && amount.bits().back() == State::S0)
-		amount.remove(GetSize(amount) - 1);
+	int amount_width = GetSize(amount);
+	while (amount_width > 1 && amount[amount_width - 1] == State::S0)
+		amount_width--;
 
 	// low zero bits encode the power-of-two scale
 	int log2scale = 0;
-	while (!amount.empty() && amount[0] == State::S0) {
-		amount.remove(0);
+	while (log2scale < amount_width && amount[log2scale] == State::S0) {
 		log2scale++;
 	}
 
 	if (log2scale < 1)
 		reject;
 
+	amount = amount.extract(log2scale, amount_width - log2scale);
 	if (amount.empty() || amount.is_fully_const())
 		reject;
 

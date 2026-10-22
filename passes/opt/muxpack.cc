@@ -17,7 +17,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// muxpack 将互斥的选择器链合并为 PMUX；复用前驱与后继查询结果，减少字典重复查找。
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
 
@@ -218,16 +218,20 @@ struct MuxpackWorker
 	bool is_start_cell(Cell* cell)
 	{
 		SigSpec a_sig = sigmap(cell->getPort(ID::A));
+		auto previous = sig_chain_prev.find(a_sig);
 		if (cell->type == ID($mux)) {
 			SigSpec b_sig = sigmap(cell->getPort(ID::B));
-			if (sig_chain_prev.count(a_sig) + sig_chain_prev.count(b_sig) != 1)
+			auto b_previous = sig_chain_prev.find(b_sig);
+			if (int(previous != sig_chain_prev.end()) + int(b_previous != sig_chain_prev.end()) != 1)
 				return true;
 
-			if (!sig_chain_prev.count(a_sig))
+			if (previous == sig_chain_prev.end()) {
 				a_sig = b_sig;
+				previous = b_previous;
+			}
 		}
 		else if (cell->type == ID($pmux)) {
-			if (!sig_chain_prev.count(a_sig))
+			if (previous == sig_chain_prev.end())
 				return true;
 		}
 		else log_abort();
@@ -237,7 +241,7 @@ struct MuxpackWorker
 				return true;
 
 		{
-			Cell *prev_cell = sig_chain_prev.at(a_sig);
+			Cell *prev_cell = previous->second;
 			log_assert(prev_cell);
 			SigSpec s_sig = sigmap(cell->getPort(ID::S));
 			s_sig.append(sigmap(prev_cell->getPort(ID::S)));
@@ -265,10 +269,11 @@ struct MuxpackWorker
 
 			SigSpec y_sig = sigmap(c->getPort(ID::Y));
 
-			if (sig_chain_next.count(y_sig) == 0)
+			auto next = sig_chain_next.find(y_sig);
+			if (next == sig_chain_next.end())
 				break;
 
-			c = sig_chain_next.at(y_sig);
+			c = next->second;
 			if (chain_start_cells.count(c) != 0)
 				break;
 		}

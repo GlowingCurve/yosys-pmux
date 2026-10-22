@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// opt_mem_feedback 将存储器数据反馈转换为写使能；复用地址查询、数据位集合与规范化信号。
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
 #include "kernel/mem.h"
@@ -147,9 +147,10 @@ struct OptMemFeedbackWorker
 
 			for (int sub = 0; sub < (1 << port.wide_log2); sub++) {
 				SigSpec addr = sigmap_xmux(port.sub_addr(sub));
-				async_rd_bits[addr].resize(mem.width);
+				auto &lanes = async_rd_bits[addr];
+				lanes.resize(mem.width);
 				for (int i = 0; i < mem.width; i++)
-					async_rd_bits[addr][i].insert(sigmap(port.data[i + sub * mem.width]));
+					lanes[i].insert(sigmap(port.data[i + sub * mem.width]));
 			}
 		}
 
@@ -169,7 +170,8 @@ struct OptMemFeedbackWorker
 			{
 				SigSpec addr = sigmap_xmux(port.sub_addr(sub));
 
-				if (!async_rd_bits.count(addr))
+				auto rd_bits = async_rd_bits.find(addr);
+				if (rd_bits == async_rd_bits.end())
 					continue;
 
 				for (int j = 0; j < mem.width; j++)
@@ -181,7 +183,7 @@ struct OptMemFeedbackWorker
 
 					dict<RTLIL::SigBit, bool> state;
 
-					find_data_feedback(async_rd_bits.at(addr).at(j), sigmap(port.data[bit_idx]), state, i, bit_idx, paths);
+					find_data_feedback(rd_bits->second.at(j), sigmap(port.data[bit_idx]), state, i, bit_idx, paths);
 				}
 			}
 		}
@@ -203,14 +205,15 @@ struct OptMemFeedbackWorker
 				continue;
 
 			bool ok = true;
-			for (auto bit : sigmap(port.data))
+			SigSpec data = sigmap(port.data);
+			for (auto bit : data)
 				if (sig_users_count[bit] != feedback_users_count[bit])
 					ok = false;
 
 			if (ok)
 			{
 				// This port is going bye-bye.
-				for (auto bit : sigmap(port.data))
+				for (auto bit : data)
 					feedback_ok.insert(bit);
 
 				port.removed = true;

@@ -17,7 +17,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// opt_dff 化简触发器及其使能、复位逻辑；simple 分析仅统计选择器输出的使用次数，并预先检查候选。
 #include "kernel/log.h"
 #include "kernel/register.h"
 #include "kernel/ff.h"

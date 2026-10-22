@@ -17,7 +17,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// 为 opt_dff 合并触发器的选择反馈逻辑；预先检查选择器与触发器候选，仅统计相关输出的使用次数。
 #include "kernel/ff.h"
 #include "kernel/pattern.h"
 #include "passes/opt/dff/opt_dff.h"
@@ -44,11 +44,6 @@ struct SimpleContext
 		// - bitusers: how many users it has (muxes will only be merged into FFs if the FF is the only user)
 		// - bit2mux: the mux cell and bit index that drives it, if any
 
-		for (auto wire : worker.module->wires())
-			if (wire->port_output)
-				for (auto bit : worker.sigmap(wire))
-					bitusers[bit]++;
-
 		for (auto cell : worker.module->cells()) {
 			if (cell->type.in(ID($mux), ID($pmux), ID($_MUX_))) {
 				RTLIL::SigSpec sig_y = worker.sigmap(cell->getPort(ID::Y));
@@ -56,15 +51,28 @@ struct SimpleContext
 					bit2mux[sig_y[i]] = cell_int_t(cell, i);
 			}
 
-			for (auto conn : cell->connections()) {
-				bool is_output = cell->output(conn.first);
-				if (!is_output || !cell->known())
-					for (auto bit : worker.sigmap(conn.second))
-						bitusers[bit]++;
-			}
-
 			if (worker.module->design->selected(worker.module, cell) && cell->is_builtin_ff())
 				dff_cells.push_back(cell);
+		}
+		if (bit2mux.empty() || dff_cells.empty())
+			return;
+
+		// 仅有 mux 输出的使用次数参与后面的合并条件。
+		for (auto wire : worker.module->wires())
+			if (wire->port_output)
+				for (auto bit : worker.sigmap(wire))
+					if (bit2mux.count(bit))
+						bitusers[bit]++;
+
+		for (auto cell : worker.module->cells()) {
+			bool known = cell->known();
+			for (auto &conn : cell->connections()) {
+				bool is_output = cell->output(conn.first);
+				if (!is_output || !known)
+					for (auto bit : worker.sigmap(conn.second))
+						if (bit2mux.count(bit))
+							bitusers[bit]++;
+			}
 		}
 	}
 

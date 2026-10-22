@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// opt_demorgan 应用 De Morgan 变换化简反相逻辑；使用端口查询结果的引用，减少集合复制。
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
 #include "kernel/modtools.h"
@@ -51,7 +51,7 @@ void demorgan_worker(
 
 		//See if this bit is driven by a $not cell
 		//TODO: do other stuff like nor/nand?
-		pool<ModIndex::PortInfo> ports = index.query_ports(b);
+		const auto &ports = index.query_ports(b);
 		bool inverted = false;
 		for(auto x : ports)
 		{
@@ -85,7 +85,7 @@ void demorgan_worker(
 
 		//See if this bit is driven by a $not cell
 		//TODO: do other stuff like nor/nand?
-		pool<ModIndex::PortInfo> ports = index.query_ports(b);
+		const auto &ports = index.query_ports(b);
 		RTLIL::Cell* srcinv = NULL;
 		for(auto x : ports)
 		{

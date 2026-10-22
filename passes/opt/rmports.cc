@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// rmports 移除模块及实例的未使用端口；集中删除端口列表中的目标条目，减少重复扫描与移动。
 #include "kernel/sigtools.h"
 #include "kernel/yosys.h"
 #include "kernel/log_help.h"
@@ -153,22 +153,14 @@ struct RmportsPassPass : public Pass {
 			log("  removing unused port %s\n", port);
 			removed_ports[module->name].insert(port);
 
-			// Remove from ports list
-			for(size_t i=0; i<module->ports.size(); i++)
-			{
-				if(module->ports[i] == port)
-				{
-					module->ports.erase(module->ports.begin() + i);
-					break;
-				}
-			}
-
 			// Mark the wire as no longer a port
 			auto wire = module->wire(port);
 			wire->port_input = false;
 			wire->port_output = false;
 			wire->port_id = 0;
 		}
+		module->ports.erase(std::remove_if(module->ports.begin(), module->ports.end(),
+				[&](IdString port) { return unused_ports.count(port); }), module->ports.end());
 		log("Removed %d unused ports.\n", GetSize(unused_ports));
 
 		// Re-number all of the wires that DO have ports still on them

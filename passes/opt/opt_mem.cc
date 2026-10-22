@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// opt_mem 删除存储器的常量位及无效端口；按数据位检查初始化值，常量条件失效时结束对应扫描。
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
 #include "kernel/mem.h"
@@ -88,15 +88,18 @@ struct OptMemPass : public Pass {
 						}
 					}
 				}
-				for (auto &init : mem.inits) {
-					for (int i = 0; i < GetSize(init.data); i++) {
-						State bit = init.data[i];
-						int lane = i % mem.width;
-						if (bit != State::Sx && bit != State::S0) {
-							always_0[lane] = false;
-						}
-						if (bit != State::Sx && bit != State::S1) {
-							always_1[lane] = false;
+				for (int lane = 0; lane < mem.width; lane++) {
+					for (auto &init : mem.inits) {
+						if (!always_0[lane] && !always_1[lane])
+							break;
+						for (int i = lane; i < GetSize(init.data); i += mem.width) {
+							State bit = init.data[i];
+							if (bit != State::Sx && bit != State::S0)
+								always_0[lane] = false;
+							if (bit != State::Sx && bit != State::S1)
+								always_1[lane] = false;
+							if (!always_0[lane] && !always_1[lane])
+								break;
 						}
 					}
 				}

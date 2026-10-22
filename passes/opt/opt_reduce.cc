@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// opt_reduce 化简归约运算与选择器；仅在粗粒度模式需要时分析存储器写使能依赖。
 #include "kernel/register.h"
 #include "kernel/sigtools.h"
 #include "kernel/log.h"
@@ -520,30 +520,34 @@ struct OptReduceWorker
 		did_something = true;
 
 		SigPool mem_wren_sigs;
-		for (auto &cell_it : module->cells_) {
-			RTLIL::Cell *cell = cell_it.second;
-			if (cell->type.in(ID($mem), ID($mem_v2)))
-				mem_wren_sigs.add(assign_map(cell->getPort(ID::WR_EN)));
-			if (cell->type.in(ID($memwr), ID($memwr_v2)))
-				mem_wren_sigs.add(assign_map(cell->getPort(ID::EN)));
-		}
-		for (auto &cell_it : module->cells_) {
-			RTLIL::Cell *cell = cell_it.second;
-			if (cell->type == ID($dff) && mem_wren_sigs.check_any(assign_map(cell->getPort(ID::Q))))
-				mem_wren_sigs.add(assign_map(cell->getPort(ID::D)));
-		}
-
-		bool keep_expanding_mem_wren_sigs = true;
-		while (keep_expanding_mem_wren_sigs) {
-			keep_expanding_mem_wren_sigs = false;
+		if (!do_fine) {
 			for (auto &cell_it : module->cells_) {
 				RTLIL::Cell *cell = cell_it.second;
-				if (cell->type == ID($mux) && mem_wren_sigs.check_any(assign_map(cell->getPort(ID::Y)))) {
-					if (!mem_wren_sigs.check_all(assign_map(cell->getPort(ID::A))) ||
-							!mem_wren_sigs.check_all(assign_map(cell->getPort(ID::B))))
-						keep_expanding_mem_wren_sigs = true;
-					mem_wren_sigs.add(assign_map(cell->getPort(ID::A)));
-					mem_wren_sigs.add(assign_map(cell->getPort(ID::B)));
+				if (cell->type.in(ID($mem), ID($mem_v2)))
+					mem_wren_sigs.add(assign_map(cell->getPort(ID::WR_EN)));
+				if (cell->type.in(ID($memwr), ID($memwr_v2)))
+					mem_wren_sigs.add(assign_map(cell->getPort(ID::EN)));
+			}
+			if (!mem_wren_sigs.bits.empty()) {
+				for (auto &cell_it : module->cells_) {
+					RTLIL::Cell *cell = cell_it.second;
+					if (cell->type == ID($dff) && mem_wren_sigs.check_any(assign_map(cell->getPort(ID::Q))))
+						mem_wren_sigs.add(assign_map(cell->getPort(ID::D)));
+				}
+
+				bool keep_expanding_mem_wren_sigs = true;
+				while (keep_expanding_mem_wren_sigs) {
+					keep_expanding_mem_wren_sigs = false;
+					for (auto &cell_it : module->cells_) {
+						RTLIL::Cell *cell = cell_it.second;
+						if (cell->type == ID($mux) && mem_wren_sigs.check_any(assign_map(cell->getPort(ID::Y)))) {
+							if (!mem_wren_sigs.check_all(assign_map(cell->getPort(ID::A))) ||
+									!mem_wren_sigs.check_all(assign_map(cell->getPort(ID::B))))
+								keep_expanding_mem_wren_sigs = true;
+							mem_wren_sigs.add(assign_map(cell->getPort(ID::A)));
+							mem_wren_sigs.add(assign_map(cell->getPort(ID::B)));
+						}
+					}
 				}
 			}
 		}

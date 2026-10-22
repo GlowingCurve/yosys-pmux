@@ -17,7 +17,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// opt_share 共享互斥分支中的同类运算；预先检查选择器候选，避免无候选模块的索引构造。
 #include "kernel/log.h"
 #include "kernel/register.h"
 #include "kernel/rtlil.h"
@@ -359,6 +359,14 @@ struct OptSharePass : public Pass {
 
 		extra_args(args, 1, design);
 		for (auto module : design->selected_modules()) {
+			bool has_mux = false;
+			for (auto cell : module->selected_cells())
+				if (cell->type.in(ID($mux), ID($_MUX_), ID($pmux))) {
+					has_mux = true;
+					break;
+				}
+			if (!has_mux)
+				continue;
 			SigMap sigmap(module);
 
 			dict<RTLIL::SigBit, int> bit_users;
@@ -419,7 +427,6 @@ struct OptSharePass : public Pass {
 				int mux_port_size = GetSize(mux->getPort(ID::A));
 				int mux_port_num = GetSize(mux->getPort(ID::S)) + 1;
 
-				RTLIL::SigSpec mux_insig = sigmap(RTLIL::SigSpec{mux->getPort(ID::B), mux->getPort(ID::A)});
 				std::vector<std::set<OpMuxConn>> mux_port_conns(mux_port_num);
 				int found = 0;
 

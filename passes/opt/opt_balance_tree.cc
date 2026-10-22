@@ -18,7 +18,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// opt_balance_tree 将结合运算重组为平衡树；递归传递输入区间，减少子向量分配与复制。
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
 #include "kernel/utils.h"
@@ -82,17 +82,18 @@ struct OptBalanceTreeWorker {
 	}
 
 	// Create a balanced binary tree from a vector of source signals
-	SigSpec create_balanced_tree(vector<SigSpec> &sources, IdString cell_type, Cell* cell) {
+	SigSpec create_balanced_tree(const vector<SigSpec> &sources, int begin, int end, IdString cell_type, Cell* cell) {
+		int size = end - begin;
 		// Base case: if we have no sources, return an empty signal
-		if (sources.size() == 0)
+		if (size == 0)
 			return SigSpec();
 
 		// Base case: if we have only one source, return it
-		if (sources.size() == 1)
-			return sources[0];
+		if (size == 1)
+			return sources[begin];
 
 		// Base case: if we have two sources, create a single cell
-		if (sources.size() == 2) {
+		if (size == 2) {
 			// Create a new cell of the same type
 			Cell* new_cell = module->addCell(NEW_ID, cell_type);
 
@@ -102,14 +103,14 @@ struct OptBalanceTreeWorker {
 			// Create output wire
 			int out_width = cell->getParam(ID::Y_WIDTH).as_int();
 			if (cell_type == ID($add))
-				out_width = max(sources[0].size(), sources[1].size()) + 1;
+				out_width = max(sources[begin].size(), sources[begin + 1].size()) + 1;
 			else if (cell_type == ID($mul))
-				out_width = sources[0].size() + sources[1].size();
+				out_width = sources[begin].size() + sources[begin + 1].size();
 			Wire* out_wire = module->addWire(NEW_ID, out_width);
 
 			// Connect ports and fix up parameters
-			new_cell->setPort(ID::A, sources[0]);
-			new_cell->setPort(ID::B, sources[1]);
+			new_cell->setPort(ID::A, sources[begin]);
+			new_cell->setPort(ID::B, sources[begin + 1]);
 			new_cell->setPort(ID::Y, out_wire);
 			new_cell->fixup_parameters();
 			new_cell->setParam(ID::A_SIGNED, cell->getParam(ID::A_SIGNED));
@@ -121,12 +122,9 @@ struct OptBalanceTreeWorker {
 		}
 
 		// Recursive case: split sources into two groups and create subtrees
-		int mid = (sources.size() + 1) / 2;
-		vector<SigSpec> left_sources(sources.begin(), sources.begin() + mid);
-		vector<SigSpec> right_sources(sources.begin() + mid, sources.end());
-
-		SigSpec left_tree = create_balanced_tree(left_sources, cell_type, cell);
-		SigSpec right_tree = create_balanced_tree(right_sources, cell_type, cell);
+		int mid = begin + (size + 1) / 2;
+		SigSpec left_tree = create_balanced_tree(sources, begin, mid, cell_type, cell);
+		SigSpec right_tree = create_balanced_tree(sources, mid, end, cell_type, cell);
 
 		// Create a cell to combine the two subtrees
 		Cell* new_cell = module->addCell(NEW_ID, cell_type);
@@ -332,7 +330,7 @@ struct OptBalanceTreeWorker {
 						}
 
 						// Create the balanced tree
-						SigSpec tree_output = create_balanced_tree(source_signals, cell_type, head_cell);
+						SigSpec tree_output = create_balanced_tree(source_signals, 0, GetSize(source_signals), cell_type, head_cell);
 
 						// Connect the tree output to the head cell's output
 						SigSpec head_output = sigmap(head_cell->getPort(ID::Y));

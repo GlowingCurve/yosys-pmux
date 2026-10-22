@@ -16,11 +16,12 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// opt_mem_priority 消除冗余的存储器写端口优先级；仅在存在可检查的端口关系时建立 SAT 分析器。
 #include "kernel/yosys.h"
 #include "kernel/modtools.h"
 #include "kernel/qcsat.h"
 #include "kernel/mem.h"
+#include <optional>
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
@@ -51,7 +52,7 @@ struct OptMemPriorityPass : public Pass {
 			modwalker.setup(module);
 			for (auto &mem : Mem::get_selected_memories(module)) {
 				bool mem_changed = false;
-				QuickConeSat qcsat(modwalker);
+				std::optional<QuickConeSat> qcsat_storage;
 				for (int i = 0; i < GetSize(mem.wr_ports); i++) {
 					auto &wport1 = mem.wr_ports[i];
 					for (int j = 0; j < GetSize(mem.wr_ports); j++) {
@@ -64,6 +65,9 @@ struct OptMemPriorityPass : public Pass {
 						// wide ports are created in normal flow.
 						if (wport1.wide_log2 != wport2.wide_log2)
 							continue;
+						if (!qcsat_storage)
+							qcsat_storage.emplace(modwalker);
+						auto &qcsat = *qcsat_storage;
 						// Two ports with priority, let's go.
 						pool<std::pair<SigBit, SigBit>> checked;
 						SigSpec addr1 = wport1.addr;

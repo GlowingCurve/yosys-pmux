@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// opt_hier 跨模块传播常量、连接与端口使用信息；仅在替换映射非空时遍历并重写模块信号。
 #include "kernel/register.h"
 #include "kernel/rtlil.h"
 #include "kernel/sigtools.h"
@@ -345,7 +345,8 @@ struct UsageData {
 		auto disconnect_rewrite = [&](SigSpec &signal) {
 			signal.replace(replacement_map);
 		};
-		module->rewrite_sigspecs(disconnect_rewrite);
+		if (!replacement_map.empty())
+			module->rewrite_sigspecs(disconnect_rewrite);
 		for (auto chunk : disconnect_outputs.chunks()) {
 			log("Disconnected unused output terminal '%s' in module '%s'\n", log_signal(chunk), module);
 			did_something = true;
@@ -361,7 +362,8 @@ struct UsageData {
 			}
 			signal.replace(constant_inputs);
 		};
-		module->rewrite_sigspecs(constant_rewrite);
+		if (!constant_inputs.empty())
+			module->rewrite_sigspecs(constant_rewrite);
 		SigSpec applied_constants2 = applied_constants.export_all();
 		applied_constants2.sort_and_unify();
 		for (auto chunk : applied_constants2.chunks()) {
@@ -394,7 +396,8 @@ struct UsageData {
 			}
 			signal.replace(ties);
 		};
-		module->rewrite_sigspecs(ties_rewrite);
+		if (!ties.empty())
+			module->rewrite_sigspecs(ties_rewrite);
 		if (applied_ties.size()) {
 			log("Replacing %zu input terminal bits with tie-togethers in module '%s'\n",
 					applied_ties.size(), module);

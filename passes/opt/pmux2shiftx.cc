@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// pmux2shiftx 转换可编码的 PMUX，onehot 化简独热比较；复用选择查询结果并减少递归保护集合更新。
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
 #include "kernel/ffinit.h"
@@ -145,16 +145,16 @@ struct OnehotDatabase
 						log("%*s   - no sources for non-const signal\n", indent, "");
 					retval = false;
 				} else {
+					recursion_guard.insert(sig);
 					for (auto &src : srcs->second) {
 						bool child_cache = true;
-						recursion_guard.insert(sig);
 						query_worker(src, retval, child_cache, indent+4);
-						recursion_guard.erase(sig);
 						if (!child_cache)
 							cache = false;
 						if (!retval)
 							break;
 					}
+					recursion_guard.erase(sig);
 				}
 			}
 		}
@@ -376,10 +376,11 @@ struct Pmux2ShiftxPass : public Pass {
 				SigSpec S = sigmap(cell->getPort(ID::S));
 				for (int i = 0; i < GetSize(S); i++)
 				{
-					if (!eqdb.count(S[i]))
+					auto found = eqdb.find(S[i]);
+					if (found == eqdb.end())
 						continue;
 
-					auto &entry = eqdb.at(S[i]);
+					auto &entry = found->second;
 					seldb[entry.first].insert(i);
 				}
 
@@ -400,18 +401,19 @@ struct Pmux2ShiftxPass : public Pass {
 				while (!seldb.empty())
 				{
 					// pick the largest entry in seldb
-					SigSpec sig = seldb.begin()->first;
-					for (auto &it : seldb) {
-						if (GetSize(sig) < GetSize(it.first))
-							sig = it.first;
-						else if (GetSize(seldb.at(sig)) < GetSize(it.second))
-							sig = it.first;
+					auto chosen = seldb.begin();
+					for (auto it = seldb.begin(); it != seldb.end(); ++it) {
+						if (GetSize(chosen->first) < GetSize(it->first))
+							chosen = it;
+						else if (GetSize(chosen->second) < GetSize(it->second))
+							chosen = it;
 					}
+					SigSpec sig = chosen->first;
 
 					// find the relevant choices
 					bool is_onehot = GetSize(sig) > 2;
 					dict<Const, int> choices;
-					for (int i : seldb.at(sig)) {
+					for (int i : chosen->second) {
 						Const val = eqdb.at(S[i]).second;
 						int onebits = 0;
 						for (auto b : val)

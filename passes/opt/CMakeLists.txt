@@ -16,6 +16,23 @@ yosys_pass(opt_reduce
 yosys_pass(opt_share
 	opt_share.cc
 )
+yosys_pass(opt_pmuxfactor
+	opt_pmuxfactor.cc
+	REQUIRES
+		opt_clean
+		opt_expr
+		opt_merge
+)
+yosys_pass(opt_pmuxselect
+	opt_pmuxselect.cc
+)
+yosys_pass(opt_pmuxcontext
+	opt_pmuxcontext.cc
+	REQUIRES
+		opt_clean
+		opt_expr
+		opt_reduce
+)
 yosys_pass(opt_expr
 	opt_expr.cc
 )

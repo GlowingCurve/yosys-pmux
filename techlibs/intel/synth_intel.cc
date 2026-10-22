@@ -17,7 +17,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// synth_intel 执行 Intel FPGA 综合；在 peepopt 与 opt_clean 之后、cmp2lut 之前依次执行三个 PMUX 优化 Pass。
 #include "kernel/celltypes.h"
 #include "kernel/log.h"
 #include "kernel/register.h"
@@ -212,6 +212,9 @@ struct SynthIntelPass : public ScriptPass {
 			run("wreduce");
 			run("peepopt");
 			run("opt_clean");
+			run("opt_pmuxfactor");
+			run("opt_pmuxselect");
+			run("opt_pmuxcontext");
 			run("techmap -map +/cmp2lut.v -D LUT_WIDTH=4");
 			run("opt_expr");
 			run("opt_clean");

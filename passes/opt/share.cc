@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// share 使用 SAT 分析互斥运算并共享资源；在同次合并的环路检查中复用单元类型与模块索引。
 #include "kernel/yosys.h"
 #include "kernel/qcsat.h"
 #include "kernel/sigtools.h"
@@ -1155,14 +1155,8 @@ struct ShareWorker
 		return find_in_input_cone_worker(root, needle, stop);
 	}
 
-	bool is_part_of_scc(RTLIL::Cell *cell)
+	bool is_part_of_scc(RTLIL::Cell *cell, const CellTypes &ct, ModIndex &mi)
 	{
-		CellTypes ct;
-		ct.setup_internals();
-		ct.setup_stdcells();
-
-		ModIndex mi(module);
-
 		pool<RTLIL::Cell*> queue, covered;
 		queue.insert(cell);
 
@@ -1487,9 +1481,15 @@ struct ShareWorker
 				cells_to_remove.insert(cell);
 				cells_to_remove.insert(other_cell);
 
-				for (auto c : supercell_aux)
-					if (is_part_of_scc(c))
-						goto do_rollback;
+				if (!supercell_aux.empty()) {
+					CellTypes ct;
+					ct.setup_internals();
+					ct.setup_stdcells();
+					ModIndex mi(module);
+					for (auto c : supercell_aux)
+						if (is_part_of_scc(c, ct, mi))
+							goto do_rollback;
+				}
 
 				if (0) {
 			do_rollback:

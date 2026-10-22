@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// 保存 clean 与 opt_clean 的共享分析状态；仅为所选模块实际使用的模块单元类型建立端口信息。
 #include "kernel/rtlil.h"
 #include "kernel/threading.h"
 #include "passes/opt/clean/keep_cache.h"
@@ -74,7 +74,14 @@ public:
 		keep_cache(f.purge, thread_pool, selected_modules),
 		flags(f)
 	{
-		ct_all.setup(design);
+		ct_all.setup();
+		pool<RTLIL::IdString> cell_types;
+		for (auto module : selected_modules)
+			for (auto cell : module->cells())
+				cell_types.insert(cell->type);
+		for (auto type : cell_types)
+			if (auto module = design->module(type))
+				ct_all.setup_module(module);
 	}
 
 	~CleanRunContext() {

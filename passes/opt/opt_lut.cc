@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// opt_lut 消除或合并冗余 LUT；按引用传递求值输入，并复用单次字典查询结果。
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
 #include "kernel/modtools.h"
@@ -48,7 +48,7 @@ struct OptLutWorker
 
 	int eliminated_count = 0, combined_count = 0;
 
-	bool evaluate_lut(RTLIL::Cell *lut, dict<SigBit, bool> inputs)
+	bool evaluate_lut(RTLIL::Cell *lut, const dict<SigBit, bool> &inputs)
 	{
 		SigSpec lut_input = sigmap(lut->getPort(ID::A));
 		int lut_width = lut->getParam(ID::WIDTH).as_int();
@@ -58,9 +58,10 @@ struct OptLutWorker
 		for (int i = 0; i < lut_width; i++)
 		{
 			SigBit input = sigmap(lut_input[i]);
-			if (inputs.count(input))
+			auto value = inputs.find(input);
+			if (value != inputs.end())
 			{
-				lut_index |= inputs[input] << i;
+				lut_index |= value->second << i;
 			}
 			else
 			{

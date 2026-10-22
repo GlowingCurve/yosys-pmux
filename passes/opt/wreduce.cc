@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// wreduce 缩减运算端口中冗余的高位；先计算保留宽度，再一次提取信号，减少连续删除操作。
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
 #include "kernel/modtools.h"
@@ -248,13 +248,16 @@ struct WreduceWorker
 			sig = sig.extract(0, max_port_size);
 		}
 
+		int retained = GetSize(sig);
 		if (port_signed) {
-			while (GetSize(sig) > 1 && sig[GetSize(sig)-1] == sig[GetSize(sig)-2])
-				work_queue_bits.insert(sig[GetSize(sig)-1]), sig.remove(GetSize(sig)-1), bits_removed++;
+			while (retained > 1 && sig[retained-1] == sig[retained-2])
+				work_queue_bits.insert(sig[--retained]), bits_removed++;
 		} else {
-			while (GetSize(sig) > 1 && sig[GetSize(sig)-1] == State::S0)
-				work_queue_bits.insert(sig[GetSize(sig)-1]), sig.remove(GetSize(sig)-1), bits_removed++;
+			while (retained > 1 && sig[retained-1] == State::S0)
+				work_queue_bits.insert(sig[--retained]), bits_removed++;
 		}
+		if (retained != GetSize(sig))
+			sig = sig.extract(0, retained);
 
 		if (bits_removed) {
 			log("Removed top %d bits (of %d) from port %c of cell %s.%s (%s).\n",

@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// 为 clean 与 opt_clean 查找保留信号的驱动单元；仅在出现驱动冲突时构造诊断所需的信号映射与集合。
 #include "kernel/ffinit.h"
 #include "kernel/yosys_common.h"
 #include "passes/opt/clean/opt_clean.h"
@@ -115,8 +115,13 @@ using Wire2Drivers = ShardedHashtable<WireDriver, WireDriversKeyEquality, WireDr
 struct ConflictLogs {
 	ShardedVector<std::pair<SigBit, std::string>> logs;
 	ConflictLogs(ParallelDispatchThreadPool::Subpool &subpool) : logs(subpool) {}
-	void print_warnings(pool<SigBit>& used_raw_bits, const SigMap& wire_map, const RTLIL::Module* mod, CleanRunContext &clean_ctx) {
+	void print_warnings(ShardedVector<Wire*>& keep_wires, const RTLIL::Module* mod, CleanRunContext &clean_ctx) {
 		if (!logs.empty()) {
+			SigMap wire_map = wire_sigmap(mod);
+			pool<SigBit> used_raw_bits;
+			for (Wire *wire : keep_wires)
+				for (auto raw_bit : SigSpec(wire))
+					used_raw_bits.insert(wire_map(raw_bit));
 			// We could do this in parallel but hopefully this is rare.
 			for (auto [_, cell] : mod->cells_) {
 				for (auto &[port, sig] : cell->connections()) {
@@ -127,7 +132,7 @@ struct ConflictLogs {
 				}
 			}
 			for (std::pair<SigBit, std::string> &it : logs) {
-				if (used_raw_bits.count(it.first))
+				if (used_raw_bits.count(wire_map(it.first)))
 					log_warning("%s\n", it.second);
 			}
 		}
@@ -148,11 +153,9 @@ struct CellAnalysis {
 	CellAnalysis(AnalysisContext& actx)
 	: keep_wires(actx.subpool), unused(actx.mod->cells_size()) {}
 
-	pool<SigBit> analyze_kept_wires(CellTraversal& traversal, const SigMap& sigmap, const SigMap& wire_map, int num_threads) {
+	void analyze_kept_wires(CellTraversal& traversal, const SigMap& sigmap, int num_threads) {
 		// Also enqueue cells that drive kept wires into cell_queue
 		// and mark those cells as used
-		// and mark all bits of those wires as used
-		pool<SigBit> used_raw_bits;
 		int i = 0;
 		for (Wire *wire : keep_wires) {
 			for (auto bit : sigmap(wire)) {
@@ -164,10 +167,7 @@ struct CellAnalysis {
 							traversal.queue.push(fake_thread_index, cell_index);
 						}
 			}
-			for (auto raw_bit : SigSpec(wire))
-				used_raw_bits.insert(wire_map(raw_bit));
 		}
-		return used_raw_bits;
 	}
 
 	void mark_used_and_enqueue(int cell_idx, ConcurrentWorkQueue<int>& queue, const ParallelDispatchThreadPool::RunCtx &ctx) {
@@ -176,7 +176,7 @@ struct CellAnalysis {
 	}
 };
 
-ConflictLogs explore(CellAnalysis& analysis, CellTraversal& traversal, const SigMap& wire_map, AnalysisContext& actx, CleanRunContext &clean_ctx) {
+ConflictLogs explore(CellAnalysis& analysis, CellTraversal& traversal, AnalysisContext& actx, CleanRunContext &clean_ctx) {
 	ConflictLogs logs(actx.subpool);
 	Wire2Drivers::Builder wire2driver_builder(actx.subpool);
 	ShardedVector<std::pair<std::string, int>> mem2cells_vector(actx.subpool);
@@ -186,7 +186,7 @@ ConflictLogs explore(CellAnalysis& analysis, CellTraversal& traversal, const Sig
 	// Prepare "input cone" traversal from memory to write port or meminit as analysis.mem2cells
 	// Also check driver conflicts
 	// Also mark cells unused to true unless keep (we override this later)
-	actx.subpool.run([&analysis, &traversal, &logs, &wire_map, &mem2cells_vector, &wire2driver_builder, &actx, &clean_ctx](const ParallelDispatchThreadPool::RunCtx &ctx) {
+	actx.subpool.run([&analysis, &traversal, &logs, &mem2cells_vector, &wire2driver_builder, &actx, &clean_ctx](const ParallelDispatchThreadPool::RunCtx &ctx) {
 		for (int i : ctx.item_range(actx.mod->cells_size())) {
 			Cell *cell = actx.mod->cell_at(i);
 			if (cell->type.in(ID($memwr), ID($memwr_v2), ID($meminit), ID($meminit_v2)))
@@ -203,7 +203,7 @@ ConflictLogs explore(CellAnalysis& analysis, CellTraversal& traversal, const Sig
 						std::string msg = stringf("Driver-driver conflict "
 							"for %s between cell %s.%s and constant %s in %s: Resolved using constant.",
 							log_signal(raw_bit), cell->name.unescape(), it2.first.unescape(), log_signal(bit), actx.mod->name.unescape());
-							logs.logs.insert(ctx, {wire_map(raw_bit), msg});
+							logs.logs.insert(ctx, {raw_bit, msg});
 						}
 						if (bit.wire != nullptr)
 							wire2driver_builder.insert(ctx, {{bit, i}, hash_bit(bit)});
@@ -340,17 +340,14 @@ void rmunused_module_cells(Module *module, ParallelDispatchThreadPool::Subpool &
 {
 	AnalysisContext actx(module, subpool);
 
-	// Used for logging warnings only
-	SigMap wire_map = wire_sigmap(module);
-
 	CellAnalysis analysis(actx);
 	CellTraversal traversal(subpool.num_threads());
 	// Mark all unkept cells as unused initially
 	// and queue up cell traversal from those cells
-	auto logs = explore(analysis, traversal, wire_map, actx, clean_ctx);
+	auto logs = explore(analysis, traversal, actx, clean_ctx);
 	// Mark cells that drive kept wires into cell_queue and those bits as used
 	// and queue up cell traversal from those cells
-	pool<SigBit> used_raw_bits = analysis.analyze_kept_wires(traversal, actx.assign_map, wire_map, subpool.num_threads());
+	analysis.analyze_kept_wires(traversal, actx.assign_map, subpool.num_threads());
 
 	// Mark all memories as unused initially
 	MemAnalysis mem_analysis(module);
@@ -367,7 +364,7 @@ void rmunused_module_cells(Module *module, ParallelDispatchThreadPool::Subpool &
 	// Now we know what to kill
 	remove_cells(module, ffinit, unused_cells, clean_ctx.flags.verbose, clean_ctx.stats);
 	remove_mems(module, mem_analysis, clean_ctx.flags.verbose);
-	logs.print_warnings(used_raw_bits, wire_map, module, clean_ctx);
+	logs.print_warnings(analysis.keep_wires, module, clean_ctx);
 }
 
 YOSYS_NAMESPACE_END

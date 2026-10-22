@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// clean 与 opt_clean 删除未使用的单元和信号；复用双类别连接表，按需建立冲突诊断映射及模块类型信息。
 #include "kernel/register.h"
 #include "kernel/log.h"
 #include "kernel/log_help.h"

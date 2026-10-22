@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// opt_mem_widen 按公共宽端口因子扩展存储器基础宽度；公共因子达到下限时结束端口扫描。
 #include "kernel/yosys.h"
 #include "kernel/mem.h"
 
@@ -57,12 +57,18 @@ struct OptMemWidenPass : public Pass {
 				if (mem.rd_ports.empty())
 					continue;
 				int factor_log2 = mem.rd_ports[0].wide_log2;
-				for (auto &port : mem.rd_ports)
+				for (auto &port : mem.rd_ports) {
+					if (factor_log2 == 0)
+						break;
 					if (port.wide_log2 < factor_log2)
 						factor_log2 = port.wide_log2;
-				for (auto &port : mem.wr_ports)
+				}
+				for (auto &port : mem.wr_ports) {
+					if (factor_log2 == 0)
+						break;
 					if (port.wide_log2 < factor_log2)
 						factor_log2 = port.wide_log2;
+				}
 				if (factor_log2 == 0)
 					continue;
 				log("Widening base width of memory %s in module %s by factor %d.\n", mem.memid.unescape(), module->name.unescape(), 1 << factor_log2);

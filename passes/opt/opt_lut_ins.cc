@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// opt_lut_ins 删除 LUT 中无关的输入；发现真值表结果存在差异时立即结束当前冗余检查。
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
 
@@ -167,8 +167,10 @@ struct OptLutInsPass : public Pass {
 					} else {
 						bool redundant = true;
 						for (int j = 0; j < GetSize(lut); j++) {
-							if (lut[j] != lut[j ^ 1 << i])
+							if (lut[j] != lut[j ^ 1 << i]) {
 								redundant = false;
+								break;
+							}
 						}
 						if (redundant) {
 							swizzle.push_back(-1);

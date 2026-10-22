@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-
+// opt_expr 折叠常量与化简表达式；复用稳定拓扑顺序、直接索引驱动节点，并按需建立单元类型信息。
 #include "kernel/register.h"
 #include "kernel/sigtools.h"
 #include "kernel/celltypes.h"
@@ -392,7 +392,13 @@ int get_highest_hot_index(RTLIL::SigSpec signal)
 	return -1;
 }
 
-void replace_const_cells(RTLIL::Design *design, RTLIL::Module *module, bool consume_x, bool mux_undef, bool mux_bool, bool do_fine, bool keepdc, bool noclkinv)
+struct ConstCellOrder {
+	std::vector<RTLIL::Cell*> sorted;
+	bool valid = false;
+	bool sorted_ok = true;
+};
+
+void replace_const_cells(RTLIL::Design *design, RTLIL::Module *module, bool consume_x, bool mux_undef, bool mux_bool, bool do_fine, bool keepdc, bool noclkinv, ConstCellOrder *order)
 {
 	SigMap assign_map(module);
 	dict<RTLIL::SigSpec, RTLIL::SigSpec> invert_map;
@@ -486,35 +492,45 @@ void replace_const_cells(RTLIL::Design *design, RTLIL::Module *module, bool cons
 		handle_clkpol_celltype_swap(cell, "$_DLATCHSR_??N_", "$_DLATCHSR_??P_", ID::R, assign_map, invert_map);
 	}
 
-	TopoSort<RTLIL::Cell*, RTLIL::IdString::compare_ptr_by_name<RTLIL::Cell>> cells;
-	dict<RTLIL::SigBit, Cell*> outbit_to_cell;
-
-	for (auto cell : module->cells())
-	if (design->selected(module, cell) && yosys_celltypes.cell_evaluable(cell->type)) {
-		for (auto &conn : cell->connections())
-		if (yosys_celltypes.cell_output(cell->type, conn.first))
-		for (auto bit : assign_map(conn.second))
-			outbit_to_cell[bit] = cell;
-		cells.node(cell);
+	std::vector<RTLIL::Cell*> sorted_cells;
+	bool sorted_ok;
+	bool topology_valid = true;
+	if (consume_x && order && order->valid) {
+		sorted_cells = std::move(order->sorted);
+		sorted_ok = order->sorted_ok;
+	} else {
+		TopoSort<RTLIL::Cell*, RTLIL::IdString::compare_ptr_by_name<RTLIL::Cell>> cells;
+		dict<RTLIL::SigBit, int> outbit_to_node;
+		for (auto cell : module->cells())
+		if (design->selected(module, cell) && yosys_celltypes.cell_evaluable(cell->type)) {
+			const int index = cells.node(cell);
+			for (auto &conn : cell->connections())
+			if (yosys_celltypes.cell_output(cell->type, conn.first))
+			for (auto bit : assign_map(conn.second))
+				outbit_to_node[bit] = index;
+		}
+		for (auto [cell, r_index] : cells.node_to_index) {
+			for (auto &conn : cell->connections())
+			if (yosys_celltypes.cell_input(cell->type, conn.first))
+			for (auto bit : assign_map(conn.second)) {
+				auto driver = outbit_to_node.find(bit);
+				if (driver != outbit_to_node.end())
+					cells.edge(driver->second, r_index);
+			}
+		}
+		sorted_ok = cells.sort();
+		sorted_cells = std::move(cells.sorted);
 	}
+	if (order)
+		order->valid = false;
 
-	for (auto cell : module->cells())
-	if (design->selected(module, cell) && yosys_celltypes.cell_evaluable(cell->type)) {
-		const int r_index = cells.node(cell);
-		for (auto &conn : cell->connections())
-		if (yosys_celltypes.cell_input(cell->type, conn.first))
-		for (auto bit : assign_map(conn.second))
-		if (outbit_to_cell.count(bit))
-			cells.edge(cells.node(outbit_to_cell.at(bit)), r_index);
-	}
-
-	if (!cells.sort()) {
+	if (!sorted_ok) {
 		// There might be a combinational loop, or there might be constants on the output of cells. 'check' may find out more.
 		// ...unless this is a coarse-grained cell loop, but not a bit loop, in which case it won't, and all is good.
 		log("Couldn't topologically sort cells, optimizing module %s may take a longer time.\n", module);
 	}
 
-	for (auto cell : cells.sorted)
+	for (auto cell : sorted_cells)
 	{
 #define ACTION_DO(_p_, _s_) do { replace_cell(assign_map, module, cell, input.as_string(), _p_, _s_); goto next_cell; } while (0)
 #define ACTION_DO_Y(_v_) ACTION_DO(ID::Y, RTLIL::SigSpec(RTLIL::State::S ## _v_))
@@ -1148,6 +1164,7 @@ skip_fine_alu:
 				cell->setPort(ID::A, input.extract(0, 1));
 				cell->unsetPort(ID::B);
 				cell->unsetPort(ID::S);
+				topology_valid = false;
 				goto next_cell;
 			}
 			if (input.match("11 ")) ACTION_DO_Y(1);
@@ -1217,6 +1234,7 @@ skip_fine_alu:
 				cell->setPort(ID::B, new_b);
 				cell->parameters[ID::A_WIDTH] = new_a.size();
 				cell->parameters[ID::B_WIDTH] = new_b.size();
+				topology_valid = false;
 			}
 		}
 
@@ -1229,6 +1247,7 @@ skip_fine_alu:
 			if (a.is_fully_const() && !b.is_fully_const()) {
 				cell->setPort(ID::A, b);
 				cell->setPort(ID::B, a);
+				topology_valid = false;
 				std::swap(a, b);
 			}
 
@@ -2238,6 +2257,11 @@ skip_alu_split:
 #undef FOLD_1ARG_CELL
 #undef FOLD_2ARG_CELL
 	}
+	if (order && !consume_x && !did_something && topology_valid) {
+		order->sorted = std::move(sorted_cells);
+		order->sorted_ok = sorted_ok;
+		order->valid = true;
+	}
 }
 
 void replace_const_connections(RTLIL::Module *module) {
@@ -2342,7 +2366,9 @@ struct OptExprPass : public Pass {
 		}
 		extra_args(args, argidx, design);
 
-		NewCellTypes ct(design);
+		NewCellTypes ct;
+		if (undriven)
+			ct.setup(design);
 		for (auto module : design->selected_modules())
 		{
 			log("Optimizing module %s.\n", module);
@@ -2355,14 +2381,15 @@ struct OptExprPass : public Pass {
 			}
 
 			do {
+				ConstCellOrder order;
 				do {
 					did_something = false;
-					replace_const_cells(design, module, false /* consume_x */, mux_undef, mux_bool, do_fine, keepdc, noclkinv);
+					replace_const_cells(design, module, false /* consume_x */, mux_undef, mux_bool, do_fine, keepdc, noclkinv, keepdc ? nullptr : &order);
 					if (did_something)
 						design->scratchpad_set_bool("opt.did_something", true);
 				} while (did_something);
 				if (!keepdc)
-					replace_const_cells(design, module, true /* consume_x */, mux_undef, mux_bool, do_fine, keepdc, noclkinv);
+					replace_const_cells(design, module, true /* consume_x */, mux_undef, mux_bool, do_fine, keepdc, noclkinv, &order);
 				if (did_something)
 					design->scratchpad_set_bool("opt.did_something", true);
 			} while (did_something);
