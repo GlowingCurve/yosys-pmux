@@ -198,14 +198,10 @@ struct SynthIntelPass : public ScriptPass {
 		if (check_label("coarse")) {
 			run("proc");
 			if (flatten || help_mode) {
-				run("check");
 				run("flatten", "(skip if -noflatten)");
 			}
-			run("tribuf -logic");
-			run("deminout");
 			run("opt_expr");
 			run("opt_clean");
-			run("check");
 			run("opt -nodffe -nosdff");
 			run("fsm");
 			run("opt");
@@ -278,23 +274,8 @@ struct SynthIntelPass : public ScriptPass {
 		}
 
 		if (check_label("check")) {
-			run("hierarchy -check");
 			run("stat");
-			run("check -noinit");
 			run("blackbox =A:whitebox");
-		}
-
-		if (check_label("vqm")) {
-			if (!vout_file.empty() || help_mode)
-				run(stringf("write_verilog -attr2comment -defparam -nohex -decimal -renameprefix syn_ %s",
-					    help_mode ? "<file-name>" : vout_file.c_str()));
-		}
-
-		if (check_label("vpr")) {
-			if (!blif_file.empty() || help_mode) {
-				run(stringf("opt_clean -purge"));
-				run(stringf("write_blif %s", help_mode ? "<file-name>" : blif_file));
-			}
 		}
 	}
 } SynthIntelPass;
