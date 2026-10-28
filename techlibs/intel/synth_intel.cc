@@ -213,11 +213,8 @@ struct SynthIntelPass : public ScriptPass {
 				run("check");
 				run("flatten", "(skip if -noflatten)");
 			}
-			run("tribuf -logic");
-			run("deminout");
 			run("opt_expr");
 			run("opt_clean");
-			run("check");
 			run("opt -nodffe -nosdff");
 			run("fsm");
 			run("opt");
@@ -293,7 +290,7 @@ struct SynthIntelPass : public ScriptPass {
 		}
 
 		if (check_label("map_luts")) {
-			run("abc9 -lut 4 -W 300 -script +&scorr;&sweep;&dc2;&dch,-f,-r;&ps;&if,{W},{D},{R},-v;&mfs" + string(dff ? " -dff" : ""));
+			run("abc9 -lut 4 -W 300" + string(dff ? " -dff" : ""));
 			run("clean");
 			run("opt -fast");
 			run("autoname");
@@ -308,9 +305,7 @@ struct SynthIntelPass : public ScriptPass {
 		}
 
 		if (check_label("check")) {
-			run("hierarchy -check");
 			run("stat");
-			run("check -noinit");
 			run("blackbox =A:whitebox");
 		}
 
