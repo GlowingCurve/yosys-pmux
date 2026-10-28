@@ -45,7 +45,6 @@ struct OptLutInsPass : public Pass {
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
-		log_header(design, "Executing OPT_LUT_INS pass (discard unused LUT inputs).\n");
 		string techname;
 
 		size_t argidx;
@@ -64,7 +63,6 @@ struct OptLutInsPass : public Pass {
 
 		for (auto module : design->selected_modules())
 		{
-			log("Optimizing LUTs in %s.\n", module);
 
 			std::vector<Cell *> remove_cells;
 			// Gather LUTs.
@@ -183,7 +181,6 @@ struct OptLutInsPass : public Pass {
 				}
 				if (!doit)
 					continue;
-				log("  Optimizing lut %s (%d -> %d)\n", cell, GetSize(inputs), GetSize(new_inputs));
 				if (techname == "lattice" || techname == "ecp5") {
 					// Pad the LUT to 4 inputs, adding consts from the front.
 					int extra = 4 - GetSize(new_inputs);

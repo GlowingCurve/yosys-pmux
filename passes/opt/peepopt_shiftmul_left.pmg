@@ -1,3 +1,4 @@
+// 为 peepopt 将乘法控制的左移转换为二次幂间距；模式通过输出填充化简移位量。
 pattern shiftmul_left
 //
 // Optimize mul+shift pairs that result from expressions such as foo[s*W+:W]
@@ -99,7 +100,6 @@ code
 	}
 
 	did_something = true;
-	log("left shiftmul pattern in %s: shift=%s, mul=%s\n", module, shift, mul);
 
 	int const_factor = mul_const.as_int();
 	int new_const_factor = 1 << factor_bits;

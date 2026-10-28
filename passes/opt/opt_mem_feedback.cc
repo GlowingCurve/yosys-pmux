@@ -164,7 +164,6 @@ struct OptMemFeedbackWorker
 		{
 			auto &port = mem.wr_ports[i];
 
-			log("  Analyzing %s.%s write port %d.\n", module, mem.memid.unescape(), i);
 
 			for (int sub = 0; sub < (1 << port.wide_log2); sub++)
 			{
@@ -235,7 +234,6 @@ struct OptMemFeedbackWorker
 
 		// Okay, let's do it.
 
-		log("Populating enable bits on write ports of memory %s.%s with async read feedback:\n", module, mem.memid.unescape());
 
 		// If a write port has a feedback path that we're about to bypass,
 		// but also has priority over some other write port, the feedback
@@ -259,7 +257,6 @@ struct OptMemFeedbackWorker
 			auto &port = mem.wr_ports[wrport_idx];
 
 			port.en[bit] = conditions_to_logic(it.second, port.en[bit]);
-			log("    Port %d bit %d: added enable logic for %d different cases.\n", wrport_idx, bit, GetSize(it.second));
 		}
 
 		mem.emit();
@@ -340,7 +337,6 @@ struct OptMemFeedbackPass : public Pass {
 		log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override {
-		log_header(design, "Executing OPT_MEM_FEEDBACK pass (finding memory read-to-write feedback paths).\n");
 		extra_args(args, 1, design);
 		OptMemFeedbackWorker worker(design);
 

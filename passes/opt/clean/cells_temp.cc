@@ -17,6 +17,7 @@
  *
  */
 
+// 为 clean 与 opt_clean 将临时缓冲单元转换为连接；直接检查高阻常量并复用原始端口信号。
 #include "passes/opt/clean/opt_clean.h"
 
 USING_YOSYS_NAMESPACE
@@ -31,38 +32,16 @@ bool trim_buf(RTLIL::Cell* cell, ShardedVector<RTLIL::SigSig>& new_connections, 
 	RTLIL::SigSpec y = cell->getPort(ID::Y);
 	a.extend_u0(GetSize(y), is_signed(cell));
 
-	if (a.has_const(State::Sz)) {
-		RTLIL::SigSpec new_a;
-		RTLIL::SigSpec new_y;
-		for (int i = 0; i < GetSize(a); ++i) {
-			RTLIL::SigBit b = a[i];
-			if (b == State::Sz)
-				return false;
-			new_a.append(b);
-			new_y.append(y[i]);
-		}
-		a = std::move(new_a);
-		y = std::move(new_y);
-	}
+	if (a.has_const(State::Sz))
+		return false;
 	if (!y.empty())
 		new_connections.insert(ctx, {y, a});
 	return true;
 }
 
-bool remove(ShardedVector<RTLIL::Cell*>& cells, RTLIL::Module* mod, bool verbose) {
+bool remove(ShardedVector<RTLIL::Cell*>& cells, RTLIL::Module* mod) {
 	bool did_something = false;
 	for (RTLIL::Cell *cell : cells) {
-		if (verbose) {
-			if (cell->type == ID($connect))
-				log_debug("  removing connect cell `%s': %s <-> %s\n", cell->name,
-						log_signal(cell->getPort(ID::A)), log_signal(cell->getPort(ID::B)));
-			else if (cell->type == ID($input_port))
-				log_debug("  removing input port marker cell `%s': %s\n", cell->name,
-						log_signal(cell->getPort(ID::Y)));
-			else
-				log_debug("  removing buffer cell `%s': %s = %s\n", cell->name,
-						log_signal(cell->getPort(ID::Y)), log_signal(cell->getPort(ID::A)));
-		}
 		mod->remove(cell);
 		did_something = true;
 	}
@@ -71,7 +50,7 @@ bool remove(ShardedVector<RTLIL::Cell*>& cells, RTLIL::Module* mod, bool verbose
 PRIVATE_NAMESPACE_END
 YOSYS_NAMESPACE_BEGIN
 
-void remove_temporary_cells(RTLIL::Module *module, ParallelDispatchThreadPool::Subpool &subpool, bool verbose)
+void remove_temporary_cells(RTLIL::Module *module, ParallelDispatchThreadPool::Subpool &subpool)
 {
 	ShardedVector<RTLIL::Cell*> delcells(subpool);
 	ShardedVector<RTLIL::SigSig> new_connections(subpool);
@@ -97,7 +76,7 @@ void remove_temporary_cells(RTLIL::Module *module, ParallelDispatchThreadPool::S
 	for (RTLIL::SigSig &connection : new_connections) {
 		module->connect(connection);
 	}
-	if (remove(delcells, module, verbose))
+	if (remove(delcells, module))
 		module->design->scratchpad_set_bool("opt.did_something", true);
 }
 

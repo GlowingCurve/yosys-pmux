@@ -385,7 +385,6 @@ struct OptMergeWorker
 		FfInitVals initvals;
 		initvals.set(&assign_map, module);
 
-		log("Finding identical cells in module `%s'.\n", module->name);
 
 		// Use no more than one worker per thousand cells, rounded down, so
 		// we only start multithreading with at least 2000 cells.
@@ -420,7 +419,6 @@ struct OptMergeWorker
 		while (did_something)
 		{
 			int cells_size = module->cells_size();
-			log("Computing hashes of %d cells of `%s'.\n", cells_size, module->name);
 			std::vector<std::vector<std::vector<CellHash>>> sharded_bucketed_cell_hashes(workers);
 
 			int cell_index = 0;
@@ -442,7 +440,6 @@ struct OptMergeWorker
 						sharded_bucketed_cell_hashes[i] = std::move(cell_hashes_queues[i].pop_front()->bucketed_cell_hashes);
 			}
 
-			log("Finding duplicate cells in `%s'.\n", module->name);
 			std::vector<DuplicateCell> merged_duplicates;
 			{
 				Multithreading multithreading;
@@ -475,12 +472,9 @@ struct OptMergeWorker
 
 			for (auto [remove_cell, keep_cell] : cell_ptrs)
 			{
-				log_debug("  Cell `%s' is identical to cell `%s'.\n", remove_cell->name, keep_cell->name);
 				for (auto &it : remove_cell->connections()) {
 					if (remove_cell->output(it.first)) {
 						RTLIL::SigSpec keep_sig = keep_cell->getPort(it.first);
-						log_debug("    Redirecting output %s: %s = %s\n", it.first,
-								log_signal(it.second), log_signal(keep_sig));
 						Const init = initvals(keep_sig);
 						initvals.remove_init(it.second);
 						initvals.remove_init(keep_sig);
@@ -493,7 +487,6 @@ struct OptMergeWorker
 						initvals.set_init(keep_sig, init);
 					}
 				}
-				log_debug("    Removing %s cell `%s' from module `%s'.\n", remove_cell->type, remove_cell->name, module->name);
 				module->remove(remove_cell);
 				total_count++;
 			}
@@ -539,7 +532,6 @@ struct OptMergePass : public Pass {
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
-		log_header(design, "Executing OPT_MERGE pass (detect identical cells).\n");
 
 		bool mode_nomux = false;
 		bool mode_share_all = false;
@@ -572,7 +564,6 @@ struct OptMergePass : public Pass {
 
 		if (total_count)
 			design->scratchpad_set_bool("opt.did_something", true);
-		log("Removed a total of %d cells.\n", total_count);
 	}
 } OptMergePass;
 

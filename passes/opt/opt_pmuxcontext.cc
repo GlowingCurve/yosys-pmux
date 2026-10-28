@@ -1,15 +1,15 @@
+// opt_pmuxcontext 按选择条件化简有界逻辑锥，并利用加法截断与模同余关系消除重复选择和运算。
+// 复用端口分类，在局部化简后按结构成本提交变换。
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
-#include "kernel/celltypes.h"
-// opt_pmuxcontext 按选择条件化简有界逻辑锥并消除可证明的模运算冗余；复用端口分类，仅提交成本下降的变换。
+#include "passes/opt/pmux_celltypes.h"
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
 
 struct PmuxContextWorker {
 	Module *module;
-	Design *design;
 	SigMap sigmap;
-	CellTypes types;
+	PmuxCellTypes types;
 	dict<SigBit, Cell *> drivers;
 	dict<SigBit, pool<Cell *>> users;
 	pool<SigBit> protected_bits, kept_bits;
@@ -17,7 +17,7 @@ struct PmuxContextWorker {
 	int changes = 0, copies = 0, total_budget = 262144;
 	static constexpr int max_bits = 4096, max_cells = 64, max_depth = 16;
 
-	PmuxContextWorker(Module *module, Design *design) : module(module), design(design), sigmap(module), types(design)
+	PmuxContextWorker(Module *module, Design *design) : module(module), sigmap(module), types(module, design)
 	{
 		for (auto wire : module->wires()) {
 			bool keep = wire->get_bool_attribute(ID::keep);
@@ -40,7 +40,8 @@ struct PmuxContextWorker {
 					}
 					if (input || !output) users[bit].insert(cell);
 					if ((!input && !output) || keep) {
-						protected_bits.insert(bit); kept_bits.insert(bit);
+						protected_bits.insert(bit);
+						kept_bits.insert(bit);
 						if (!input && !output) drivers[bit] = nullptr;
 					}
 				}
@@ -86,7 +87,8 @@ struct PmuxContextWorker {
 
 	bool spend(int &budget, int amount = 1)
 	{
-		budget -= amount; total_budget -= amount;
+		budget -= amount;
+		total_budget -= amount;
 		return budget >= 0 && total_budget >= 0;
 	}
 
@@ -102,7 +104,8 @@ struct PmuxContextWorker {
 	bool fact(dict<SigBit, State> &facts, SigBit bit, State value)
 	{
 		if (!bit.wire) return bit.data == value;
-		if (facts.count(bit)) return facts.at(bit) == value;
+		auto found = facts.find(bit);
+		if (found != facts.end()) return found->second == value;
 		facts[bit] = value;
 		return true;
 	}
@@ -129,7 +132,8 @@ struct PmuxContextWorker {
 			if (a.is_fully_const()) std::swap(a, b);
 			if (!b.is_fully_def()) return true;
 			int width = std::max(GetSize(a), GetSize(b));
-			a.extend_u0(width); b.extend_u0(width);
+			a.extend_u0(width);
+			b.extend_u0(width);
 			for (int i = 0; i < width; i++) if (!fact(facts, a[i], b[i].data)) return false;
 		} else if ((cell->type == ID($logic_and) && value) || (cell->type == ID($logic_or) && !value)) {
 			auto b = sigmap(cell->getPort(ID::B));
@@ -144,9 +148,15 @@ struct PmuxContextWorker {
 	{
 		if (!spend(budget) || depth > max_depth) return false;
 		if (!bit.wire) return true;
-		if (facts.count(bit)) { affected = true; return true; }
+		if (facts.count(bit)) {
+			affected = true;
+			return true;
+		}
 		auto cell = driver(bit);
-		if (!supported(cell)) { leaves.insert(bit); return true; }
+		if (!supported(cell)) {
+			leaves.insert(bit);
+			return true;
+		}
 		if (active.count(cell)) return false;
 		if (cells.count(cell)) return true;
 		if (GetSize(cells) >= max_cells) return false;
@@ -154,7 +164,8 @@ struct PmuxContextWorker {
 		active.insert(cell);
 		for (auto &port : cell->connections()) if (types.cell_input(cell->type, port.first))
 			for (auto input : sigmap(port.second)) if (!cone(input, facts, cells, active, leaves, affected, budget, depth+1)) return false;
-		active.erase(cell); cells.insert(cell);
+		active.erase(cell);
+		cells.insert(cell);
 		return true;
 	}
 
@@ -181,7 +192,10 @@ struct PmuxContextWorker {
 						}
 					}
 				}
-				if (keep) { result.erase(cell); changed = true; }
+				if (keep) {
+					result.erase(cell);
+					changed = true;
+				}
 			}
 		} while (changed);
 		return result;
@@ -218,7 +232,10 @@ struct PmuxContextWorker {
 			if (!mapping.count(bit)) {
 				auto wire = local->addWire(NEW_ID);
 				mapping[bit] = SigBit(wire);
-				if (leaves.count(bit)) { wire->port_input = true; reverse[SigBit(wire)] = bit; }
+				if (leaves.count(bit)) {
+					wire->port_input = true;
+					reverse[SigBit(wire)] = bit;
+				}
 			}
 			return mapping.at(bit);
 		};
@@ -234,10 +251,13 @@ struct PmuxContextWorker {
 				copy->setPort(port.first, signal);
 			}
 		}
-		auto output = local->addWire(NEW_ID, width); output->port_output = true;
+		auto output = local->addWire(NEW_ID, width);
+		output->port_output = true;
 		SigSpec result;
 		for (auto bit : original) result.append(mapbit(bit));
-		local->connect(output, result); local->fixup_ports(); copies++;
+		local->connect(output, result);
+		local->fixup_ports();
+		copies++;
 		Pass::call_on_module(&local_design, local, "opt_expr -fine");
 		Pass::call_on_module(&local_design, local, "opt_reduce");
 		Pass::call_on_module(&local_design, local, "opt_expr -fine");
@@ -265,10 +285,11 @@ struct PmuxContextWorker {
 		}
 		SigSpec replacement;
 		for (auto bit : SigSpec(output)) replacement.append(importbit(bit));
-		auto signal = consumer->getPort(port); signal.replace(offset, replacement);
-		consumer->setPort(port, signal); index_inputs(consumer);
+		auto signal = consumer->getPort(port);
+		signal.replace(offset, replacement);
+		consumer->setPort(port, signal);
+		index_inputs(consumer);
 		for (auto cell : deleted) removed.insert(cell);
-		log("Specialized PMUX context at %s.%s in %s (private cost %d -> %d).\n", log_id(consumer), log_id(port), log_id(module), old_cost, new_cost);
 		changes++;
 	}
 
@@ -285,7 +306,7 @@ struct PmuxContextWorker {
 		return signal;
 	}
 
-	Const maximum(SigSpec signal)
+	Const maximum(const SigSpec &signal)
 	{
 		Const result(State::S0, GetSize(signal));
 		for (int i = 0; i < GetSize(signal); i++) if (signal[i] != State::S0) result.set(i, State::S1);
@@ -305,21 +326,31 @@ struct PmuxContextWorker {
 		if (supported_type && !spend_ports(cell, budget)) return result;
 		if (!supported_type || !editable(cell) || sigmap(cell->getPort(ID::Y)) != signal) {
 			if (!signal.is_fully_def() && signal.is_fully_const()) return result;
-			result.valid = true; result.base = signal; result.residue = Const(State::S0, GetSize(modulus)); result.upper = maximum(signal);
+			result.valid = true;
+			result.base = signal;
+			result.residue = Const(State::S0, GetSize(modulus));
+			result.upper = maximum(signal);
 			return result;
 		}
 		if (!active.insert(cell).second || GetSize(active) > max_cells) return result;
 		if (cell->type.in(ID($add), ID($pos))) {
-			if (cell->getParam(ID::A_SIGNED).as_bool() || (cell->hasPort(ID::B) && cell->getParam(ID::B_SIGNED).as_bool())) { active.erase(cell); return result; }
+			if (cell->getParam(ID::A_SIGNED).as_bool() || (cell->hasPort(ID::B) && cell->getParam(ID::B_SIGNED).as_bool())) {
+				active.erase(cell);
+				return result;
+			}
 			auto a = sigmap(cell->getPort(ID::A));
 			SigSpec b = cell->hasPort(ID::B) ? sigmap(cell->getPort(ID::B)) : SigSpec(State::S0);
 			if (a.is_fully_const()) std::swap(a, b);
-			if (!b.is_fully_def()) { active.erase(cell); return result; }
+			if (!b.is_fully_def()) {
+				active.erase(cell);
+				return result;
+			}
 			result = relation(a, modulus, active, budget, depth+1);
 			if (result.valid) {
 				int width = GetSize(signal), calc_width = std::max({width, GetSize(a), GetSize(b), GetSize(result.upper), GetSize(modulus)})+2;
 				auto sum = const_add(result.upper, b.as_const(), false, false, calc_width);
-				Const capacity(State::S0, calc_width); capacity.set(width, State::S1);
+				Const capacity(State::S0, calc_width);
+				capacity.set(width, State::S1);
 				bool no_overflow = const_lt(sum, capacity, false, false, 1).as_bool();
 				if (!no_overflow && !zero(const_mod(capacity, modulus, false, false, calc_width))) result.valid = false;
 				else {
@@ -331,22 +362,34 @@ struct PmuxContextWorker {
 		} else {
 			auto s = sigmap(cell->getPort(ID::S)), a = sigmap(cell->getPort(ID::A)), b = sigmap(cell->getPort(ID::B));
 			int count = cell->type == ID($mux) ? 1 : GetSize(s);
-			if (count > 16) { active.erase(cell); return result; }
+			if (count > 16) {
+				active.erase(cell);
+				return result;
+			}
 			std::vector<SigSpec> branches;
 			if (!a.is_fully_undef()) branches.push_back(a);
 			for (int i = 0; i < count; i++) branches.push_back(b.extract(i*GetSize(a), GetSize(a)));
 			bool first = true;
 			for (auto branch : branches) {
 				auto next = relation(branch, modulus, active, budget, depth+1);
-				if (!next.valid || (!first && (result.base != next.base || result.residue != next.residue))) { result.valid = false; break; }
-				if (first) { result = next; first = false; }
+				if (!next.valid || (!first && (result.base != next.base || result.residue != next.residue))) {
+					result.valid = false;
+					break;
+				}
+				if (first) {
+					result = next;
+					first = false;
+				}
 				else {
 					result.cells.insert(next.cells.begin(), next.cells.end());
 					if (const_lt(result.upper, next.upper, false, false, 1).as_bool()) result.upper = next.upper;
 				}
 			}
 			if (first) result.valid = false;
-			if (result.valid) { result.selection = true; result.cells.insert(cell); }
+			if (result.valid) {
+				result.selection = true;
+				result.cells.insert(cell);
+			}
 		}
 		active.erase(cell);
 		if (GetSize(result.cells) > max_cells) result.valid = false;
@@ -370,9 +413,10 @@ struct PmuxContextWorker {
 		int old_cost = 0;
 		for (auto old_cell : deleted) old_cost += cost(old_cell);
 		if (!old_cost || budget < 0 || GetSize(result.base) > GetSize(old)) return;
-		cell->setPort(ID::A, result.base); cell->setParam(ID::A_WIDTH, GetSize(result.base)); index_inputs(cell);
+		cell->setPort(ID::A, result.base);
+		cell->setParam(ID::A_WIDTH, GetSize(result.base));
+		index_inputs(cell);
 		for (auto old_cell : deleted) removed.insert(old_cell);
-		log("Reduced PMUX modulo input at %s in %s (private cost %d -> 0).\n", log_id(cell), log_id(module), old_cost);
 		changes++;
 	}
 
@@ -380,8 +424,11 @@ struct PmuxContextWorker {
 	{
 		auto candidates = module->cells().to_vector();
 		for (auto cell : candidates) {
-			if (total_budget <= 0) continue;
-			if (cell->type.in(ID($mod), ID($modfloor))) { modulo(cell); continue; }
+			if (total_budget <= 0) break;
+			if (cell->type.in(ID($mod), ID($modfloor))) {
+				modulo(cell);
+				continue;
+			}
 			if (!editable(cell)) continue;
 			if (!cell->type.in(ID($mux), ID($pmux))) continue;
 			auto s = sigmap(cell->getPort(ID::S));
@@ -389,12 +436,14 @@ struct PmuxContextWorker {
 			if (GetSize(s) > 16 || width > max_bits) continue;
 			if (cell->type == ID($mux)) {
 				for (int value = 0; value < 2; value++) {
-					dict<SigBit, State> facts; int budget = max_bits;
+					dict<SigBit, State> facts;
+					int budget = max_bits;
 					if (condition(s[0], value, facts, budget)) specialize(cell, value ? ID::B : ID::A, 0, width, facts);
 				}
 			} else {
 				for (int index = 0; index < GetSize(s); index++) {
-					dict<SigBit, State> facts; int budget = max_bits;
+					dict<SigBit, State> facts;
+					int budget = max_bits;
 					if (condition(s[index], true, facts, budget)) specialize(cell, ID::B, index*width, width, facts);
 				}
 			}
@@ -412,15 +461,22 @@ struct OptPmuxContextPass : public Pass {
 		log("Only strictly cheaper private structures are replaced. Undefined regions may be refined.\n");
 	}
 	void execute(std::vector<std::string> args, Design *design) override {
-		log_header(design, "Executing OPT_PMUXCONTEXT pass.\n");
 		extra_args(args, 1, design);
 		for (auto module : design->selected_modules()) {
 			bool candidate = false;
-			for (auto cell : module->selected_cells()) if (cell->type.in(ID($mux), ID($pmux), ID($mod), ID($modfloor))) { candidate = true; break; }
+			for (auto cell : module->selected_cells()) if (cell->type.in(ID($mux), ID($pmux), ID($mod), ID($modfloor))) {
+				candidate = true;
+				break;
+			}
 			if (!candidate) continue;
 			bool whole = design->selected_whole_module(module);
-			PmuxContextWorker worker(module, design); worker.run();
-			if (worker.changes && whole) {
+			int changes;
+			{
+				PmuxContextWorker worker(module, design);
+				worker.run();
+				changes = worker.changes;
+			}
+			if (changes && whole) {
 				Pass::call_on_module(design, module, "opt_expr -fine");
 				Pass::call_on_module(design, module, "opt_clean");
 			}

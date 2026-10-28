@@ -32,9 +32,6 @@ struct OptBalanceTreeWorker {
 	Module *module;
 	SigMap sigmap;
 
-	// Counts of each cell type that are getting balanced
-	dict<IdString, int> cell_count;
-
 	// Per cell type netlist indexes, rebuilt for each balanced cell type
 	dict<SigSpec, Cell*> sig_to_driver;
 	pool<SigSpec> input_port_sigs;
@@ -116,8 +113,7 @@ struct OptBalanceTreeWorker {
 			new_cell->setParam(ID::A_SIGNED, cell->getParam(ID::A_SIGNED));
 			new_cell->setParam(ID::B_SIGNED, cell->getParam(ID::B_SIGNED));
 
-			// Update count and return output wire
-			cell_count[cell_type]++;
+			// 返回输出信号。
 			return out_wire;
 		}
 
@@ -148,8 +144,7 @@ struct OptBalanceTreeWorker {
 		new_cell->setParam(ID::A_SIGNED, cell->getParam(ID::A_SIGNED));
 		new_cell->setParam(ID::B_SIGNED, cell->getParam(ID::B_SIGNED));
 
-		// Update count and return output wire
-		cell_count[cell_type]++;
+		// 返回输出信号。
 		return out_wire;
 	}
 
@@ -312,7 +307,6 @@ struct OptBalanceTreeWorker {
 					if (inner_cells)
 					{
 						// Create a tree
-						log_debug("  Creating tree for %s with %d sources and %d inner cells...\n", head_cell, GetSize(sources), inner_cells);
 
 						// Build a vector of all source signals
 						vector<SigSpec> source_signals;
@@ -372,7 +366,6 @@ struct OptBalanceTreePass : public Pass {
 		log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override {
-		log_header(design, "Executing OPT_BALANCE_TREE pass (cell cascades to trees).\n");
 		log_experimental("open_balance_tree");
 
 		// Handle arguments
@@ -391,18 +384,9 @@ struct OptBalanceTreePass : public Pass {
 		}
 		extra_args(args, argidx, design);
 
-		// Count of all cells that were packed
-		dict<IdString, int> cell_count;
 		for (auto module : design->selected_modules()) {
 			OptBalanceTreeWorker worker(module, cell_types);
-			for (auto cell : worker.cell_count) {
-				cell_count[cell.first] += cell.second;
-			}
 		}
-
-		// Log stats
-		for (auto cell_type : cell_types)
-			log("Converted %d %s cells into trees.\n", cell_count[cell_type], cell_type.unescape());
 
 		// Clean up
 		Yosys::run_pass("clean -purge");

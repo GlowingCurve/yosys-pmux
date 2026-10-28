@@ -96,7 +96,6 @@ struct OptDffPass : public Pass {
 
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
-		log_header(design, "Executing OPT_DFF pass (perform DFF optimizations).\n");
 
 		OptDffOptions opt;
 		opt.nodffe = false;

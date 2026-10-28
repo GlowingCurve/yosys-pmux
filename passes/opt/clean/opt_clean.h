@@ -33,27 +33,14 @@ struct AnalysisContext {
 	AnalysisContext(RTLIL::Module* m, ParallelDispatchThreadPool::Subpool &p) : assign_map(m), mod(m), subpool(p) {}
 };
 
-struct RmStats {
-	int count_rm_cells = 0;
-	int count_rm_wires = 0;
-
-	void log()
-	{
-		if (count_rm_cells > 0 || count_rm_wires > 0)
-			YOSYS_NAMESPACE_PREFIX log("Removed %d unused cells and %d unused wires.\n", count_rm_cells, count_rm_wires);
-	}
-};
-
 struct Flags {
 	bool purge = false;
-	bool verbose = false;
 };
 struct CleanRunContext {
 	static constexpr auto ct_reg = StaticCellTypes::Categories::join(
 		StaticCellTypes::Compat::mem_ff,
 		StaticCellTypes::categories.is_anyinit);
 	NewCellTypes ct_all;
-	RmStats stats;
 	ParallelDispatchThreadPool thread_pool;
 	KeepCache keep_cache;
 	Flags flags;
@@ -84,15 +71,12 @@ public:
 				ct_all.setup_module(module);
 	}
 
-	~CleanRunContext() {
-		ct_all.clear();
-	}
 };
 
-void remove_temporary_cells(RTLIL::Module *module, ParallelDispatchThreadPool::Subpool &subpool, bool verbose);
+void remove_temporary_cells(RTLIL::Module *module, ParallelDispatchThreadPool::Subpool &subpool);
 void rmunused_module_cells(Module *module, ParallelDispatchThreadPool::Subpool &subpool, CleanRunContext &clean_ctx);
 bool rmunused_module_signals(RTLIL::Module *module, ParallelDispatchThreadPool::Subpool &subpool, CleanRunContext &clean_ctx);
-bool rmunused_module_init(RTLIL::Module *module, ParallelDispatchThreadPool::Subpool &subpool, bool verbose);
+bool rmunused_module_init(RTLIL::Module *module, ParallelDispatchThreadPool::Subpool &subpool);
 
 YOSYS_NAMESPACE_END
 

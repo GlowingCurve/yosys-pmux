@@ -128,7 +128,6 @@ struct MuxpackWorker
 	Module *module;
 	SigMap sigmap;
 
-	int mux_count, pmux_count;
 
 	pool<Cell*> remove_cells;
 
@@ -290,11 +289,7 @@ struct MuxpackWorker
 		Cell *first_cell = chain.front();
 		Cell *last_cell = chain.back();
 
-		log("Converting %s.%s ... %s.%s to a pmux with %d cases.\n",
-			module, first_cell, module, last_cell, cases);
 
-		mux_count += cases;
-		pmux_count += 1;
 
 		first_cell->type = ID($pmux);
 
@@ -334,7 +329,7 @@ struct MuxpackWorker
 	}
 
 	MuxpackWorker(Module *module) :
-			module(module), sigmap(module), mux_count(0), pmux_count(0), excl_db(module, sigmap)
+			module(module), sigmap(module), excl_db(module, sigmap)
 	{
 		make_sig_chain_next_prev();
 		find_chain_start_cells();
@@ -367,7 +362,6 @@ struct MuxpackPass : public Pass {
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
-		log_header(design, "Executing MUXPACK pass ($mux cell cascades to $pmux).\n");
 
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++)
@@ -376,16 +370,10 @@ struct MuxpackPass : public Pass {
 		}
 		extra_args(args, argidx, design);
 
-		int mux_count = 0;
-		int pmux_count = 0;
-
 		for (auto module : design->selected_modules()) {
 			MuxpackWorker worker(module);
-			mux_count += worker.mux_count;
-			pmux_count += worker.pmux_count;
 		}
 
-		log("Converted %d (p)mux cells into %d pmux cells.\n", mux_count, pmux_count);
 	}
 } MuxpackPass;
 

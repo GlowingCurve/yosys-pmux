@@ -37,7 +37,6 @@ struct OptMemWidenPass : public Pass {
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
-		log_header(design, "Executing OPT_MEM_WIDEN pass (optimize memories where all ports are wide).\n");
 
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
@@ -71,7 +70,6 @@ struct OptMemWidenPass : public Pass {
 				}
 				if (factor_log2 == 0)
 					continue;
-				log("Widening base width of memory %s in module %s by factor %d.\n", mem.memid.unescape(), module->name.unescape(), 1 << factor_log2);
 				total_count++;
 				// The inits are too messy to expand one-by-one, for they may
 				// collide with one another after expansion.  Just hit it with
@@ -106,7 +104,6 @@ struct OptMemWidenPass : public Pass {
 
 		if (total_count)
 			design->scratchpad_set_bool("opt.did_something", true);
-		log("Performed a total of %d transformations.\n", total_count);
 	}
 } OptMemWidenPass;
 

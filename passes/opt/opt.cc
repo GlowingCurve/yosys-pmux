@@ -78,7 +78,6 @@ struct OptPass : public Pass {
 		bool noff_mode = false;
 		bool hier_mode = false;
 
-		log_header(design, "Executing OPT pass (performing simple optimizations).\n");
 		log_push();
 
 		size_t argidx;
@@ -165,7 +164,6 @@ struct OptPass : public Pass {
 				if (hier_mode)
 					Pass::call(design, "opt_hier");
 				Pass::call(design, opt_clean_args);
-				log_header(design, "Rerunning OPT passes. (Removed registers in this run.)\n");
 			}
 			Pass::call(design, opt_clean_args);
 		}
@@ -190,14 +188,12 @@ struct OptPass : public Pass {
 				Pass::call(design, opt_expr_args);
 				if (design->scratchpad_get_bool("opt.did_something") == false)
 					break;
-				log_header(design, "Rerunning OPT passes. (Maybe there is more to do..)\n");
 			}
 		}
 
 		design->optimize();
 		design->check();
 
-		log_header(design, "Finished fast OPT passes.%s\n", fast_mode ? "" : " (There is nothing left to do.)");
 		log_pop();
 	}
 } OptPass;

@@ -83,7 +83,6 @@ struct PeepoptPass : public Pass {
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
-		log_header(design, "Executing PEEPOPT pass (run peephole optimizers).\n");
 
 		bool formalclk = false;
 

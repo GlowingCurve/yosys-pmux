@@ -476,16 +476,8 @@ struct WireDeleter {
 		for (auto &conn : new_connections)
 			mod->connect(std::move(conn));
 	}
-	int delete_wires(RTLIL::Module* mod, bool verbose) {
-		int deleted_and_unreported = 0;
-		for (auto wire : del_wires_queue) {
-			if (ys_debug() || (check_public_name(wire->name) && verbose))
-				log_debug("  removing unused non-port wire %s.\n", wire->name);
-			else
-				deleted_and_unreported++;
-		}
+	void delete_wires(RTLIL::Module* mod) {
 		mod->remove(del_wires_queue);
-		return deleted_and_unreported;
 	}
 };
 
@@ -501,40 +493,39 @@ bool rmunused_module_signals(RTLIL::Module *module, ParallelDispatchThreadPool::
 	AnalysisContext actx(module, subpool);
 	SigConnKinds conn_kinds(clean_ctx.flags.purge, actx, clean_ctx);
 
-	ExactCellWires cell_wires(conn_kinds.exact_cells, actx.assign_map);
-	// Collect sigmap representative candidates as built in parallel
-	// With parallel runs, this creates redundant candidates that have to resolve in update_assign_map
-	ShardedVector<RTLIL::SigBit> new_sigmap_rep_candidates = build_candidates(cell_wires, conn_kinds, actx);
+	{
+		ExactCellWires cell_wires(conn_kinds.exact_cells, actx.assign_map);
+		// Collect sigmap representative candidates as built in parallel
+		// With parallel runs, this creates redundant candidates that have to resolve in update_assign_map
+		ShardedVector<RTLIL::SigBit> new_sigmap_rep_candidates = build_candidates(cell_wires, conn_kinds, actx);
 
-	// Cache all the cell_wires results that we might possible need. This avoids the results
-	// changing when we update `assign_map` below.
-	cell_wires.cache_all(new_sigmap_rep_candidates);
-	// Modify assign_map to reflect the connectivity we want, not the one we have
-	// this changes representative selection in assign_map
-	update_assign_map(actx.assign_map, new_sigmap_rep_candidates, cell_wires, conn_kinds);
+		// Cache all the cell_wires results that we might possible need. This avoids the results
+		// changing when we update `assign_map` below.
+		cell_wires.cache_all(new_sigmap_rep_candidates);
+		// Modify assign_map to reflect the connectivity we want, not the one we have
+		// this changes representative selection in assign_map
+		update_assign_map(actx.assign_map, new_sigmap_rep_candidates, cell_wires, conn_kinds);
+	}
 
 	// Remove all wire-wire connections
 	module->connections_.clear();
 
 	UsedSignals used;
-	DeferredUpdates deferred = analyse_connectivity(used, conn_kinds, actx);
-	fixup_cell_ports(deferred.update_connections);
-	// Rip up and re-apply init attributes onto representative wires with x-bits
-	// in place of unset init bits
-	consume_inits(deferred.initialized_wires, actx.assign_map).apply_normalised_inits();
+	{
+		DeferredUpdates deferred = analyse_connectivity(used, conn_kinds, actx);
+		fixup_cell_ports(deferred.update_connections);
+		// Rip up and re-apply init attributes onto representative wires with x-bits
+		// in place of unset init bits
+		consume_inits(deferred.initialized_wires, actx.assign_map).apply_normalised_inits();
+	}
 
 	WireDeleter deleter(used, clean_ctx.flags.purge, actx);
 
 	used.clear(subpool);
 
 	deleter.commit_changes(module);
-	int deleted_and_unreported = deleter.delete_wires(module, clean_ctx.flags.verbose);
+	deleter.delete_wires(module);
 	int deleted_total = GetSize(deleter.del_wires_queue);
-
-	clean_ctx.stats.count_rm_wires += deleted_total;
-
-	if (clean_ctx.flags.verbose && deleted_and_unreported)
-		log_debug("  removed %d unused temporary wires.\n", deleted_and_unreported);
 
 	if (deleted_total)
 		module->design->scratchpad_set_bool("opt.did_something", true);

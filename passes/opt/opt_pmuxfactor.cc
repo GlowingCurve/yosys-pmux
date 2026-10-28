@@ -1,14 +1,14 @@
+// opt_pmuxfactor 提取 PMUX 分支的公共运算并前移归约运算；复用分支表达式与端口映射，减少选择逻辑和重复运算。
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
-#include "kernel/celltypes.h"
-// opt_pmuxfactor 提取 PMUX 分支的公共运算并前移归约运算；复用分支表达式与端口映射，减少选择逻辑和重复运算。
+#include "passes/opt/pmux_celltypes.h"
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
 
 struct PmuxFactorWorker {
 	Module *module;
 	SigMap sigmap;
-	CellTypes types;
+	PmuxCellTypes types;
 	dict<SigBit, std::pair<Cell *, int>> drivers;
 	dict<SigBit, pool<Cell *>> users;
 	pool<SigBit> protected_bits;
@@ -17,7 +17,7 @@ struct PmuxFactorWorker {
 	dict<std::tuple<IdString, SigBit, SigBit>, SigBit> operators;
 	int changes = 0;
 
-	PmuxFactorWorker(Module *module, Design *design) : module(module), sigmap(module), types(design)
+	PmuxFactorWorker(Module *module, Design *design) : module(module), sigmap(module), types(module, design)
 	{
 		for (auto wire : module->wires()) if (wire->port_input)
 			for (auto bit : sigmap(wire)) drivers[bit] = {nullptr, 0};
@@ -38,7 +38,10 @@ struct PmuxFactorWorker {
 						if (drivers.count(signal[i])) drivers[signal[i]] = {nullptr, 0};
 						else drivers[signal[i]] = {cell, i};
 					} else users[signal[i]].insert(cell);
-					if (keep) { protected_bits.insert(signal[i]); kept_bits.insert(signal[i]); }
+					if (keep) {
+						protected_bits.insert(signal[i]);
+						kept_bits.insert(signal[i]);
+					}
 				}
 			}
 		}
@@ -74,8 +77,9 @@ struct PmuxFactorWorker {
 
 	bool expression(SigBit bit, IdString &type, SigBit &a, SigBit &b)
 	{
-		if (!drivers.count(bit) || !drivers.at(bit).first) return false;
-		auto entry = drivers.at(bit);
+		auto found = drivers.find(bit);
+		if (found == drivers.end() || !found->second.first) return false;
+		auto entry = found->second;
 		auto cell = entry.first;
 		if (!editable(cell)) return false;
 		type = cell->type;
@@ -125,13 +129,16 @@ struct PmuxFactorWorker {
 		if (bit == target) return true;
 		if (!seen.insert(bit).second || !drivers.count(bit) || !drivers.at(bit).first) return false;
 		if (--budget <= 0) return true;
-		auto entry = drivers.at(bit); auto cell = entry.first;
+		auto entry = drivers.at(bit);
+		auto cell = entry.first;
 		SigSpec inputs;
 		if (cell->type.in(ID($and), ID($or), ID($xor), ID($xnor))) {
-			inputs.append(operand(cell, ID::A, entry.second)); inputs.append(operand(cell, ID::B, entry.second));
+			inputs.append(operand(cell, ID::A, entry.second));
+			inputs.append(operand(cell, ID::B, entry.second));
 		} else if (cell->type.in(ID($mux), ID($pmux))) {
 			auto a = sigmap(cell->getPort(ID::A)), b = sigmap(cell->getPort(ID::B)), s = sigmap(cell->getPort(ID::S));
-			inputs.append(a[entry.second]); inputs.append(s);
+			inputs.append(a[entry.second]);
+			inputs.append(s);
 			for (int i = 0; i < (cell->type == ID($mux) ? 1 : GetSize(s)); i++) inputs.append(b[i*GetSize(a)+entry.second]);
 		} else {
 			for (auto &port : cell->connections()) if (types.cell_input(cell->type, port.first)) inputs.append(sigmap(port.second));
@@ -142,18 +149,22 @@ struct PmuxFactorWorker {
 
 	bool independent(SigBit bit, SigBit target)
 	{
-		pool<SigBit> seen; int budget = 512;
+		pool<SigBit> seen;
+		int budget = 512;
 		return !depends(bit, target, seen, budget);
 	}
 
-	PlanPtr lookup(Choice &choice, SigSpec values, SigBit avoid)
+	PlanPtr lookup(Choice &choice, const SigSpec &values, SigBit avoid)
 	{
-		if (choice.exact.count(values) && independent(choice.exact.at(values), avoid))
-			return direct(choice.exact.at(values));
+		log_assert(GetSize(values) >= 2);
+		auto exact = choice.exact.find(values);
+		if (exact != choice.exact.end() && independent(exact->second, avoid))
+			return direct(exact->second);
 		if (values[0] == State::Sx) {
 			auto branches = values.extract(1, GetSize(values)-1);
-			if (choice.undefined_default.count(branches) && independent(choice.undefined_default.at(branches), avoid))
-				return direct(choice.undefined_default.at(branches));
+			auto found = choice.undefined_default.find(branches);
+			if (found != choice.undefined_default.end() && independent(found->second, avoid))
+				return direct(found->second);
 		}
 		SigBit same = values[0];
 		if (same == State::Sx) same = values[1];
@@ -162,7 +173,7 @@ struct PmuxFactorWorker {
 		return direct(same);
 	}
 
-	PlanPtr lift(Choice &choice, SigSpec values, SigBit avoid, int depth, bool root = false)
+	PlanPtr lift(Choice &choice, const SigSpec &values, SigBit avoid, int depth, bool root = false)
 	{
 		if (!root) {
 			auto existing = lookup(choice, values, avoid);
@@ -175,15 +186,25 @@ struct PmuxFactorWorker {
 			SigBit first_a, first_b;
 			for (int i = 0; i < GetSize(values); i++) {
 				if (i == 0 && values[i] == State::Sx) {
-					aa.append(State::Sx); bb.append(State::Sx); ss.append(State::Sx);
+					aa.append(State::Sx);
+					bb.append(State::Sx);
+					ss.append(State::Sx);
 					continue;
 				}
 				IdString type;
 				SigBit a, b;
-				if (!expression(values[i], type, a, b) || (!common.empty() && type != common)) { match = false; break; }
-				if (common.empty()) { common = type; first_a = a; first_b = b; }
+				if (!expression(values[i], type, a, b) || (!common.empty() && type != common)) {
+					match = false;
+					break;
+				}
+				if (common.empty()) {
+					common = type;
+					first_a = a;
+					first_b = b;
+				}
 				if (type != ID($mux) && a == first_b && b != first_b) std::swap(a, b);
-				aa.append(a); bb.append(b);
+				aa.append(a);
+				bb.append(b);
 				if (type == ID($mux)) ss.append(sigmap(drivers.at(values[i]).first->getPort(ID::S)));
 			}
 			if (match && !common.empty()) {
@@ -193,7 +214,8 @@ struct PmuxFactorWorker {
 					bool defined_data = (first_a.wire || first_a.data == State::S0 || first_a.data == State::S1) &&
 						(first_b.wire || first_b.data == State::S0 || first_b.data == State::S1);
 					if (defined_data && pa && pb && pa->direct && pb->direct && pa->result == first_a && pb->result == first_b) {
-						a = direct(first_a); b = lift(choice, ss, avoid, depth-1);
+						a = direct(first_a);
+						b = lift(choice, ss, avoid, depth-1);
 					}
 				} else {
 					a = lift(choice, aa, avoid, depth-1);
@@ -201,7 +223,9 @@ struct PmuxFactorWorker {
 				}
 				if (a && b && a->selectors + b->selectors <= 1) {
 					auto plan = std::make_shared<Plan>();
-					plan->type = common; plan->a = a; plan->b = b;
+					plan->type = common;
+					plan->a = a;
+					plan->b = b;
 					if (common == ID($mux)) plan->values.append(first_b);
 					plan->selectors = a->selectors + b->selectors;
 					plan->operations = 1 + a->operations + b->operations;
@@ -211,12 +235,14 @@ struct PmuxFactorWorker {
 		}
 		if (root) return nullptr;
 		auto plan = std::make_shared<Plan>();
-		plan->values = values; plan->selectors = 1;
+		plan->values = values;
+		plan->selectors = 1;
 		return plan;
 	}
 
 	SigBit materialize(Choice &choice, PlanPtr plan, SigBit avoid)
 	{
+		log_assert(plan != nullptr);
 		if (plan->direct) return plan->result;
 		if (plan->type.empty()) {
 			auto output = module->addWire(NEW_ID);
@@ -226,15 +252,21 @@ struct PmuxFactorWorker {
 			auto a = materialize(choice, plan->a, avoid), b = materialize(choice, plan->b, avoid);
 			if (plan->type != ID($mux) && b < a) std::swap(a, b);
 			auto key = std::make_tuple(plan->type, a, b);
-			if (plan->type != ID($mux) && operators.count(key) && independent(operators.at(key), avoid)) return operators.at(key);
+			auto found = operators.find(key);
+			if (plan->type != ID($mux) && found != operators.end() && independent(found->second, avoid)) return found->second;
 			auto output = module->addWire(NEW_ID);
 			Cell *cell;
 			if (plan->type == ID($mux)) cell = module->addMux(NEW_ID, a, plan->values[0], b, output);
 			else {
 				cell = module->addCell(NEW_ID, plan->type);
-				cell->setParam(ID::A_WIDTH, 1); cell->setParam(ID::B_WIDTH, 1); cell->setParam(ID::Y_WIDTH, 1);
-				cell->setParam(ID::A_SIGNED, false); cell->setParam(ID::B_SIGNED, false);
-				cell->setPort(ID::A, a); cell->setPort(ID::B, b); cell->setPort(ID::Y, output);
+				cell->setParam(ID::A_WIDTH, 1);
+				cell->setParam(ID::B_WIDTH, 1);
+				cell->setParam(ID::Y_WIDTH, 1);
+				cell->setParam(ID::A_SIGNED, false);
+				cell->setParam(ID::B_SIGNED, false);
+				cell->setPort(ID::A, a);
+				cell->setPort(ID::B, b);
+				cell->setPort(ID::Y, output);
 			}
 			if (plan->type != ID($mux)) operators[key] = SigBit(output);
 			return SigBit(output);
@@ -243,9 +275,11 @@ struct PmuxFactorWorker {
 
 	void xor_terms(SigBit bit, pool<SigBit> &terms, int depth)
 	{
-		IdString type; SigBit a, b;
+		IdString type;
+		SigBit a, b;
 		if (depth && expression(bit, type, a, b) && type == ID($xor)) {
-			xor_terms(a, terms, depth-1); xor_terms(b, terms, depth-1);
+			xor_terms(a, terms, depth-1);
+			xor_terms(b, terms, depth-1);
 		} else if (bit != State::S0) {
 			if (terms.count(bit)) terms.erase(bit); else terms.insert(bit);
 		}
@@ -261,19 +295,30 @@ struct PmuxFactorWorker {
 			SigSpec a, b, remaining;
 			for (int i = 0; i < GetSize(y); i++) {
 				pool<SigBit> terms;
-				xor_terms(operand(cell, ID::A, i), terms, 3); xor_terms(operand(cell, ID::B, i), terms, 3);
+				xor_terms(operand(cell, ID::A, i), terms, 3);
+				xor_terms(operand(cell, ID::B, i), terms, 3);
 				if (GetSize(terms) <= 1) {
-					module->connect(y[i], terms.empty() ? SigBit(State::S0) : *terms.begin()); changes++;
-				} else { a.append(operand(cell, ID::A, i)); b.append(operand(cell, ID::B, i)); remaining.append(y[i]); }
+					module->connect(y[i], terms.empty() ? SigBit(State::S0) : *terms.begin());
+					changes++;
+				} else {
+					a.append(operand(cell, ID::A, i));
+					b.append(operand(cell, ID::B, i));
+					remaining.append(y[i]);
+				}
 			}
 			if (GetSize(remaining) == GetSize(y)) continue;
 			if (remaining.empty()) removed.push_back(cell);
 			else edits.push_back({cell, a, b, remaining});
 		}
 		for (auto &edit : edits) {
-			edit.cell->setPort(ID::A, edit.a); edit.cell->setPort(ID::B, edit.b); edit.cell->setPort(ID::Y, edit.y);
-			edit.cell->setParam(ID::A_WIDTH, GetSize(edit.a)); edit.cell->setParam(ID::B_WIDTH, GetSize(edit.b)); edit.cell->setParam(ID::Y_WIDTH, GetSize(edit.y));
-			edit.cell->setParam(ID::A_SIGNED, false); edit.cell->setParam(ID::B_SIGNED, false);
+			edit.cell->setPort(ID::A, edit.a);
+			edit.cell->setPort(ID::B, edit.b);
+			edit.cell->setPort(ID::Y, edit.y);
+			edit.cell->setParam(ID::A_WIDTH, GetSize(edit.a));
+			edit.cell->setParam(ID::B_WIDTH, GetSize(edit.b));
+			edit.cell->setParam(ID::Y_WIDTH, GetSize(edit.y));
+			edit.cell->setParam(ID::A_SIGNED, false);
+			edit.cell->setParam(ID::B_SIGNED, false);
 		}
 		for (auto cell : removed) module->remove(cell);
 	}
@@ -327,7 +372,7 @@ struct PmuxFactorWorker {
 	{
 		if (plan->direct) return true;
 		if (!plan->type.empty()) return independent_selector_branches(plan->a) && independent_selector_branches(plan->b);
-		// 新建选择器的分支需要具有独立支持，避免把共享控制逻辑计作可删除的独立成本。
+		// 按分支的独立支持集合计算新建选择器成本。
 		pool<SigBit> used;
 		for (int i = 0; i < GetSize(plan->values); i++) {
 			if (i == 0 && plan->values[i] == State::Sx) continue;
@@ -348,7 +393,8 @@ struct PmuxFactorWorker {
 		for (auto cell : module->cells()) if (cell->type == ID($pmux) && editable(cell)) {
 			auto s = sigmap(cell->getPort(ID::S));
 			if (GetSize(s) < 3) continue;
-			auto &choice = choices[s]; choice.select = s;
+			auto &choice = choices[s];
+			choice.select = s;
 			auto a = sigmap(cell->getPort(ID::A)), b = sigmap(cell->getPort(ID::B)), y = sigmap(cell->getPort(ID::Y));
 			for (int j = 0; j < GetSize(y); j++) {
 				SigSpec values(a[j]);
@@ -359,7 +405,8 @@ struct PmuxFactorWorker {
 			pmuxes.push_back(cell);
 		}
 		for (auto cell : pmuxes) {
-			auto s = sigmap(cell->getPort(ID::S)); auto &choice = choices[s];
+			auto s = sigmap(cell->getPort(ID::S));
+			auto &choice = choices[s];
 			auto a = sigmap(cell->getPort(ID::A)), b = sigmap(cell->getPort(ID::B)), y = sigmap(cell->getPort(ID::Y));
 			SigSpec remaining_a, remaining_b, remaining_y;
 			std::vector<int> remaining;
@@ -372,7 +419,8 @@ struct PmuxFactorWorker {
 				auto plan = lift(choice, values, y[j], 3, true);
 				if (plan && !private_branches(cell, values, plan->operations)) plan = nullptr;
 				if (plan && !independent_selector_branches(plan)) plan = nullptr;
-				plans.push_back(plan); branch_values.push_back(values);
+				plans.push_back(plan);
+				branch_values.push_back(values);
 			}
 			bool invalidated;
 			do {
@@ -382,22 +430,33 @@ struct PmuxFactorWorker {
 					for (auto bit : branch_values[j]) if (drivers.count(bit) && drivers.at(bit).first) retained.insert(drivers.at(bit).first);
 				for (int j = 0; j < GetSize(y); j++) if (plans[j])
 					for (auto bit : branch_values[j]) if (drivers.count(bit) && retained.count(drivers.at(bit).first)) {
-						plans[j] = nullptr; invalidated = true; break;
+						plans[j] = nullptr;
+						invalidated = true;
+						break;
 					}
 			} while (invalidated);
 			for (int j = 0; j < GetSize(y); j++) {
-				if (!plans[j]) { remaining.push_back(j); continue; }
-				module->connect(y[j], materialize(choice, plans[j], y[j])); count++;
+				if (!plans[j]) {
+					remaining.push_back(j);
+					continue;
+				}
+				module->connect(y[j], materialize(choice, plans[j], y[j]));
+				count++;
 			}
 			if (!count) continue;
-			for (int j : remaining) { remaining_a.append(a[j]); remaining_y.append(y[j]); }
+			for (int j : remaining) {
+				remaining_a.append(a[j]);
+				remaining_y.append(y[j]);
+			}
 			for (int i = 0; i < GetSize(s); i++) for (int j : remaining) remaining_b.append(b[i*GetSize(y)+j]);
 			if (remaining.empty()) removed.push_back(cell);
 			else edits.push_back({cell, remaining_a, remaining_b, remaining_y});
 			changes += count;
 		}
 		for (auto &edit : edits) {
-			edit.cell->setPort(ID::A, edit.a); edit.cell->setPort(ID::B, edit.b); edit.cell->setPort(ID::Y, edit.y);
+			edit.cell->setPort(ID::A, edit.a);
+			edit.cell->setPort(ID::B, edit.b);
+			edit.cell->setPort(ID::Y, edit.y);
 			edit.cell->setParam(ID::WIDTH, GetSize(edit.y));
 		}
 		for (auto cell : removed) module->remove(cell);
@@ -424,7 +483,10 @@ struct PmuxFactorWorker {
 			branches.push_back(a);
 			for (int i = 0; i < GetSize(s); i++) branches.push_back(b.extract(i*GetSize(a), GetSize(a)));
 			pool<SigSpec> unique;
-			for (auto &branch : branches) { branch.sort(); unique.insert(branch); }
+			for (auto &branch : branches) {
+				branch.sort();
+				unique.insert(branch);
+			}
 			if (GetSize(unique)*(GetSize(a)-1)+GetSize(s) >= GetSize(a)*(GetSize(s)+1)) continue;
 			dict<SigSpec, SigBit> results;
 			SigSpec reduced;
@@ -432,8 +494,12 @@ struct PmuxFactorWorker {
 				if (!results.count(branch)) {
 					auto wire = module->addWire(NEW_ID);
 					auto cell = module->addCell(NEW_ID, reduce->type);
-					cell->setParam(ID::A_WIDTH, GetSize(branch)); cell->setParam(ID::Y_WIDTH, 1); cell->setParam(ID::A_SIGNED, false);
-					cell->setPort(ID::A, branch); cell->setPort(ID::Y, wire); results[branch] = SigBit(wire);
+					cell->setParam(ID::A_WIDTH, GetSize(branch));
+					cell->setParam(ID::Y_WIDTH, 1);
+					cell->setParam(ID::A_SIGNED, false);
+					cell->setPort(ID::A, branch);
+					cell->setPort(ID::Y, wire);
+					results[branch] = SigBit(wire);
 				}
 				reduced.append(results.at(branch));
 			}
@@ -442,7 +508,9 @@ struct PmuxFactorWorker {
 			if (GetSize(unique) == 1 || (a.is_fully_undef() && same_defined))
 				module->connect(reduce->getPort(ID::Y), reduced[1]);
 			else module->addPmux(NEW_ID, reduced[0], reduced.extract(1, GetSize(s)), s, reduce->getPort(ID::Y));
-			removed.push_back(reduce); removed.push_back(pmux); changes++;
+			removed.push_back(reduce);
+			removed.push_back(pmux);
+			changes++;
 		}
 		for (auto cell : removed) module->remove(cell);
 	}
@@ -458,7 +526,6 @@ struct OptPmuxFactorPass : public Pass {
 		log("Undefined input regions may be refined. Explicit defaults are preserved.\n");
 	}
 	void execute(std::vector<std::string> args, Design *design) override {
-		log_header(design, "Executing OPT_PMUXFACTOR pass.\n");
 		extra_args(args, 1, design);
 		for (auto module : design->selected_modules()) {
 			bool has_pmux = false;
@@ -472,20 +539,22 @@ struct OptPmuxFactorPass : public Pass {
 			int changes;
 			bool rebuild;
 			{
-				PmuxFactorWorker worker(module, design); worker.reductions();
+				PmuxFactorWorker worker(module, design);
+				worker.reductions();
 				rebuild = worker.changes != 0;
 				if (!rebuild) worker.factor();
 				changes = worker.changes;
 			}
 			if (rebuild) {
-				PmuxFactorWorker worker(module, design); worker.factor();
+				PmuxFactorWorker worker(module, design);
+				worker.factor();
 				changes += worker.changes;
 			}
 			if (changes) {
 				{
-					PmuxFactorWorker xors(module, design); xors.simplify_xors();
+					PmuxFactorWorker xors(module, design);
+					xors.simplify_xors();
 				}
-				log("Changed %d PMUX output bits/reductions in %s.\n", changes, log_id(module));
 				if (whole_module) {
 					Pass::call_on_module(design, module, "opt_expr -fine");
 					Pass::call_on_module(design, module, "opt_merge");

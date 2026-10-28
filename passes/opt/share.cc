@@ -874,7 +874,7 @@ struct ShareWorker
 		return insert_capped(cache, &pattern, &pattern + 1);
 	}
 
-	const pool<ssc_pair_t> &find_cell_activation_patterns(RTLIL::Cell *cell, const char *indent)
+	const pool<ssc_pair_t> &find_cell_activation_patterns(RTLIL::Cell *cell)
 	{
 		if (recursion_state.count(cell)) {
 			static pool<ssc_pair_t> empty_patterns_set;
@@ -907,7 +907,7 @@ struct ShareWorker
 
 		for (auto c : driven_data_muxes)
 		{
-			const pool<ssc_pair_t> &c_patterns = find_cell_activation_patterns(c, indent);
+			const pool<ssc_pair_t> &c_patterns = find_cell_activation_patterns(c);
 
 			bool used_in_a = false;
 			std::set<int> used_in_b_parts;
@@ -950,7 +950,7 @@ struct ShareWorker
 		}
 
 		for (auto c : driven_cells) {
-			const pool<ssc_pair_t> &c_patterns = find_cell_activation_patterns(c, indent);
+			const pool<ssc_pair_t> &c_patterns = find_cell_activation_patterns(c);
 			if (!insert_capped(activation_patterns_cache[cell], c_patterns.begin(), c_patterns.end())) {
 				recursion_state.erase(cell);
 				return activation_patterns_cache[cell];
@@ -962,28 +962,12 @@ struct ShareWorker
 
 		optimize_activation_patterns(activation_patterns_cache[cell]);
 		if (activation_patterns_cache[cell].empty()) {
-			log("%sFound cell that is never activated: %s\n", indent, cell);
 			RTLIL::SigSpec cell_outputs = modwalker.cell_outputs[cell];
 			module->connect(RTLIL::SigSig(cell_outputs, RTLIL::SigSpec(RTLIL::State::Sx, cell_outputs.size())));
 			cells_to_remove.insert(cell);
 		}
 
 		return activation_patterns_cache[cell];
-	}
-
-	RTLIL::SigSpec bits_from_activation_patterns(const pool<ssc_pair_t> &activation_patterns)
-	{
-		std::set<RTLIL::SigBit> all_bits;
-		for (auto &it : activation_patterns) {
-			std::vector<RTLIL::SigBit> bits = it.first;
-			all_bits.insert(bits.begin(), bits.end());
-		}
-
-		RTLIL::SigSpec signal;
-		for (auto &bit : all_bits)
-			signal.append(bit);
-
-		return signal;
 	}
 
 	void filter_activation_patterns(pool<ssc_pair_t> &out,
@@ -1251,70 +1235,51 @@ struct ShareWorker
 		if (shareable_cells.size() < 2)
 			return;
 
-		log("Found %d cells in module %s that may be considered for resource sharing.\n",
-				GetSize(shareable_cells), module);
 
 		while (!shareable_cells.empty() && config.limit != 0 && !warn_if_budget_spent())
 		{
 			RTLIL::Cell *cell = *shareable_cells.begin();
 			shareable_cells.erase(cell);
 
-			log("  Analyzing resource sharing options for %s (%s):\n", cell, cell->type.unescape());
 
-			const pool<ssc_pair_t> &cell_activation_patterns = find_cell_activation_patterns(cell, "    ");
-			RTLIL::SigSpec cell_activation_signals = bits_from_activation_patterns(cell_activation_patterns);
+			const pool<ssc_pair_t> &cell_activation_patterns = find_cell_activation_patterns(cell);
 
 			if (cell_activation_patterns.empty()) {
-				log("    Cell is never active. Sharing is pointless, we simply remove it.\n");
 				cells_to_remove.insert(cell);
 				continue;
 			}
 
 			if (cell_activation_patterns.count(ssc_pair_t())) {
-				log("    Cell is always active. Therefore no sharing is possible.\n");
 				continue;
 			}
 
-			log("    Found %d activation_patterns using ctrl signal %s.\n", GetSize(cell_activation_patterns), log_signal(cell_activation_signals));
 
 			std::vector<RTLIL::Cell*> candidates;
 			find_shareable_partners(candidates, cell);
 
 			if (candidates.empty()) {
-				log("    No candidates found.\n");
 				continue;
 			}
-
-			log("    Found %d candidates:", GetSize(candidates));
-			for (auto c : candidates)
-				log(" %s", c);
-			log("\n");
 
 			for (auto other_cell : candidates)
 			{
 				if (warn_if_budget_spent())
 					break;
 
-				log("    Analyzing resource sharing with %s (%s):\n", other_cell, other_cell->type.unescape());
 
-				const pool<ssc_pair_t> &other_cell_activation_patterns = find_cell_activation_patterns(other_cell, "      ");
-				RTLIL::SigSpec other_cell_activation_signals = bits_from_activation_patterns(other_cell_activation_patterns);
+				const pool<ssc_pair_t> &other_cell_activation_patterns = find_cell_activation_patterns(other_cell);
 
 				if (other_cell_activation_patterns.empty()) {
-					log("      Cell is never active. Sharing is pointless, we simply remove it.\n");
 					shareable_cells.erase(other_cell);
 					cells_to_remove.insert(other_cell);
 					continue;
 				}
 
 				if (other_cell_activation_patterns.count(ssc_pair_t())) {
-					log("      Cell is always active. Therefore no sharing is possible.\n");
 					shareable_cells.erase(other_cell);
 					continue;
 				}
 
-				log("      Found %d activation_patterns using ctrl signal %s.\n",
-						GetSize(other_cell_activation_patterns), log_signal(other_cell_activation_signals));
 
 				const pool<RTLIL::SigBit> &cell_forbidden_controls = find_forbidden_controls(cell);
 				const pool<RTLIL::SigBit> &other_cell_forbidden_controls = find_forbidden_controls(other_cell);
@@ -1322,9 +1287,6 @@ struct ShareWorker
 				std::set<RTLIL::SigBit> union_forbidden_controls;
 				union_forbidden_controls.insert(cell_forbidden_controls.begin(), cell_forbidden_controls.end());
 				union_forbidden_controls.insert(other_cell_forbidden_controls.begin(), other_cell_forbidden_controls.end());
-
-				if (!union_forbidden_controls.empty())
-					log("      Forbidden control signals for this pair of cells: %s\n", log_signal(union_forbidden_controls));
 
 				pool<ssc_pair_t> filtered_cell_activation_patterns;
 				pool<ssc_pair_t> filtered_other_cell_activation_patterns;
@@ -1348,13 +1310,11 @@ struct ShareWorker
 				RTLIL::SigSpec all_ctrl_signals;
 
 				for (auto &p : filtered_cell_activation_patterns) {
-					log("      Activation pattern for cell %s: %s = %s\n", cell, log_signal(p.first), log_signal(p.second));
 					cell_active.push_back(qcsat.ez->vec_eq(qcsat.importSig(p.first), qcsat.importSig(p.second)));
 					all_ctrl_signals.append(p.first);
 				}
 
 				for (auto &p : filtered_other_cell_activation_patterns) {
-					log("      Activation pattern for cell %s: %s = %s\n", other_cell, log_signal(p.first), log_signal(p.second));
 					other_cell_active.push_back(qcsat.ez->vec_eq(qcsat.importSig(p.first), qcsat.importSig(p.second)));
 					all_ctrl_signals.append(p.first);
 				}
@@ -1383,7 +1343,6 @@ struct ShareWorker
 					break;
 				}
 				if (act_res == SatEffortBudget::Result::Unsat) {
-					log("      According to the SAT solver the cell %s is never active. Sharing is pointless, we simply remove it.\n", cell);
 					cells_to_remove.insert(cell);
 					break;
 				}
@@ -1394,7 +1353,6 @@ struct ShareWorker
 					break;
 				}
 				if (act_res == SatEffortBudget::Result::Unsat) {
-					log("      According to the SAT solver the cell %s is never active. Sharing is pointless, we simply remove it.\n", other_cell);
 					cells_to_remove.insert(other_cell);
 					shareable_cells.erase(other_cell);
 					continue;
@@ -1412,8 +1370,6 @@ struct ShareWorker
 
 					qcsat.ez->assume(qcsat.ez->AND(sub1, sub2));
 
-					log("      Size of SAT problem: %zu cells, %d variables, %d clauses\n",
-							qcsat.imported_cells.size(), qcsat.ez->numCnfVariables(), qcsat.ez->numCnfClauses());
 
 					auto res = sat_budget.solve(qcsat, 0, sat_model, sat_model_values, {});
 					if (res == SatEffortBudget::Result::LimitReached) {
@@ -1422,34 +1378,18 @@ struct ShareWorker
 					}
 
 					if (res == SatEffortBudget::Result::Sat) {
-						log("      According to the SAT solver this pair of cells can not be shared.\n");
-						log("      Model from SAT solver: %s = %d'", log_signal(all_ctrl_signals), GetSize(sat_model_values));
-						for (int i = GetSize(sat_model_values)-1; i >= 0; i--)
-							log("%c", sat_model_values[i] ? '1' : '0');
-						log("\n");
 						continue;
 					}
 
-					log("      According to the SAT solver this pair of cells can be shared.\n");
 				} else {
-					log("      According to the SAT solver this pair of cells can be shared. (Pattern only case)\n");
-
-					if (restrict_activation_patterns(optimized_cell_activation_patterns, optimized_other_cell_activation_patterns)) {
-						for (auto &p : optimized_cell_activation_patterns)
-							log("      Simplified activation pattern for cell %s: %s = %s\n", cell, log_signal(p.first), log_signal(p.second));
-
-						for (auto &p : optimized_other_cell_activation_patterns)
-							log("      Simplified activation pattern for cell %s: %s = %s\n", other_cell, log_signal(p.first), log_signal(p.second));
-					}
+					restrict_activation_patterns(optimized_cell_activation_patterns, optimized_other_cell_activation_patterns);
 				}
 
 				if (find_in_input_cone(cell, other_cell)) {
-					log("      Sharing not possible: %s is in input cone of %s.\n", other_cell, cell);
 					continue;
 				}
 
 				if (find_in_input_cone(other_cell, cell)) {
-					log("      Sharing not possible: %s is in input cone of %s.\n", cell, other_cell);
 					continue;
 				}
 
@@ -1469,14 +1409,11 @@ struct ShareWorker
 				if (cell_select_score <= other_cell_select_score) {
 					RTLIL::SigSpec act = make_cell_activation_logic(optimized_cell_activation_patterns, supercell_aux);
 					supercell = make_supercell(cell, other_cell, act, supercell_aux);
-					log("      Activation signal for %s: %s\n", cell, log_signal(act));
 				} else {
 					RTLIL::SigSpec act = make_cell_activation_logic(optimized_other_cell_activation_patterns, supercell_aux);
 					supercell = make_supercell(other_cell, cell, act, supercell_aux);
-					log("      Activation signal for %s: %s\n", other_cell, log_signal(act));
 				}
 
-				log("      New cell: %s (%s)\n", supercell, supercell->type.unescape());
 
 				cells_to_remove.insert(cell);
 				cells_to_remove.insert(other_cell);
@@ -1493,7 +1430,6 @@ struct ShareWorker
 
 				if (0) {
 			do_rollback:
-					log("      New topology contains loops! Rolling back..\n");
 					cells_to_remove.erase(cell);
 					cells_to_remove.erase(other_cell);
 					shareable_cells.insert(other_cell);
@@ -1527,9 +1463,7 @@ struct ShareWorker
 		}
 
 		if (!cells_to_remove.empty()) {
-			log("Removing %d cells in module %s:\n", GetSize(cells_to_remove), module);
 			for (auto c : cells_to_remove) {
-				log("  Removing cell %s (%s).\n", c, c->type.unescape());
 				remove_cell(c);
 			}
 		}
@@ -1624,7 +1558,6 @@ struct SharePass : public Pass {
 		config.generic_other_ops.set_id(ID($alu));
 		config.generic_other_ops.set_id(ID($macc));
 
-		log_header(design, "Executing SHARE pass (SAT-based resource sharing).\n");
 
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {

@@ -39,7 +39,6 @@ struct RmportsPassPass : public Pass {
 
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
-		log_header(design, "Executing RMPORTS pass (remove ports with no connections).\n");
 
 		size_t argidx = 1;
 		extra_args(args, argidx, design);
@@ -57,49 +56,36 @@ struct RmportsPassPass : public Pass {
 			CleanupModule(mod, removed_ports);
 	}
 
-	void CleanupModule(Module *module, dict<IdString, pool<IdString>> &removed_ports)
+	void CleanupModule(Module *module, const dict<IdString, pool<IdString>> &removed_ports)
 	{
-		log("Removing now-unused cell ports in module %s\n", module->name);
 
 		auto cells = module->cells();
 		for(auto cell : cells)
 		{
-			if(removed_ports.find(cell->type) == removed_ports.end())
-			{
-				// log("  Not touching instance \"%s\" because we didn't remove any ports from module \"%s\"\n",
-				//	cell->name.c_str(), cell->type.c_str());
+			auto found = removed_ports.find(cell->type);
+			if (found == removed_ports.end())
 				continue;
-			}
 
-			auto ports_to_remove = removed_ports[cell->type];
-			for(auto p : ports_to_remove)
+			for (auto port : found->second)
 			{
-				log("  Removing port \"%s\" from instance \"%s\"\n",
-					p.c_str(), cell->type.c_str());
-				cell->unsetPort(p);
+				cell->unsetPort(port);
 			}
 		}
 	}
 
 	void ScanModule(Module* module, dict<IdString, pool<IdString>> &removed_ports)
 	{
-		log("Finding unconnected ports in module %s\n", module->name);
 
 		pool<IdString> used_ports;
 
 		// See what wires are used.
 		// Start by checking connections between named wires
 		auto &conns = module->connections();
-		for(auto sigsig : conns)
+		for (const auto &sigsig : conns)
 		{
-			auto s1 = sigsig.first;
-			auto s2 = sigsig.second;
-
-			int len1 = s1.size();
-			int len2 = s2.size();
-			int len = len1;
-			if(len2 < len1)
-				len = len2;
+			const auto &s1 = sigsig.first;
+			const auto &s2 = sigsig.second;
+			int len = std::min(GetSize(s1), GetSize(s2));
 
 			for(int i=0; i<len; i++)
 			{
@@ -108,12 +94,11 @@ struct RmportsPassPass : public Pass {
 				if( (w1 == NULL) || (w2 == NULL) )
 					continue;
 
-				//log("  conn %s, %s\n", w1->name, w2->name);
 
-				if( (w1->port_input || w1->port_output) && (used_ports.find(w1->name) == used_ports.end()) )
+				if (w1->port_input || w1->port_output)
 					used_ports.insert(w1->name);
 
-				if( (w2->port_input || w2->port_output) && (used_ports.find(w2->name) == used_ports.end()) )
+				if (w2->port_input || w2->port_output)
 					used_ports.insert(w2->name);
 			}
 		}
@@ -123,7 +108,7 @@ struct RmportsPassPass : public Pass {
 		for(auto cell : cells)
 		{
 			auto &cconns = cell->connections();
-			for(auto conn : cconns)
+			for (const auto &conn : cconns)
 			{
 				for(int i=0; i<conn.second.size(); i++)
 				{
@@ -131,8 +116,7 @@ struct RmportsPassPass : public Pass {
 					if(sig == NULL)
 						continue;
 
-					// log("  sig %s\n", sig->name);
-					if( (sig->port_input || sig->port_output) && (used_ports.find(sig->name) == used_ports.end()) )
+					if (sig->port_input || sig->port_output)
 						used_ports.insert(sig->name);
 				}
 			}
@@ -147,10 +131,9 @@ struct RmportsPassPass : public Pass {
 			unused_ports.insert(port);
 		}
 
-		// Print the ports out as we go through them
+		// 删除端口属性并记录实例中需要移除的端口。
 		for(auto port : unused_ports)
 		{
-			log("  removing unused port %s\n", port);
 			removed_ports[module->name].insert(port);
 
 			// Mark the wire as no longer a port
@@ -161,7 +144,6 @@ struct RmportsPassPass : public Pass {
 		}
 		module->ports.erase(std::remove_if(module->ports.begin(), module->ports.end(),
 				[&](IdString port) { return unused_ports.count(port); }), module->ports.end());
-		log("Removed %d unused ports.\n", GetSize(unused_ports));
 
 		// Re-number all of the wires that DO have ports still on them
 		for(size_t i=0; i<module->ports.size(); i++)

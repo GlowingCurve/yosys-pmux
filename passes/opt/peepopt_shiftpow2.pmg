@@ -62,8 +62,6 @@ code
 		reject;
 
 	did_something = true;
-	log("shiftpow2 pattern in %s: shift=%s, index=%s, stride=%d, width=%d, ways=%lld\n",
-			module, shift, log_signal(sel), stride, width, ways);
 
 	// way m holds A[m*stride +: width], way 0 in the LSBs
 	State fill = shift->type.in($shiftx) ? State::Sx : State::S0;

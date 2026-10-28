@@ -17,8 +17,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-// synth_intel 执行 Intel FPGA 综合；在 peepopt 与 opt_clean 之后、cmp2lut 之前依次执行三个 PMUX 优化 Pass。
-#include "kernel/celltypes.h"
+// synth_intel 在位宽化简之后、cmp2lut 之前执行 PMUX 算术与选择优化。
 #include "kernel/log.h"
 #include "kernel/register.h"
 #include "kernel/rtlil.h"
@@ -86,6 +85,20 @@ struct SynthIntelPass : public ScriptPass {
 
 	string top_opt, family_opt, vout_file, blif_file;
 	bool flatten, nobram, dff, nodsp, iopads;
+
+	bool has_memories(bool include_bmux = false)
+	{
+		if (help_mode)
+			return true;
+		for (auto module : active_design->selected_modules()) {
+			if (!module->memories.empty())
+				return true;
+			for (auto cell : module->selected_cells())
+				if (cell->type.begins_with("$mem") || (include_bmux && cell->type == ID($bmux)))
+					return true;
+		}
+		return false;
+	}
 
 	void clear_flags() override
 	{
@@ -175,7 +188,6 @@ struct SynthIntelPass : public ScriptPass {
 		if (family_opt != "max10")
 			nodsp = true;
 
-		log_header(design, "Executing SYNTH_INTEL pass.\n");
 		log_push();
 
 		run_script(design, run_from, run_to);
@@ -212,9 +224,14 @@ struct SynthIntelPass : public ScriptPass {
 			run("wreduce");
 			run("peepopt");
 			run("opt_clean");
+			run("opt_pmuxstate");
+			std::string pmux_lut = family_opt == "max10" ? "fiftyfivenm_lcell_comb" : family_opt + "_lcell_comb";
+			run("opt_pmuxrel -coarse -lut4 " + pmux_lut);
+			run("opt_pmuxarith -lut4 " + pmux_lut);
 			run("opt_pmuxfactor");
 			run("opt_pmuxselect");
 			run("opt_pmuxcontext");
+			run("opt_pmuxlut -lut4 " + pmux_lut);
 			run("techmap -map +/cmp2lut.v -D LUT_WIDTH=4");
 			run("opt_expr");
 			run("opt_clean");
@@ -234,7 +251,13 @@ struct SynthIntelPass : public ScriptPass {
 				run("alumacc");
 			}
 			run("opt");
-			run("memory -nomap");
+			if (has_memories(true)) {
+				run("memory -nomap");
+			} else {
+				// memory 中的两次清理保留相同的信号清理和固定点行为。
+				run("opt_clean");
+				run("opt_clean");
+			}
 			run("opt_clean");
 		}
 
@@ -243,7 +266,8 @@ struct SynthIntelPass : public ScriptPass {
 				    family_opt == "cycloneive" ||
 				    family_opt == "max10" ||
 				    help_mode) {
-				run("memory_bram -rules +/intel/common/brams_m9k.txt", "(if applicable for family)");
+				if (has_memories())
+					run("memory_bram -rules +/intel/common/brams_m9k.txt", "(if applicable for family)");
 				run("techmap -map +/intel/common/brams_map_m9k.v", "(if applicable for family)");
 			} else {
 				log_warning("BRAM mapping is not currently supported for %s.\n", family_opt);
@@ -252,8 +276,11 @@ struct SynthIntelPass : public ScriptPass {
 
 		if (check_label("map_ffram")) {
 			run("opt -fast -mux_undef -undriven -fine -full");
-			run("memory_map");
+			if (has_memories())
+				run("memory_map");
 			run("opt -undriven -fine");
+			std::string pmux_lut = family_opt == "max10" ? "fiftyfivenm_lcell_comb" : family_opt + "_lcell_comb";
+			run("opt_pmuxrel -tables -lut4 " + pmux_lut);
 			run("techmap -map +/techmap.v");
 			run("opt -full");
 			run("clean -purge");
@@ -266,7 +293,7 @@ struct SynthIntelPass : public ScriptPass {
 		}
 
 		if (check_label("map_luts")) {
-			run("abc9 -lut 4 -W 300" + string(dff ? " -dff" : ""));
+			run("abc9 -lut 4 -W 300 -script +&scorr;&sweep;&dc2;&dch,-f,-r;&ps;&if,{W},{D},{R},-v;&mfs" + string(dff ? " -dff" : ""));
 			run("clean");
 			run("opt -fast");
 			run("autoname");

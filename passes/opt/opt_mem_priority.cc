@@ -42,7 +42,6 @@ struct OptMemPriorityPass : public Pass {
 		log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override {
-		log_header(design, "Executing OPT_MEM_PRIORITY pass (removing unnecessary memory write priority relations).\n");
 		extra_args(args, 1, design);
 
 		ModWalker modwalker(design);
@@ -105,7 +104,6 @@ struct OptMemPriorityPass : public Pass {
 
 		if (total_count)
 			design->scratchpad_set_bool("opt.did_something", true);
-		log("Performed a total of %d transformations.\n", total_count);
 	}
 } OptMemPriorityPass;
 

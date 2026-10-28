@@ -1,3 +1,4 @@
+// 为 peepopt 分离移位量中的常量偏移；模式直接更新数据端口和移位端口。
 pattern shiftadd
 //
 // Transforms add/sub+shift pairs that result from expressions such as data[s*W +C +:W2]
@@ -111,8 +112,6 @@ code
 	}
 
 	did_something = true;
-	log("shiftadd pattern in %s: shift=%s, add/sub=%s, offset: %d\n", \
-			module, shift, add, offset);
 
 	SigSpec new_a;
 	if(offset<0) {

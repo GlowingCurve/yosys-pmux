@@ -1,3 +1,4 @@
+// 为 peepopt 折叠乘除链中的整除常量比例；模式将常量计算合并到乘法输入。
 pattern muldiv_c
 //
 // Authored by Akash Levy and Alain Dargelas of Silimate, Inc. under ISC license.
@@ -119,7 +120,6 @@ code
 	autoremove(div);
 
 	// Log, fixup, accept
-	log("muldiv_const pattern in %s: mul=%s, div=%s\n", module, mul, div);
 	mul->fixup_parameters();
 	accept;
 endcode

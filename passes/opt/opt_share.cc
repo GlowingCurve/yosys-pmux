@@ -17,7 +17,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-// opt_share 共享互斥分支中的同类运算；预先检查选择器候选，避免无候选模块的索引构造。
+// opt_share 共享互斥分支中的同类运算；预先检查选择器候选，按候选需要构造索引。
 #include "kernel/log.h"
 #include "kernel/register.h"
 #include "kernel/rtlil.h"
@@ -355,7 +355,6 @@ struct OptSharePass : public Pass {
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
 
-		log_header(design, "Executing OPT_SHARE pass.\n");
 
 		extra_args(args, 1, design);
 		for (auto module : design->selected_modules()) {
@@ -564,14 +563,6 @@ struct OptSharePass : public Pass {
 			}
 
 			for (auto &shared : merged_ops) {
-				log("    Found cells that share an operand and can be merged by moving the %s %s in front "
-				    "of "
-				    "them:\n",
-				    shared.mux->type.unescape(), shared.mux);
-				for (const auto& op : shared.ports)
-					log("        %s\n", op.op);
-				log("\n");
-
 				merge_operators(module, shared.mux, shared.ports, shared.shared_operand, sigmap);
 			}
 		}

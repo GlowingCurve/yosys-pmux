@@ -189,7 +189,6 @@ struct OptFfInvWorker
 	OptFfInvWorker(RTLIL::Module *module) :
 		module(module), index(module), initvals(&index.sigmap, module)
 	{
-		log("Discovering LUTs.\n");
 
 		std::vector<Cell *> ffs;
 
@@ -238,7 +237,6 @@ struct OptFfInvPass : public Pass {
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
-		log_header(design, "Executing OPT_FFINV pass (push inverters through FFs).\n");
 
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++)
@@ -255,7 +253,6 @@ struct OptFfInvPass : public Pass {
 		}
 		if (total_count)
 			design->scratchpad_set_bool("opt.did_something", true);
-		log("Pushed %d inverters.\n", total_count);
 	}
 } OptFfInvPass;
 

@@ -308,25 +308,20 @@ pool<Cell*> all_unused_cells(const Module *mod, const CellAnalysis& analysis, Wi
 	return unused_cells;
 }
 
-void remove_cells(RTLIL::Module* mod, FfInitVals& ffinit, const pool<Cell*>& cells, bool verbose, RmStats& stats) {
+void remove_cells(RTLIL::Module* mod, FfInitVals& ffinit, const pool<Cell*>& cells) {
 	for (auto cell : cells) {
-		if (verbose)
-			log_debug("  removing unused `%s' cell `%s'.\n", cell->type, cell->name);
 		mod->design->scratchpad_set_bool("opt.did_something", true);
 		if (cell->is_builtin_ff())
 			ffinit.remove_init(cell->getPort(ID::Q));
 		mod->remove(cell);
-		stats.count_rm_cells++;
 	}
 }
 
-void remove_mems(RTLIL::Module* mod, const MemAnalysis& mem_analysis, bool verbose) {
+void remove_mems(RTLIL::Module* mod, const MemAnalysis& mem_analysis) {
 	for (const auto &it : mem_analysis.indices) {
 		if (!mem_analysis.unused[it.second].load(std::memory_order_relaxed))
 			continue;
 		RTLIL::IdString id(it.first);
-		if (verbose)
-			log_debug("  removing unused memory `%s'.\n", id.unescape());
 		delete mod->memories.at(id);
 		mod->memories.erase(id);
 	}
@@ -362,8 +357,8 @@ void rmunused_module_cells(Module *module, ParallelDispatchThreadPool::Subpool &
 	FfInitVals ffinit;
 	ffinit.set_parallel(&actx.assign_map, subpool.thread_pool(), module);
 	// Now we know what to kill
-	remove_cells(module, ffinit, unused_cells, clean_ctx.flags.verbose, clean_ctx.stats);
-	remove_mems(module, mem_analysis, clean_ctx.flags.verbose);
+	remove_cells(module, ffinit, unused_cells);
+	remove_mems(module, mem_analysis);
 	logs.print_warnings(analysis.keep_wires, module, clean_ctx);
 }
 

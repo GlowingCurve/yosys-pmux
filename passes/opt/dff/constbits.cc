@@ -18,6 +18,7 @@
  *
  */
 
+// 为 opt_dff 推导触发器的常量位；常量分析复用共享连接索引和分批 SAT 分析。
 #include "kernel/ff.h"
 #include "passes/opt/dff/opt_dff.h"
 
@@ -113,8 +114,6 @@ struct ConstBitsContext
 
 	void commit_const(dict<Cell *, pool<int>> &const_bits, Cell *cell, int idx, SigBit q, State val)
 	{
-		log("Setting constant %d-bit at position %d on %s (%s) from module %s.\n",
-				val == State::S1 ? 1 : 0, idx, cell, cell->type.unescape(), worker.module);
 		worker.initvals.remove_init(q);
 		worker.module->connect(q, val);
 		const_bits[cell].insert(idx);

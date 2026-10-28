@@ -1,3 +1,4 @@
+// 为 peepopt 将门控时钟的锁存反馈转换为触发器形式；模式直接生成等价连接。
 pattern formal_clockgateff
 
 // Detects the most common clock gating pattern using a latch and replaces it
@@ -43,8 +44,6 @@ match and_gate
 endmatch
 
 code
-	log("replacing clock gate pattern in %s with ff: latch=%s, and=%s\n",
-		module, latch, and_gate);
 
 	// Add a flip-flop and rewire the AND gate to use the output of this flop
 	// instead of the latch. We don't delete the latch in case its output is
