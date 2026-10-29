@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-// opt_demorgan 应用 De Morgan 变换化简反相逻辑；使用端口查询结果的引用，减少集合复制。
+
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
 #include "kernel/modtools.h"
@@ -26,7 +26,8 @@ PRIVATE_NAMESPACE_BEGIN
 
 void demorgan_worker(
 	ModIndex& index,
-	Cell *cell)
+	Cell *cell,
+	unsigned int& cells_changed)
 {
 	SigMap& sigmap = index.sigmap;
 	auto m = cell->module;
@@ -42,6 +43,7 @@ void demorgan_worker(
 	if (GetSize(insig) < 1)
 		return;
 
+	log("Inspecting %s cell %s (%d inputs)\n", cell->type.unescape(), cell->name.unescape(), GetSize(insig));
 	int num_inverted = 0;
 	for(int i=0; i<GetSize(insig); i++)
 	{
@@ -49,7 +51,7 @@ void demorgan_worker(
 
 		//See if this bit is driven by a $not cell
 		//TODO: do other stuff like nor/nand?
-		const auto &ports = index.query_ports(b);
+		pool<ModIndex::PortInfo> ports = index.query_ports(b);
 		bool inverted = false;
 		for(auto x : ports)
 		{
@@ -67,10 +69,13 @@ void demorgan_worker(
 	//Stop if less than half of the inputs are inverted
 	if(num_inverted*2 < GetSize(insig))
 	{
+		log("  %d / %d inputs are inverted, not pushing\n", num_inverted, GetSize(insig));
 		return;
 	}
 
 	//More than half of the inputs are inverted! Push through
+	cells_changed ++;
+	log("  %d / %d inputs are inverted, pushing inverter through reduction\n", num_inverted, GetSize(insig));
 
 	//For each input, either add or remove the inverter as needed
 	//TODO: this duplicates the loop up above, can we refactor it?
@@ -80,7 +85,7 @@ void demorgan_worker(
 
 		//See if this bit is driven by a $not cell
 		//TODO: do other stuff like nor/nand?
-		const auto &ports = index.query_ports(b);
+		pool<ModIndex::PortInfo> ports = index.query_ports(b);
 		RTLIL::Cell* srcinv = NULL;
 		for(auto x : ports)
 		{
@@ -140,6 +145,7 @@ void demorgan_worker(
 		//TODO: can we do SigChunks instead of single bits if we have subsets of a bus?
 		if(every_bit_once && (GetSize(insig) == srcwire->width) )
 		{
+			log("Rearranging bits\n");
 			RTLIL::SigSpec newsig;
 			for(int i=0; i<GetSize(insig); i++)
 				newsig.append(RTLIL::SigBit(srcwire, GetSize(insig) - i - 1));
@@ -179,18 +185,22 @@ struct OptDemorganPass : public Pass {
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
+		log_header(design, "Executing OPT_DEMORGAN pass (push inverters through $reduce_* cells).\n");
 		log_deprecated("opt_demorgan");
 
 		int argidx = 1;
 		extra_args(args, argidx, design);
 
+		unsigned int cells_changed = 0;
 		for (auto module : design->selected_modules())
 		{
 			ModIndex index(module);
 			for (auto cell : module->selected_cells())
-				demorgan_worker(index, cell);
+				demorgan_worker(index, cell, cells_changed);
 		}
 
+		if(cells_changed)
+			log("Pushed inverters through %u reductions\n", cells_changed);
 	}
 } OptDemorganPass;
 

@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-// opt_lut_ins 删除 LUT 中无关的输入；发现真值表结果存在差异时立即结束当前冗余检查。
+
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
 
@@ -45,6 +45,7 @@ struct OptLutInsPass : public Pass {
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
+		log_header(design, "Executing OPT_LUT_INS pass (discard unused LUT inputs).\n");
 		string techname;
 
 		size_t argidx;
@@ -63,6 +64,7 @@ struct OptLutInsPass : public Pass {
 
 		for (auto module : design->selected_modules())
 		{
+			log("Optimizing LUTs in %s.\n", module);
 
 			std::vector<Cell *> remove_cells;
 			// Gather LUTs.
@@ -165,10 +167,8 @@ struct OptLutInsPass : public Pass {
 					} else {
 						bool redundant = true;
 						for (int j = 0; j < GetSize(lut); j++) {
-							if (lut[j] != lut[j ^ 1 << i]) {
+							if (lut[j] != lut[j ^ 1 << i])
 								redundant = false;
-								break;
-							}
 						}
 						if (redundant) {
 							swizzle.push_back(-1);
@@ -181,6 +181,7 @@ struct OptLutInsPass : public Pass {
 				}
 				if (!doit)
 					continue;
+				log("  Optimizing lut %s (%d -> %d)\n", cell, GetSize(inputs), GetSize(new_inputs));
 				if (techname == "lattice" || techname == "ecp5") {
 					// Pad the LUT to 4 inputs, adding consts from the front.
 					int extra = 4 - GetSize(new_inputs);

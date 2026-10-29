@@ -17,7 +17,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-// muxpack 将互斥的选择器链合并为 PMUX；复用前驱与后继查询结果，减少字典重复查找。
+
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
 
@@ -128,6 +128,7 @@ struct MuxpackWorker
 	Module *module;
 	SigMap sigmap;
 
+	int mux_count, pmux_count;
 
 	pool<Cell*> remove_cells;
 
@@ -217,20 +218,16 @@ struct MuxpackWorker
 	bool is_start_cell(Cell* cell)
 	{
 		SigSpec a_sig = sigmap(cell->getPort(ID::A));
-		auto previous = sig_chain_prev.find(a_sig);
 		if (cell->type == ID($mux)) {
 			SigSpec b_sig = sigmap(cell->getPort(ID::B));
-			auto b_previous = sig_chain_prev.find(b_sig);
-			if (int(previous != sig_chain_prev.end()) + int(b_previous != sig_chain_prev.end()) != 1)
+			if (sig_chain_prev.count(a_sig) + sig_chain_prev.count(b_sig) != 1)
 				return true;
 
-			if (previous == sig_chain_prev.end()) {
+			if (!sig_chain_prev.count(a_sig))
 				a_sig = b_sig;
-				previous = b_previous;
-			}
 		}
 		else if (cell->type == ID($pmux)) {
-			if (previous == sig_chain_prev.end())
+			if (!sig_chain_prev.count(a_sig))
 				return true;
 		}
 		else log_abort();
@@ -240,7 +237,7 @@ struct MuxpackWorker
 				return true;
 
 		{
-			Cell *prev_cell = previous->second;
+			Cell *prev_cell = sig_chain_prev.at(a_sig);
 			log_assert(prev_cell);
 			SigSpec s_sig = sigmap(cell->getPort(ID::S));
 			s_sig.append(sigmap(prev_cell->getPort(ID::S)));
@@ -268,11 +265,10 @@ struct MuxpackWorker
 
 			SigSpec y_sig = sigmap(c->getPort(ID::Y));
 
-			auto next = sig_chain_next.find(y_sig);
-			if (next == sig_chain_next.end())
+			if (sig_chain_next.count(y_sig) == 0)
 				break;
 
-			c = next->second;
+			c = sig_chain_next.at(y_sig);
 			if (chain_start_cells.count(c) != 0)
 				break;
 		}
@@ -289,7 +285,11 @@ struct MuxpackWorker
 		Cell *first_cell = chain.front();
 		Cell *last_cell = chain.back();
 
+		log("Converting %s.%s ... %s.%s to a pmux with %d cases.\n",
+			module, first_cell, module, last_cell, cases);
 
+		mux_count += cases;
+		pmux_count += 1;
 
 		first_cell->type = ID($pmux);
 
@@ -329,7 +329,7 @@ struct MuxpackWorker
 	}
 
 	MuxpackWorker(Module *module) :
-			module(module), sigmap(module), excl_db(module, sigmap)
+			module(module), sigmap(module), mux_count(0), pmux_count(0), excl_db(module, sigmap)
 	{
 		make_sig_chain_next_prev();
 		find_chain_start_cells();
@@ -362,6 +362,7 @@ struct MuxpackPass : public Pass {
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
+		log_header(design, "Executing MUXPACK pass ($mux cell cascades to $pmux).\n");
 
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++)
@@ -370,10 +371,16 @@ struct MuxpackPass : public Pass {
 		}
 		extra_args(args, argidx, design);
 
+		int mux_count = 0;
+		int pmux_count = 0;
+
 		for (auto module : design->selected_modules()) {
 			MuxpackWorker worker(module);
+			mux_count += worker.mux_count;
+			pmux_count += worker.pmux_count;
 		}
 
+		log("Converted %d (p)mux cells into %d pmux cells.\n", mux_count, pmux_count);
 	}
 } MuxpackPass;
 

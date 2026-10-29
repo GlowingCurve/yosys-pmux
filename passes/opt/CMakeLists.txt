@@ -1,21 +1,8 @@
-# 注册 opt 系列 Pass 及其依赖，包含七个新增 PMUX Pass 和 peepopt 模式生成。
 add_subdirectory(clean)
 add_subdirectory(dff)
 
-yosys_pass(opt_merge
-	opt_merge.cc
-)
-yosys_pass(opt_mem_widen
-	opt_mem_widen.cc
-)
-yosys_pass(opt_muxtree
-	opt_muxtree.cc
-)
-yosys_pass(opt_reduce
-	opt_reduce.cc
-)
-yosys_pass(opt_share
-	opt_share.cc
+yosys_pass(native_opt
+	native_opt.cc
 )
 yosys_pass(opt_pmuxfactor
 	opt_pmuxfactor.cc
@@ -45,6 +32,22 @@ yosys_pass(opt_pmuxrel
 )
 yosys_pass(opt_pmuxlut
 	opt_pmuxlut.cc
+)
+
+yosys_pass(opt_merge
+	opt_merge.cc
+)
+yosys_pass(opt_mem_widen
+	opt_mem_widen.cc
+)
+yosys_pass(opt_muxtree
+	opt_muxtree.cc
+)
+yosys_pass(opt_reduce
+	opt_reduce.cc
+)
+yosys_pass(opt_share
+	opt_share.cc
 )
 yosys_pass(opt_expr
 	opt_expr.cc

@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-// opt_merge 合并功能相同的单元；复用静态类型分类，并直接比较普通单元端口以减少连接表复制。
+
 #include "kernel/register.h"
 #include "kernel/ffinit.h"
 #include "kernel/sigtools.h"
@@ -101,10 +101,10 @@ struct OptMergeThreadWorker
 	const RTLIL::Module *module;
 	const SigMap &assign_map;
 	const FfInitVals &initvals;
+	const CellTypes &ct;
 	int workers;
 	bool mode_share_all;
 	bool mode_keepdc;
-	bool mode_nomux;
 
 	static Hasher hash_pmux_in(const SigSpec& sig_s, const SigSpec& sig_b, Hasher h)
 	{
@@ -208,21 +208,6 @@ struct OptMergeThreadWorker
 			if (!cell2->connections_.count(it.first))
 				return false;
 
-		if (!cell1->type.in(ID($and), ID($or), ID($xor), ID($xnor), ID($add), ID($mul),
-				ID($logic_and), ID($logic_or), ID($_AND_), ID($_OR_), ID($_XOR_),
-				ID($reduce_xor), ID($reduce_xnor), ID($reduce_and), ID($reduce_or), ID($reduce_bool), ID($pmux))) {
-			for (const auto &it : cell1->connections_) {
-				if (cell1->output(it.first)) {
-					if (it.first == ID::Q && cell1->is_builtin_ff() &&
-							initvals(it.second) != initvals(cell2->getPort(it.first)))
-						return false;
-				} else if (assign_map(it.second) != assign_map(cell2->getPort(it.first))) {
-					return false;
-				}
-			}
-			return true;
-		}
-
 		decltype(Cell::connections_) conn1, conn2;
 		conn1.reserve(cell1->connections_.size());
 		conn2.reserve(cell1->connections_.size());
@@ -280,10 +265,10 @@ struct OptMergeThreadWorker
 	}
 
 	OptMergeThreadWorker(const RTLIL::Module *module, const FfInitVals &initvals,
-			const SigMap &assign_map, int workers,
-			bool mode_share_all, bool mode_keepdc, bool mode_nomux) :
-		module(module), assign_map(assign_map), initvals(initvals),
-		workers(workers), mode_share_all(mode_share_all), mode_keepdc(mode_keepdc), mode_nomux(mode_nomux)
+			const SigMap &assign_map, const CellTypes &ct, int workers,
+			bool mode_share_all, bool mode_keepdc) :
+		module(module), assign_map(assign_map), initvals(initvals), ct(ct),
+		workers(workers), mode_share_all(mode_share_all), mode_keepdc(mode_keepdc)
 	{
 	}
 
@@ -305,13 +290,8 @@ struct OptMergeThreadWorker
 				continue;
 			if (!cell->known())
 				continue;
-			if (!mode_share_all) {
-				if (!StaticCellTypes::categories.is_known(cell->type) ||
-						cell->type.in(ID($anyinit), ID($tribuf), ID($_TBUF_), ID($anyseq), ID($anyconst), ID($allseq), ID($allconst)))
-					continue;
-				if (mode_nomux && cell->type.in(ID($mux), ID($pmux)))
-					continue;
-			}
+			if (!mode_share_all && !ct.cell_known(cell->type))
+				continue;
 
 			Hasher::hash_t h = hash_cell_function(cell, Hasher()).yield();
 			int bucket_index = h % workers;
@@ -378,13 +358,14 @@ struct OptMergeWorker
 {
 	int total_count;
 
-	OptMergeWorker(RTLIL::Module *module, bool mode_share_all, bool mode_keepdc, bool mode_nomux) :
+	OptMergeWorker(RTLIL::Module *module, const CellTypes &ct, bool mode_share_all, bool mode_keepdc) :
 		total_count(0)
 	{
 		SigMap assign_map(module);
 		FfInitVals initvals;
 		initvals.set(&assign_map, module);
 
+		log("Finding identical cells in module `%s'.\n", module->name);
 
 		// Use no more than one worker per thousand cells, rounded down, so
 		// we only start multithreading with at least 2000 cells.
@@ -397,7 +378,7 @@ struct OptMergeWorker
 		// for very small modules.
 		if (num_worker_threads == 1)
 			num_worker_threads = 0;
-		OptMergeThreadWorker thread_worker(module, initvals, assign_map, workers, mode_share_all, mode_keepdc, mode_nomux);
+		OptMergeThreadWorker thread_worker(module, initvals, assign_map, ct, workers, mode_share_all, mode_keepdc);
 
 		std::vector<ConcurrentQueue<CellRange>> cell_ranges_queues(num_worker_threads);
 		std::vector<ConcurrentQueue<CellHashes>> cell_hashes_queues(num_worker_threads);
@@ -419,6 +400,7 @@ struct OptMergeWorker
 		while (did_something)
 		{
 			int cells_size = module->cells_size();
+			log("Computing hashes of %d cells of `%s'.\n", cells_size, module->name);
 			std::vector<std::vector<std::vector<CellHash>>> sharded_bucketed_cell_hashes(workers);
 
 			int cell_index = 0;
@@ -440,6 +422,7 @@ struct OptMergeWorker
 						sharded_bucketed_cell_hashes[i] = std::move(cell_hashes_queues[i].pop_front()->bucketed_cell_hashes);
 			}
 
+			log("Finding duplicate cells in `%s'.\n", module->name);
 			std::vector<DuplicateCell> merged_duplicates;
 			{
 				Multithreading multithreading;
@@ -472,9 +455,12 @@ struct OptMergeWorker
 
 			for (auto [remove_cell, keep_cell] : cell_ptrs)
 			{
+				log_debug("  Cell `%s' is identical to cell `%s'.\n", remove_cell->name, keep_cell->name);
 				for (auto &it : remove_cell->connections()) {
 					if (remove_cell->output(it.first)) {
 						RTLIL::SigSpec keep_sig = keep_cell->getPort(it.first);
+						log_debug("    Redirecting output %s: %s = %s\n", it.first,
+								log_signal(it.second), log_signal(keep_sig));
 						Const init = initvals(keep_sig);
 						initvals.remove_init(it.second);
 						initvals.remove_init(keep_sig);
@@ -487,6 +473,7 @@ struct OptMergeWorker
 						initvals.set_init(keep_sig, init);
 					}
 				}
+				log_debug("    Removing %s cell `%s' from module `%s'.\n", remove_cell->type, remove_cell->name, module->name);
 				module->remove(remove_cell);
 				total_count++;
 			}
@@ -532,6 +519,7 @@ struct OptMergePass : public Pass {
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
+		log_header(design, "Executing OPT_MERGE pass (detect identical cells).\n");
 
 		bool mode_nomux = false;
 		bool mode_share_all = false;
@@ -556,14 +544,31 @@ struct OptMergePass : public Pass {
 		}
 		extra_args(args, argidx, design);
 
+		CellTypes ct;
+		ct.setup_internals();
+		ct.setup_internals_mem();
+		ct.setup_stdcells();
+		ct.setup_stdcells_mem();
+		if (mode_nomux) {
+			ct.cell_types.erase(ID($mux));
+			ct.cell_types.erase(ID($pmux));
+		}
+		ct.cell_types.erase(ID($tribuf));
+		ct.cell_types.erase(ID($_TBUF_));
+		ct.cell_types.erase(ID($anyseq));
+		ct.cell_types.erase(ID($anyconst));
+		ct.cell_types.erase(ID($allseq));
+		ct.cell_types.erase(ID($allconst));
+
 		int total_count = 0;
 		for (auto module : design->selected_modules()) {
-			OptMergeWorker worker(module, mode_share_all, mode_keepdc, mode_nomux);
+			OptMergeWorker worker(module, ct, mode_share_all, mode_keepdc);
 			total_count += worker.total_count;
 		}
 
 		if (total_count)
 			design->scratchpad_set_bool("opt.did_something", true);
+		log("Removed a total of %d cells.\n", total_count);
 	}
 } OptMergePass;
 

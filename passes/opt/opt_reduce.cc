@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-// opt_reduce 化简归约运算与选择器；仅在粗粒度模式需要时分析存储器写使能依赖。
+
 #include "kernel/register.h"
 #include "kernel/sigtools.h"
 #include "kernel/log.h"
@@ -93,6 +93,7 @@ struct OptReduceWorker
 			new_sig_a = (cell->type == ID($reduce_or)) ? State::S0 : State::S1;
 
 		if (new_sig_a != sig_a || sig_a.size() != cell->getPort(ID::A).size()) {
+			log("    New input vector for %s cell %s: %s\n", cell->type, cell->name, log_signal(new_sig_a));
 			did_something = true;
 			total_count++;
 		}
@@ -153,6 +154,7 @@ struct OptReduceWorker
 		}
 
 		if (new_sig_s.size() != sig_s.size() || (new_sig_s.size() == 1 && cell->type == ID($pmux))) {
+			log("    New ctrl vector for %s cell %s: %s\n", cell->type, cell->name, log_signal(new_sig_s));
 			did_something = true;
 			total_count++;
 			cell->setPort(ID::B, new_sig_b);
@@ -239,6 +241,7 @@ struct OptReduceWorker
 		}
 
 		if (new_sig_s.size() != sig_s.size()) {
+			log("    New ctrl vector for %s cell %s: %s\n", cell->type, cell->name, log_signal(new_sig_s));
 			did_something = true;
 			total_count++;
 			cell->setPort(ID::A, new_sig_a);
@@ -304,6 +307,7 @@ struct OptReduceWorker
 		if (new_sig_s.size() == sig_s.size() && sig_s.size() > 0)
 			return;
 
+		log("    New ctrl vector for %s cell %s: %s\n", cell->type, cell->name, log_signal(new_sig_s));
 		did_something = true;
 		total_count++;
 
@@ -383,6 +387,14 @@ struct OptReduceWorker
 
 		if (GetSize(swizzle) != width)
 		{
+			log("    Consolidated identical input bits for %s cell %s:\n", cell->type, cell->name);
+			if (cell->type != ID($bmux)) {
+				log("      Old ports: A=%s, B=%s, Y=%s\n", log_signal(cell->getPort(ID::A)),
+						log_signal(cell->getPort(ID::B)), log_signal(cell->getPort(ID::Y)));
+			} else {
+				log("      Old ports: A=%s, Y=%s\n", log_signal(cell->getPort(ID::A)),
+						log_signal(cell->getPort(ID::Y)));
+			}
 
 			if (swizzle.empty()) {
 				module->remove(cell);
@@ -408,8 +420,16 @@ struct OptReduceWorker
 
 				cell->parameters[ID::WIDTH] = RTLIL::Const(GetSize(swizzle));
 
+				if (cell->type != ID($bmux)) {
+					log("      New ports: A=%s, B=%s, Y=%s\n", log_signal(cell->getPort(ID::A)),
+							log_signal(cell->getPort(ID::B)), log_signal(cell->getPort(ID::Y)));
+				} else {
+					log("      New ports: A=%s, Y=%s\n", log_signal(cell->getPort(ID::A)),
+							log_signal(cell->getPort(ID::Y)));
+				}
 			}
 
+			log("      New connections: %s = %s\n", log_signal(old_sig_conn.first), log_signal(old_sig_conn.second));
 			module->connect(old_sig_conn);
 
 			did_something = true;
@@ -458,6 +478,9 @@ struct OptReduceWorker
 
 		if (GetSize(swizzle) != width)
 		{
+			log("    Consolidated identical input bits for %s cell %s:\n", cell->type, cell->name);
+			log("      Old ports: A=%s, Y=%s\n", log_signal(cell->getPort(ID::A)),
+					log_signal(cell->getPort(ID::Y)));
 
 			if (swizzle.empty()) {
 				module->remove(cell);
@@ -475,8 +498,11 @@ struct OptReduceWorker
 
 				cell->parameters[ID::WIDTH] = RTLIL::Const(GetSize(swizzle));
 
+				log("      New ports: A=%s, Y=%s\n", log_signal(cell->getPort(ID::A)),
+						log_signal(cell->getPort(ID::Y)));
 			}
 
+			log("      New connections: %s = %s\n", log_signal(old_sig_conn.first), log_signal(old_sig_conn.second));
 			module->connect(old_sig_conn);
 
 			did_something = true;
@@ -488,39 +514,36 @@ struct OptReduceWorker
 	OptReduceWorker(RTLIL::Design *design, RTLIL::Module *module, bool do_fine) :
 			design(design), module(module), assign_map(module)
 	{
+		log("  Optimizing cells in module %s.\n", module->name);
 
 		total_count = 0;
 		did_something = true;
 
 		SigPool mem_wren_sigs;
-		if (!do_fine) {
+		for (auto &cell_it : module->cells_) {
+			RTLIL::Cell *cell = cell_it.second;
+			if (cell->type.in(ID($mem), ID($mem_v2)))
+				mem_wren_sigs.add(assign_map(cell->getPort(ID::WR_EN)));
+			if (cell->type.in(ID($memwr), ID($memwr_v2)))
+				mem_wren_sigs.add(assign_map(cell->getPort(ID::EN)));
+		}
+		for (auto &cell_it : module->cells_) {
+			RTLIL::Cell *cell = cell_it.second;
+			if (cell->type == ID($dff) && mem_wren_sigs.check_any(assign_map(cell->getPort(ID::Q))))
+				mem_wren_sigs.add(assign_map(cell->getPort(ID::D)));
+		}
+
+		bool keep_expanding_mem_wren_sigs = true;
+		while (keep_expanding_mem_wren_sigs) {
+			keep_expanding_mem_wren_sigs = false;
 			for (auto &cell_it : module->cells_) {
 				RTLIL::Cell *cell = cell_it.second;
-				if (cell->type.in(ID($mem), ID($mem_v2)))
-					mem_wren_sigs.add(assign_map(cell->getPort(ID::WR_EN)));
-				if (cell->type.in(ID($memwr), ID($memwr_v2)))
-					mem_wren_sigs.add(assign_map(cell->getPort(ID::EN)));
-			}
-			if (!mem_wren_sigs.bits.empty()) {
-				for (auto &cell_it : module->cells_) {
-					RTLIL::Cell *cell = cell_it.second;
-					if (cell->type == ID($dff) && mem_wren_sigs.check_any(assign_map(cell->getPort(ID::Q))))
-						mem_wren_sigs.add(assign_map(cell->getPort(ID::D)));
-				}
-
-				bool keep_expanding_mem_wren_sigs = true;
-				while (keep_expanding_mem_wren_sigs) {
-					keep_expanding_mem_wren_sigs = false;
-					for (auto &cell_it : module->cells_) {
-						RTLIL::Cell *cell = cell_it.second;
-						if (cell->type == ID($mux) && mem_wren_sigs.check_any(assign_map(cell->getPort(ID::Y)))) {
-							if (!mem_wren_sigs.check_all(assign_map(cell->getPort(ID::A))) ||
-									!mem_wren_sigs.check_all(assign_map(cell->getPort(ID::B))))
-								keep_expanding_mem_wren_sigs = true;
-							mem_wren_sigs.add(assign_map(cell->getPort(ID::A)));
-							mem_wren_sigs.add(assign_map(cell->getPort(ID::B)));
-						}
-					}
+				if (cell->type == ID($mux) && mem_wren_sigs.check_any(assign_map(cell->getPort(ID::Y)))) {
+					if (!mem_wren_sigs.check_all(assign_map(cell->getPort(ID::A))) ||
+							!mem_wren_sigs.check_all(assign_map(cell->getPort(ID::B))))
+						keep_expanding_mem_wren_sigs = true;
+					mem_wren_sigs.add(assign_map(cell->getPort(ID::A)));
+					mem_wren_sigs.add(assign_map(cell->getPort(ID::B)));
 				}
 			}
 		}
@@ -611,6 +634,7 @@ struct OptReducePass : public Pass {
 	{
 		bool do_fine = false;
 
+		log_header(design, "Executing OPT_REDUCE pass (consolidate $*mux and $reduce_* inputs).\n");
 
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
@@ -637,6 +661,7 @@ struct OptReducePass : public Pass {
 
 		if (total_count)
 			design->scratchpad_set_bool("opt.did_something", true);
+		log("Performed a total of %d changes.\n", total_count);
 	}
 } OptReducePass;
 

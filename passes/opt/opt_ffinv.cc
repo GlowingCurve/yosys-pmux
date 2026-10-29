@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-// opt_ffinv 将触发器周围的反相逻辑吸收到 LUT；复用 D 端口查询与资格检查结果。
+
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
 #include "kernel/modtools.h"
@@ -37,8 +37,15 @@ struct OptFfInvWorker
 	// - FF is driven by inverter
 	// - ... which has no other users
 	// - all users of FF are LUTs
-	bool push_d_inv(FfData &ff, const pool<ModIndex::PortInfo> &d_ports) {
+	bool push_d_inv(FfData &ff) {
 		log_assert(ff.width == 1);
+		if (index.query_is_input(ff.sig_d))
+			return false;
+		if (index.query_is_output(ff.sig_d))
+			return false;
+		auto d_ports = index.query_ports(ff.sig_d);
+		if (d_ports.size() != 2)
+			return false;
 		Cell *d_inv = nullptr;
 		for (auto &port: d_ports) {
 			if (port.cell == ff.cell && port.port == ID::D)
@@ -115,8 +122,16 @@ struct OptFfInvWorker
 	// - ... which has no other users
 	// - FF has one user
 	// - ... which is an inverter
-	bool push_q_inv(FfData &ff, const pool<ModIndex::PortInfo> &d_ports) {
+	bool push_q_inv(FfData &ff) {
+		if (index.query_is_input(ff.sig_d))
+			return false;
+		if (index.query_is_output(ff.sig_d))
+			return false;
+
 		Cell *d_lut = nullptr;
+		auto d_ports = index.query_ports(ff.sig_d);
+		if (d_ports.size() != 2)
+			return false;
 		for (auto &port: d_ports) {
 			if (port.cell == ff.cell && port.port == ID::D)
 				continue;
@@ -189,6 +204,7 @@ struct OptFfInvWorker
 	OptFfInvWorker(RTLIL::Module *module) :
 		module(module), index(module), initvals(&index.sigmap, module)
 	{
+		log("Discovering LUTs.\n");
 
 		std::vector<Cell *> ffs;
 
@@ -206,17 +222,10 @@ struct OptFfInvWorker
 				continue;
 			if (ff.width != 1)
 				continue;
-			if (index.query_is_input(ff.sig_d))
-				continue;
-			if (index.query_is_output(ff.sig_d))
-				continue;
-			auto d_ports = index.query_ports(ff.sig_d);
-			if (d_ports.size() != 2)
-				continue;
 
-			if (push_d_inv(ff, d_ports)) {
+			if (push_d_inv(ff)) {
 				count++;
-			} else if (push_q_inv(ff, d_ports)) {
+			} else if (push_q_inv(ff)) {
 				count++;
 			}
 		}
@@ -237,6 +246,7 @@ struct OptFfInvPass : public Pass {
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
+		log_header(design, "Executing OPT_FFINV pass (push inverters through FFs).\n");
 
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++)
@@ -253,6 +263,7 @@ struct OptFfInvPass : public Pass {
 		}
 		if (total_count)
 			design->scratchpad_set_bool("opt.did_something", true);
+		log("Pushed %d inverters.\n", total_count);
 	}
 } OptFfInvPass;
 

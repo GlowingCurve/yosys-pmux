@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-// opt_hier 跨模块传播常量、连接与端口使用信息；仅在替换映射非空时遍历并重写模块信号。
+
 #include "kernel/register.h"
 #include "kernel/rtlil.h"
 #include "kernel/sigtools.h"
@@ -144,9 +144,13 @@ struct ModuleIndex {
 			}
 
 			if (nunused > 0) {
+				log("Disconnected %d input bits of instance '%s' (type '%s') in '%s'\n",
+					nunused, instantiation, instantiation->type.unescape(), parent.module);
 				changed = true;
 			}
 			if (nconstants > 0) {
+				log("Substituting constant for %d output bits of instance '%s' (type '%s') in '%s'\n",
+					nconstants, instantiation, instantiation->type.unescape(), parent.module);
 				changed = true;
 			}
 		}
@@ -184,6 +188,8 @@ struct ModuleIndex {
 		}
 
 		if (ntie_togethers > 0) {
+			log("Replacing %d output bits with tie-togethers on instance '%s' of '%s' in '%s'\n",
+				ntie_togethers, instantiation, instantiation->type.unescape(), parent.module);
 			changed = true;
 		}
 
@@ -339,19 +345,31 @@ struct UsageData {
 		auto disconnect_rewrite = [&](SigSpec &signal) {
 			signal.replace(replacement_map);
 		};
-		if (!replacement_map.empty())
-			module->rewrite_sigspecs(disconnect_rewrite);
+		module->rewrite_sigspecs(disconnect_rewrite);
 		for (auto chunk : disconnect_outputs.chunks()) {
+			log("Disconnected unused output terminal '%s' in module '%s'\n", log_signal(chunk), module);
 			did_something = true;
 			module->connect(chunk, SigSpec(RTLIL::Sx, chunk.size()));
 		}
 
 		// Connect constant inputs
+		SigPool applied_constants;
 		auto constant_rewrite = [&](SigSpec &signal) {
+			for (auto bit : signal) {
+				if (constant_inputs.count(bit))
+					applied_constants.add(bit);
+			}
 			signal.replace(constant_inputs);
 		};
-		if (!constant_inputs.empty())
-			module->rewrite_sigspecs(constant_rewrite);
+		module->rewrite_sigspecs(constant_rewrite);
+		SigSpec applied_constants2 = applied_constants.export_all();
+		applied_constants2.sort_and_unify();
+		for (auto chunk : applied_constants2.chunks()) {
+			SigSpec const_ = chunk;
+			const_.replace(constant_inputs);
+			log("Substituting constant %s for input terminal '%s' in module '%s'\n",
+				log_signal(const_), log_signal(chunk), module);
+		}
 
 		// Propagate tied-together inputs
 		dict<SigBit, SigBit> ties;
@@ -367,11 +385,20 @@ struct UsageData {
 			for (int i = 1; i < filtered_group.size(); i++)
 				ties[filtered_group[i]] = filtered_group[0];
 		}
+		SigPool applied_ties;
 		auto ties_rewrite = [&](SigSpec &signal) {
+			for (auto bit : signal) {
+				if (ties.count(bit)) {
+					applied_ties.add(bit);
+				}
+			}
 			signal.replace(ties);
 		};
-		if (!ties.empty())
-			module->rewrite_sigspecs(ties_rewrite);
+		module->rewrite_sigspecs(ties_rewrite);
+		if (applied_ties.size()) {
+			log("Replacing %zu input terminal bits with tie-togethers in module '%s'\n",
+					applied_ties.size(), module);
+		}
 		return did_something;
 	}
 };
@@ -393,6 +420,7 @@ struct OptHierPass : Pass {
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *d) override
 	{
+		log_header(d, "Executing OPT_HIER pass.\n");
 
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
@@ -405,6 +433,7 @@ struct OptHierPass : Pass {
 
 		dict<IdString, ModuleIndex> indices;
 		for (auto module : d->modules()) {
+			log_debug("Building index for %s\n", module);
 			indices.emplace(module->name, ModuleIndex(module));
 		}
 
@@ -413,12 +442,14 @@ struct OptHierPass : Pass {
 			if (module->get_bool_attribute(ID::top))
 				continue;
 
+			log_debug("Starting usage data for %s\n", module);
 			usage_datas.emplace(module->name, UsageData(module));
 		}
 
 		for (auto module : d->modules()) {
 			for (auto cell : module->cells()) {
 				if (usage_datas.count(cell->type)) {
+					log_debug("Account for instance %s of %s in %s\n", cell, cell->type.unescape(), module);
 					usage_datas.at(cell->type).refine(cell, indices.at(module->name));
 				}
 			}
@@ -429,11 +460,13 @@ struct OptHierPass : Pass {
 			ModuleIndex &parent_index = indices.at(module->name);
 
 			if (usage_datas.count(module->name)) {
+				log_debug("Applying usage data changes to %s\n", module);
 				did_something |= usage_datas.at(module->name).apply_changes(parent_index);
 			}
 
 			for (auto cell : module->cells()) {
 				if (indices.count(cell->type)) {
+					log_debug("Applying changes to instance %s of %s in %s\n", cell, cell->type.unescape(), module);
 					did_something |= indices.at(cell->type).apply_changes(parent_index, cell);
 				}
 			}

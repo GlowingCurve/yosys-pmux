@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-// clean 与 opt_clean 删除未使用的单元和信号；复用双类别连接表，按需建立冲突诊断映射及模块类型信息。
+
 #include "kernel/register.h"
 #include "kernel/log.h"
 #include "kernel/log_help.h"
@@ -27,14 +27,18 @@ PRIVATE_NAMESPACE_BEGIN
 
 void rmunused_module(RTLIL::Module *module, bool rminit, CleanRunContext &clean_ctx)
 {
-	// 根据单元数量分配并行工作线程。
+	if (clean_ctx.flags.verbose)
+		log("Finding unused cells or wires in module %s..\n", module->name);
+
+	// Use no more than one worker per thousand cells, rounded down, so
+	// we only start multithreading with at least 2000 cells.
 	int num_worker_threads = ThreadPool::work_pool_size(0, module->cells_size(), 10000);
 	ParallelDispatchThreadPool::Subpool subpool(clean_ctx.thread_pool, num_worker_threads);
-	remove_temporary_cells(module, subpool);
+	remove_temporary_cells(module, subpool, clean_ctx.flags.verbose);
 	rmunused_module_cells(module, subpool, clean_ctx);
 	while (rmunused_module_signals(module, subpool, clean_ctx)) { }
 
-	if (rminit && rmunused_module_init(module, subpool))
+	if (rminit && rmunused_module_init(module, subpool, clean_ctx.flags.verbose))
 		while (rmunused_module_signals(module, subpool, clean_ctx)) { }
 }
 
@@ -67,6 +71,7 @@ struct OptCleanPass : public Pass {
 	{
 		bool purge_mode = false;
 
+		log_header(design, "Executing OPT_CLEAN pass (remove unused cells and wires).\n");
 		log_push();
 
 		size_t argidx;
@@ -84,9 +89,10 @@ struct OptCleanPass : public Pass {
 			for (auto module : design->selected_whole_modules_warn())
 				if (!module->has_processes_warn())
 					selected_modules.push_back(module);
-			CleanRunContext clean_ctx(design, selected_modules, {purge_mode});
+			CleanRunContext clean_ctx(design, selected_modules, {purge_mode, true});
 			for (auto module : selected_modules)
 				rmunused_module(module, true, clean_ctx);
+			clean_ctx.stats.log();
 
 			design->optimize();
 			design->check();
@@ -112,7 +118,7 @@ struct CleanPass : public Pass {
 		log("\n");
 		log("    clean [options] [selection]\n");
 		log("\n");
-		log("This command removes unused cells and wires.\n");
+		log("This is identical to 'opt_clean', but less verbose.\n");
 		log("\n");
 		log("When commands are separated using the ';;' token, this command will be executed\n");
 		log("between the commands.\n");
@@ -140,11 +146,12 @@ struct CleanPass : public Pass {
 			for (auto module : design->selected_unboxed_whole_modules())
 				if (!module->has_processes())
 					selected_modules.push_back(module);
-			CleanRunContext clean_ctx(design, selected_modules, {purge_mode});
+			CleanRunContext clean_ctx(design, selected_modules, {purge_mode, ys_debug()});
 			for (auto module : selected_modules)
 				rmunused_module(module, true, clean_ctx);
 
 			log_suppressed();
+			clean_ctx.stats.log();
 
 			design->optimize();
 			design->check();

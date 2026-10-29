@@ -18,7 +18,6 @@
  *
  */
 
-// 为 opt_dff 合并等价触发器位；使用并行位模拟筛选候选并复用共享连接索引。
 #include "kernel/ff.h"
 #include "passes/opt/dff/opt_dff.h"
 

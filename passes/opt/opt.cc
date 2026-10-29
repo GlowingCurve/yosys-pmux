@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-// opt 调度组合逻辑与时序优化；复用参数向量，减少循环中的命令拼接与解析。
+
 #include "kernel/register.h"
 #include "kernel/log.h"
 #include <stdlib.h>
@@ -68,71 +68,72 @@ struct OptPass : public Pass {
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
-		std::vector<std::string> opt_clean_args = {"opt_clean"};
-		std::vector<std::string> opt_expr_args = {"opt_expr"};
-		std::vector<std::string> opt_reduce_args = {"opt_reduce"};
-		std::vector<std::string> opt_merge_args = {"opt_merge"};
-		std::vector<std::string> opt_dff_args = {"opt_dff"};
+		std::string opt_clean_args;
+		std::string opt_expr_args;
+		std::string opt_reduce_args;
+		std::string opt_merge_args;
+		std::string opt_dff_args;
 		bool opt_share = false;
 		bool fast_mode = false;
 		bool noff_mode = false;
 		bool hier_mode = false;
 
+		log_header(design, "Executing OPT pass (performing simple optimizations).\n");
 		log_push();
 
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
 			if (args[argidx] == "-purge") {
-				opt_clean_args.push_back("-purge");
+				opt_clean_args += " -purge";
 				continue;
 			}
 			if (args[argidx] == "-mux_undef") {
-				opt_expr_args.push_back("-mux_undef");
+				opt_expr_args += " -mux_undef";
 				continue;
 			}
 			if (args[argidx] == "-mux_bool") {
-				opt_expr_args.push_back("-mux_bool");
+				opt_expr_args += " -mux_bool";
 				continue;
 			}
 			if (args[argidx] == "-undriven") {
-				opt_expr_args.push_back("-undriven");
+				opt_expr_args += " -undriven";
 				continue;
 			}
 			if (args[argidx] == "-noclkinv") {
-				opt_expr_args.push_back("-noclkinv");
+				opt_expr_args += " -noclkinv";
 				continue;
 			}
 			if (args[argidx] == "-fine") {
-				opt_expr_args.push_back("-fine");
-				opt_reduce_args.push_back("-fine");
+				opt_expr_args += " -fine";
+				opt_reduce_args += " -fine";
 				continue;
 			}
 			if (args[argidx] == "-full") {
-				opt_expr_args.push_back("-full");
-				opt_reduce_args.push_back("-full");
+				opt_expr_args += " -full";
+				opt_reduce_args += " -full";
 				opt_share = true;
 				continue;
 			}
 			if (args[argidx] == "-keepdc") {
-				opt_expr_args.push_back("-keepdc");
-				opt_dff_args.push_back("-keepdc");
-				opt_merge_args.push_back("-keepdc");
+				opt_expr_args += " -keepdc";
+				opt_dff_args += " -keepdc";
+				opt_merge_args += " -keepdc";
 				continue;
 			}
 			if (args[argidx] == "-nodffe") {
-				opt_dff_args.push_back("-nodffe");
+				opt_dff_args += " -nodffe";
 				continue;
 			}
 			if (args[argidx] == "-nosdff") {
-				opt_dff_args.push_back("-nosdff");
+				opt_dff_args += " -nosdff";
 				continue;
 			}
 			if (args[argidx] == "-sat") {
-				opt_dff_args.push_back("-sat");
+				opt_dff_args += " -sat";
 				continue;
 			}
 			if (args[argidx] == "-share_all") {
-				opt_merge_args.push_back("-share_all");
+				opt_merge_args += " -share_all";
 				continue;
 			}
 			if (args[argidx] == "-fast") {
@@ -154,46 +155,47 @@ struct OptPass : public Pass {
 		if (fast_mode)
 		{
 			while (1) {
-				Pass::call(design, opt_expr_args);
-				Pass::call(design, opt_merge_args);
+				Pass::call(design, "opt_expr" + opt_expr_args);
+				Pass::call(design, "opt_merge" + opt_merge_args);
 				design->scratchpad_unset("opt.did_something");
 				if (!noff_mode)
-					Pass::call(design, opt_dff_args);
+					Pass::call(design, "opt_dff" + opt_dff_args);
 				if (design->scratchpad_get_bool("opt.did_something") == false)
 					break;
 				if (hier_mode)
 					Pass::call(design, "opt_hier");
-				Pass::call(design, opt_clean_args);
+				Pass::call(design, "opt_clean" + opt_clean_args);
+				log_header(design, "Rerunning OPT passes. (Removed registers in this run.)\n");
 			}
-			Pass::call(design, opt_clean_args);
+			Pass::call(design, "opt_clean" + opt_clean_args);
 		}
 		else
 		{
-			Pass::call(design, opt_expr_args);
-			auto opt_merge_nomux_args = opt_merge_args;
-			opt_merge_nomux_args.insert(opt_merge_nomux_args.begin() + 1, "-nomux");
-			Pass::call(design, opt_merge_nomux_args);
+			Pass::call(design, "opt_expr" + opt_expr_args);
+			Pass::call(design, "opt_merge -nomux" + opt_merge_args);
 			while (1) {
 				design->scratchpad_unset("opt.did_something");
 				Pass::call(design, "opt_muxtree");
-				Pass::call(design, opt_reduce_args);
-				Pass::call(design, opt_merge_args);
+				Pass::call(design, "opt_reduce" + opt_reduce_args);
+				Pass::call(design, "opt_merge" + opt_merge_args);
 				if (opt_share)
 					Pass::call(design, "opt_share");
 				if (!noff_mode)
-					Pass::call(design, opt_dff_args);
+					Pass::call(design, "opt_dff" + opt_dff_args);
 				if (hier_mode)
 					Pass::call(design, "opt_hier");
-				Pass::call(design, opt_clean_args);
-				Pass::call(design, opt_expr_args);
+				Pass::call(design, "opt_clean" + opt_clean_args);
+				Pass::call(design, "opt_expr" + opt_expr_args);
 				if (design->scratchpad_get_bool("opt.did_something") == false)
 					break;
+				log_header(design, "Rerunning OPT passes. (Maybe there is more to do..)\n");
 			}
 		}
 
 		design->optimize();
 		design->check();
 
+		log_header(design, "Finished fast OPT passes.%s\n", fast_mode ? "" : " (There is nothing left to do.)");
 		log_pop();
 	}
 } OptPass;

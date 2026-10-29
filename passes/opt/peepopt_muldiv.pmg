@@ -1,4 +1,3 @@
-// 为 peepopt 消除连续乘除中的相同操作数；模式直接复用约简后的数据信号。
 pattern muldiv
 
 state <SigSpec> t x y
@@ -33,6 +32,7 @@ code
 		val_y.extend_u0(GetSize(div_y), param(div, \A_SIGNED).as_bool());
 
 	did_something = true;
+	log("muldiv pattern in %s: mul=%s, div=%s\n", module, mul, div);
 	module->connect(div_y, val_y);
 	autoremove(div);
 	accept;

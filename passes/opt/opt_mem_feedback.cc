@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-// opt_mem_feedback 将存储器数据反馈转换为写使能；复用地址查询、数据位集合与规范化信号。
+
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
 #include "kernel/mem.h"
@@ -147,10 +147,9 @@ struct OptMemFeedbackWorker
 
 			for (int sub = 0; sub < (1 << port.wide_log2); sub++) {
 				SigSpec addr = sigmap_xmux(port.sub_addr(sub));
-				auto &lanes = async_rd_bits[addr];
-				lanes.resize(mem.width);
+				async_rd_bits[addr].resize(mem.width);
 				for (int i = 0; i < mem.width; i++)
-					lanes[i].insert(sigmap(port.data[i + sub * mem.width]));
+					async_rd_bits[addr][i].insert(sigmap(port.data[i + sub * mem.width]));
 			}
 		}
 
@@ -164,13 +163,13 @@ struct OptMemFeedbackWorker
 		{
 			auto &port = mem.wr_ports[i];
 
+			log("  Analyzing %s.%s write port %d.\n", module, mem.memid.unescape(), i);
 
 			for (int sub = 0; sub < (1 << port.wide_log2); sub++)
 			{
 				SigSpec addr = sigmap_xmux(port.sub_addr(sub));
 
-				auto rd_bits = async_rd_bits.find(addr);
-				if (rd_bits == async_rd_bits.end())
+				if (!async_rd_bits.count(addr))
 					continue;
 
 				for (int j = 0; j < mem.width; j++)
@@ -182,7 +181,7 @@ struct OptMemFeedbackWorker
 
 					dict<RTLIL::SigBit, bool> state;
 
-					find_data_feedback(rd_bits->second.at(j), sigmap(port.data[bit_idx]), state, i, bit_idx, paths);
+					find_data_feedback(async_rd_bits.at(addr).at(j), sigmap(port.data[bit_idx]), state, i, bit_idx, paths);
 				}
 			}
 		}
@@ -204,15 +203,14 @@ struct OptMemFeedbackWorker
 				continue;
 
 			bool ok = true;
-			SigSpec data = sigmap(port.data);
-			for (auto bit : data)
+			for (auto bit : sigmap(port.data))
 				if (sig_users_count[bit] != feedback_users_count[bit])
 					ok = false;
 
 			if (ok)
 			{
 				// This port is going bye-bye.
-				for (auto bit : data)
+				for (auto bit : sigmap(port.data))
 					feedback_ok.insert(bit);
 
 				port.removed = true;
@@ -234,6 +232,7 @@ struct OptMemFeedbackWorker
 
 		// Okay, let's do it.
 
+		log("Populating enable bits on write ports of memory %s.%s with async read feedback:\n", module, mem.memid.unescape());
 
 		// If a write port has a feedback path that we're about to bypass,
 		// but also has priority over some other write port, the feedback
@@ -257,6 +256,7 @@ struct OptMemFeedbackWorker
 			auto &port = mem.wr_ports[wrport_idx];
 
 			port.en[bit] = conditions_to_logic(it.second, port.en[bit]);
+			log("    Port %d bit %d: added enable logic for %d different cases.\n", wrport_idx, bit, GetSize(it.second));
 		}
 
 		mem.emit();
@@ -337,6 +337,7 @@ struct OptMemFeedbackPass : public Pass {
 		log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override {
+		log_header(design, "Executing OPT_MEM_FEEDBACK pass (finding memory read-to-write feedback paths).\n");
 		extra_args(args, 1, design);
 		OptMemFeedbackWorker worker(design);
 

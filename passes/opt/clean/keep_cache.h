@@ -17,7 +17,6 @@
  *
  */
 
-// 为 clean 与 opt_clean 缓存模块的 keep 属性及依赖传播结果；统一说明共享缓存职责。
 #include "kernel/rtlil.h"
 #include "kernel/sigtools.h"
 #include "kernel/threading.h"

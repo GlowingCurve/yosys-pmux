@@ -17,7 +17,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-// 为 opt_dff 合并触发器的选择反馈逻辑；预先检查选择器与触发器候选，仅统计相关输出的使用次数。
+
 #include "kernel/ff.h"
 #include "kernel/pattern.h"
 #include "passes/opt/dff/opt_dff.h"
@@ -44,6 +44,11 @@ struct SimpleContext
 		// - bitusers: how many users it has (muxes will only be merged into FFs if the FF is the only user)
 		// - bit2mux: the mux cell and bit index that drives it, if any
 
+		for (auto wire : worker.module->wires())
+			if (wire->port_output)
+				for (auto bit : worker.sigmap(wire))
+					bitusers[bit]++;
+
 		for (auto cell : worker.module->cells()) {
 			if (cell->type.in(ID($mux), ID($pmux), ID($_MUX_))) {
 				RTLIL::SigSpec sig_y = worker.sigmap(cell->getPort(ID::Y));
@@ -51,28 +56,15 @@ struct SimpleContext
 					bit2mux[sig_y[i]] = cell_int_t(cell, i);
 			}
 
+			for (auto conn : cell->connections()) {
+				bool is_output = cell->output(conn.first);
+				if (!is_output || !cell->known())
+					for (auto bit : worker.sigmap(conn.second))
+						bitusers[bit]++;
+			}
+
 			if (worker.module->design->selected(worker.module, cell) && cell->is_builtin_ff())
 				dff_cells.push_back(cell);
-		}
-		if (bit2mux.empty() || dff_cells.empty())
-			return;
-
-		// 仅有 mux 输出的使用次数参与后面的合并条件。
-		for (auto wire : worker.module->wires())
-			if (wire->port_output)
-				for (auto bit : worker.sigmap(wire))
-					if (bit2mux.count(bit))
-						bitusers[bit]++;
-
-		for (auto cell : worker.module->cells()) {
-			bool known = cell->known();
-			for (auto &conn : cell->connections()) {
-				bool is_output = cell->output(conn.first);
-				if (!is_output || !known)
-					for (auto bit : worker.sigmap(conn.second))
-						if (bit2mux.count(bit))
-							bitusers[bit]++;
-			}
 		}
 	}
 
@@ -267,6 +259,8 @@ struct SimpleContext
 			if (worker.is_always_active(ff.sig_clr[i], ff.pol_clr)) {
 				worker.initvals.remove_init(ff.sig_q[i]);
 				worker.module->connect(ff.sig_q[i], State::S0);
+				log("Handling always-active CLR at position %d on %s (%s) from module %s (changing to const driver).\n",
+						i, cell, cell->type.unescape(), worker.module);
 				sr_removed = true;
 			} else if (worker.is_always_active(ff.sig_set[i], ff.pol_set)) {
 				worker.initvals.remove_init(ff.sig_q[i]);
@@ -276,6 +270,8 @@ struct SimpleContext
 					worker.module->addNotGate(NEW_ID, ff.sig_clr[i], ff.sig_q[i]);
 				else
 					worker.module->addNot(NEW_ID, ff.sig_clr[i], ff.sig_q[i]);
+				log("Handling always-active SET at position %d on %s (%s) from module %s (changing to combinatorial circuit).\n",
+						i, cell, cell->type.unescape(), worker.module);
 				sr_removed = true;
 			} else {
 				keep_bits.push_back(i);
@@ -297,6 +293,8 @@ struct SimpleContext
 		bool set_inactive = ff.pol_set ? ff.sig_set.is_fully_zero() : ff.sig_set.is_fully_ones();
 
 		if (clr_inactive && signal_all_same(ff.sig_set)) {
+			log("Removing never-active CLR on %s (%s) from module %s.\n",
+					cell, cell->type.unescape(), worker.module);
 			ff.has_sr = false;
 			ff.has_arst = true;
 			ff.pol_arst = ff.pol_set;
@@ -304,6 +302,8 @@ struct SimpleContext
 			ff.val_arst = Const(State::S1, ff.width);
 			changed = true;
 		} else if (set_inactive && signal_all_same(ff.sig_clr)) {
+			log("Removing never-active SET on %s (%s) from module %s.\n",
+					cell, cell->type.unescape(), worker.module);
 			ff.has_sr = false;
 			ff.has_arst = true;
 			ff.pol_arst = ff.pol_clr;
@@ -328,6 +328,8 @@ struct SimpleContext
 			}
 
 			if (!failed) {
+				log("Converting CLR/SET to ARST on %s (%s) from module %s.\n",
+						cell, cell->type.unescape(), worker.module);
 				ff.has_sr = false;
 				ff.has_arst = true;
 				ff.val_arst = val_arst_builder.build();
@@ -340,11 +342,13 @@ struct SimpleContext
 		return false;
 	}
 
-	bool optimize_aload(FfData &ff, bool &changed)
+	bool optimize_aload(FfData &ff, Cell *cell, bool &changed)
 	{
 		// Removes unused Async Load
 		// Converts constant Async Load to ARST
 		if (worker.is_always_inactive(ff.sig_aload, ff.pol_aload)) {
+			log("Removing never-active async load on %s (%s) from module %s.\n",
+					cell, cell->type.unescape(), worker.module);
 			ff.has_aload = false;
 			changed = true;
 			return false;
@@ -352,6 +356,8 @@ struct SimpleContext
 
 		if (worker.is_active(ff.sig_aload, ff.pol_aload)) {
 			// ALOAD always active
+			log("Handling always-active async load on %s (%s) from module %s (changing to combinatorial circuit).\n",
+					cell, cell->type.unescape(), worker.module);
 			ff.remove();
 
 			if (ff.has_sr) {
@@ -385,6 +391,8 @@ struct SimpleContext
 
 		// AD is constant -> ARST
 		if (ff.sig_ad.is_fully_const() && !ff.has_arst && !ff.has_sr) {
+			log("Changing const-value async load to async reset on %s (%s) from module %s.\n",
+					cell, cell->type.unescape(), worker.module);
 			ff.has_arst = true;
 			ff.has_aload = false;
 			ff.sig_arst = ff.sig_aload;
@@ -396,13 +404,17 @@ struct SimpleContext
 		return false;
 	}
 
-	bool optimize_arst(FfData &ff, bool &changed)
+	bool optimize_arst(FfData &ff, Cell *cell, bool &changed)
 	{
 		// Removes ARST if never active or replaces FF if always active
 		if (worker.is_inactive(ff.sig_arst, ff.pol_arst)) {
+			log("Removing never-active ARST on %s (%s) from module %s.\n",
+					cell, cell->type.unescape(), worker.module);
 			ff.has_arst = false;
 			changed = true;
 		} else if (worker.is_always_active(ff.sig_arst, ff.pol_arst)) {
+			log("Handling always-active ARST on %s (%s) from module %s (changing to const driver).\n",
+					cell, cell->type.unescape(), worker.module);
 			ff.remove();
 			worker.module->connect(ff.sig_q, ff.val_arst);
 			return true;
@@ -411,13 +423,17 @@ struct SimpleContext
 		return false;
 	}
 
-	void optimize_srst(FfData &ff, bool &changed)
+	void optimize_srst(FfData &ff, Cell *cell, bool &changed)
 	{
 		// Removes SRST if never active or forces D to reset value if always active
 		if (worker.is_inactive(ff.sig_srst, ff.pol_srst)) {
+			log("Removing never-active SRST on %s (%s) from module %s.\n",
+					cell, cell->type.unescape(), worker.module);
 			ff.has_srst = false;
 			changed = true;
 		} else if (worker.is_always_active(ff.sig_srst, ff.pol_srst)) {
+			log("Handling always-active SRST on %s (%s) from module %s (changing to const D).\n",
+					cell, cell->type.unescape(), worker.module);
 			ff.has_srst = false;
 			if (!ff.ce_over_srst)
 				ff.has_ce = false;
@@ -427,16 +443,20 @@ struct SimpleContext
 		}
 	}
 
-	void optimize_ce(FfData &ff, bool &changed)
+	void optimize_ce(FfData &ff, Cell *cell, bool &changed)
 	{
 		if (worker.is_always_inactive(ff.sig_ce, ff.pol_ce)) {
 			if (ff.has_srst && !ff.ce_over_srst) {
+				log("Handling never-active EN on %s (%s) from module %s (connecting SRST instead).\n",
+						cell, cell->type.unescape(), worker.module);
 				ff.pol_ce = ff.pol_srst;
 				ff.sig_ce = ff.sig_srst;
 				ff.has_srst = false;
 				ff.sig_d = ff.val_srst;
 				changed = true;
 			} else if (!worker.opt.keepdc || ff.val_init.is_fully_def()) {
+				log("Handling never-active EN on %s (%s) from module %s (removing D path).\n",
+						cell, cell->type.unescape(), worker.module);
 				ff.has_ce = ff.has_clk = ff.has_srst = false;
 				changed = true;
 			} else {
@@ -445,14 +465,18 @@ struct SimpleContext
 				changed = true;
 			}
 		} else if (worker.is_active(ff.sig_ce, ff.pol_ce)) {
+			log("Removing always-active EN on %s (%s) from module %s.\n",
+					cell, cell->type.unescape(), worker.module);
 			ff.has_ce = false;
 			changed = true;
 		}
 	}
 
-	void optimize_const_clk(FfData &ff, bool &changed)
+	void optimize_const_clk(FfData &ff, Cell *cell, bool &changed)
 	{
 		if (!worker.opt.keepdc || ff.val_init.is_fully_def()) {
+			log("Handling const CLK on %s (%s) from module %s (removing D path).\n",
+					cell, cell->type.unescape(), worker.module);
 			ff.has_ce = ff.has_clk = ff.has_srst = false;
 			changed = true;
 		} else if (ff.has_ce || ff.has_srst || ff.sig_d != ff.sig_q) {
@@ -462,10 +486,12 @@ struct SimpleContext
 		}
 	}
 
-	void optimize_d_equals_q(FfData &ff, bool &changed)
+	void optimize_d_equals_q(FfData &ff, Cell *cell, bool &changed)
 	{
 		// Detect feedback loops where D is hardwired to Q
 		if (ff.has_clk && ff.has_srst) {
+			log("Handling D = Q on %s (%s) from module %s (conecting SRST instead).\n",
+					cell, cell->type.unescape(), worker.module);
 			if (ff.has_ce && ff.ce_over_srst) {
 				SigSpec ce = ff.pol_ce ? ff.sig_ce : create_not(ff.sig_ce, ff.is_fine);
 				SigSpec srst = ff.pol_srst ? ff.sig_srst : create_not(ff.sig_srst, ff.is_fine);
@@ -481,6 +507,8 @@ struct SimpleContext
 			ff.sig_d = ff.val_srst;
 			changed = true;
 		} else if (!worker.opt.keepdc || ff.val_init.is_fully_def()) {
+			log("Handling D = Q on %s (%s) from module %s (removing D path).\n",
+					cell, cell->type.unescape(), worker.module);
 			ff.has_gclk = ff.has_clk = ff.has_ce = false;
 			changed = true;
 		}
@@ -557,6 +585,9 @@ struct SimpleContext
 			if (new_cell)
 				dff_cells.push_back(new_cell);
 
+			log("Adding SRST signal on %s (%s) from module %s (D = %s, Q = %s, rval = %s).\n",
+					cell, cell->type.unescape(), worker.module,
+					log_signal(new_ff.sig_d), log_signal(new_ff.sig_q), log_signal(new_ff.val_srst));
 		}
 
 		if (remaining_indices.empty()) {
@@ -628,6 +659,9 @@ struct SimpleContext
 			if (new_cell)
 				dff_cells.push_back(new_cell);
 
+			log("Adding EN signal on %s (%s) from module %s (D = %s, Q = %s).\n",
+					cell, cell->type.unescape(), worker.module,
+					log_signal(new_ff.sig_d), log_signal(new_ff.sig_q));
 		}
 
 		if (remaining_indices.empty()) {
@@ -667,31 +701,33 @@ struct SimpleContext
 				continue;
 			}
 
-			if (ff.has_aload && optimize_aload(ff, changed)) {
+			if (ff.has_aload && optimize_aload(ff, cell, changed)) {
 				did_something = true;
 				continue;
 			}
 
-			if (ff.has_arst && optimize_arst(ff, changed)) {
+			if (ff.has_arst && optimize_arst(ff, cell, changed)) {
 				did_something = true;
 				continue;
 			}
 
 			// Sync control signal opt
 			if (ff.has_srst)
-				optimize_srst(ff, changed);
+				optimize_srst(ff, cell, changed);
 
 			if (ff.has_ce)
-				optimize_ce(ff, changed);
+				optimize_ce(ff, cell, changed);
 
 			if (ff.has_clk && ff.sig_clk.is_fully_const())
-				optimize_const_clk(ff, changed);
+				optimize_const_clk(ff, cell, changed);
 
 			// Feedback (D=Q) opt
 			if ((ff.has_clk || ff.has_gclk) && ff.sig_d == ff.sig_q)
-				optimize_d_equals_q(ff, changed);
+				optimize_d_equals_q(ff, cell, changed);
 
 			if (ff.has_aload && !ff.has_clk && ff.sig_ad == ff.sig_q) {
+				log("Handling AD = Q on %s (%s) from module %s (removing async load path).\n",
+						cell, cell->type.unescape(), worker.module);
 				ff.has_aload = false;
 				changed = true;
 			}

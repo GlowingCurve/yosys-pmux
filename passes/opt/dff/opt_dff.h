@@ -18,7 +18,6 @@
  *
  */
 
-// 保存 opt_dff 的选项、初始化信息和分析状态；常量与等价位分析按需共用模块连接索引。
 #include "kernel/log.h"
 #include "kernel/rtlil.h"
 #include "kernel/qcsat.h"

@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-// opt_muxtree 删除选择树中不可达的分支；直接使用端口索引记录驱动关系，减少集合存储与扫描。
+
 #include "kernel/register.h"
 #include "kernel/sigtools.h"
 #include "kernel/log.h"
@@ -83,6 +83,7 @@ struct OptMuxtreeWorker
 
 	struct portinfo_t {
 		int ctrl_sig = -1; // No associated control signal by default
+		pool<int> input_sigs = {};
 		pool<int> input_muxes = {};
 		bool const_activated = false;
 		bool const_deactivated = false;
@@ -104,6 +105,7 @@ struct OptMuxtreeWorker
 		portinfo_t portinfo = {};
 		for (int bit_idx : sig2bits(sig)) {
 			bit2info[bit_idx].mux_users.insert({mux_idx, port_idx});
+			portinfo.input_sigs.insert(bit_idx);
 		}
 		return portinfo;
 	}
@@ -115,6 +117,7 @@ struct OptMuxtreeWorker
 		//	.mux_driver
 		// Populate mux2info[].ports[]:
 		//	.ctrl_sig
+		//	.input_sigs
 		//	.const_activated
 		//	.const_deactivated
 		RTLIL::SigSpec sig_a = cell->getPort(ID::A);
@@ -176,10 +179,10 @@ struct OptMuxtreeWorker
 		// use this to tell mux2info ports about what muxes are driven by it
 		for (int i = 0; i < GetSize(bit2info); i++)
 		for (auto muxport : bit2info[i].mux_users) {
-			if (bit2info[i].mux_driver) {
-				auto &ports = mux2info[muxport.mux].ports;
-				auto &p = ports[muxport.port < 0 ? GetSize(ports) - 1 : muxport.port];
-				p.input_muxes.insert(*bit2info[i].mux_driver);
+			for (auto &p : mux2info[muxport.mux].ports) {
+				if (p.input_sigs.count(i))
+					if (bit2info[i].mux_driver)
+						p.input_muxes.insert(*bit2info[i].mux_driver);
 			}
 		}
 	}
@@ -235,6 +238,9 @@ struct OptMuxtreeWorker
 	OptMuxtreeWorker(RTLIL::Design *design, RTLIL::Module *module) :
 			design(design), module(module), assign_map(module), removed_count(0)
 	{
+		log("Running muxtree optimizer on module %s..\n", module->name);
+
+		log("  Creating internal representation of mux trees.\n");
 
 		for (auto cell : module->cells())
 		{
@@ -246,11 +252,13 @@ struct OptMuxtreeWorker
 		see_non_mux_wires();
 
 		if (mux2info.empty()) {
+			log("  No muxes found in this module.\n");
 			return;
 		}
 
 		fixup_input_muxes();
 
+		log("  Evaluating internal representation of mux trees.\n");
 
 		populate_roots();
 
@@ -258,23 +266,28 @@ struct OptMuxtreeWorker
 
 		for (int mux_idx = 0; mux_idx < GetSize(root_muxes); mux_idx++)
 			if (root_muxes.at(mux_idx)) {
+				log_debug("    Root of a mux tree: %s%s\n", mux2info[mux_idx].cell, root_enable_muxes.at(mux_idx) ? " (pure)" : "");
 				root_mux_rerun.erase(mux_idx);
 				eval_root_mux(shared_knowledge, mux_idx);
 				if (glob_evals_left == 0) {
+					log("  Giving up (too many iterations)\n");
 					return;
 				}
 			}
 
 		while (!root_mux_rerun.empty()) {
 			int mux_idx = *root_mux_rerun.begin();
+			log_debug("    Root of a mux tree: %s (rerun as non-pure)\n", mux2info[mux_idx].cell);
 			log_assert(root_enable_muxes.at(mux_idx));
 			root_mux_rerun.erase(mux_idx);
 			eval_root_mux(shared_knowledge, mux_idx);
 			if (glob_evals_left == 0) {
+				log("  Giving up (too many iterations)\n");
 				return;
 			}
 		}
 
+		log("  Analyzing evaluation results.\n");
 		log_assert(glob_evals_left > 0);
 
 		for (auto &mi : mux2info)
@@ -285,6 +298,8 @@ struct OptMuxtreeWorker
 				if (pi.observable) {
 					live_ports.push_back(port_idx);
 				} else {
+					log("    dead port %d/%d on %s %s.\n", port_idx+1, GetSize(mi.ports),
+							mi.cell->type.c_str(), mi.cell->name.c_str());
 					removed_count++;
 				}
 			}
@@ -436,6 +451,7 @@ struct OptMuxtreeWorker
 					// Ran out of subtree depth, re-eval this input tree in the next re-run
 					root_mux_rerun.insert(m);
 					root_enable_muxes.at(m) = true;
+					log_debug("      Removing pure flag from root mux %s.\n", mux2info[m].cell);
 				} else {
 					auto new_limits = limits.subtree();
 					// Since our knowledge includes assumption,
@@ -518,6 +534,8 @@ struct OptMuxtreeWorker
 		}
 
 		if (did_something) {
+			log("      Replacing known input bits on port %s of cell %s: %s -> %s\n", portname.unescape(),
+					muxinfo.cell, log_signal(muxinfo.cell->getPort(portname)), log_signal(sig));
 			muxinfo.cell->setPort(portname, sig);
 		}
 	}
@@ -529,6 +547,7 @@ struct OptMuxtreeWorker
 		glob_evals_left--;
 
 		muxinfo_t &muxinfo = mux2info[mux_idx];
+		log_debug("\t\teval %s (replace %d enable %d)\n", muxinfo.cell, limits.do_replace_known, limits.do_mark_ports_observable);
 
 		// set input ports to constants if we find known active or inactive signals
 		if (limits.do_replace_known) {
@@ -605,6 +624,7 @@ struct OptMuxtreePass : public Pass {
 	}
 	void execute(vector<std::string> args, RTLIL::Design *design) override
 	{
+		log_header(design, "Executing OPT_MUXTREE pass (detect dead branches in mux trees).\n");
 		extra_args(args, 1, design);
 
 		int total_count = 0;
@@ -616,6 +636,7 @@ struct OptMuxtreePass : public Pass {
 		}
 		if (total_count)
 			design->scratchpad_set_bool("opt.did_something", true);
+		log("Removed %d multiplexer ports.\n", total_count);
 	}
 } OptMuxtreePass;
 

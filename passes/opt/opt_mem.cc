@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-// opt_mem 删除存储器的常量位及无效端口；按数据位检查初始化值，常量条件失效时结束对应扫描。
+
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
 #include "kernel/mem.h"
@@ -38,6 +38,7 @@ struct OptMemPass : public Pass {
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
+		log_header(design, "Executing OPT_MEM pass (optimize memories).\n");
 
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
@@ -87,18 +88,15 @@ struct OptMemPass : public Pass {
 						}
 					}
 				}
-				for (int lane = 0; lane < mem.width; lane++) {
-					for (auto &init : mem.inits) {
-						if (!always_0[lane] && !always_1[lane])
-							break;
-						for (int i = lane; i < GetSize(init.data); i += mem.width) {
-							State bit = init.data[i];
-							if (bit != State::Sx && bit != State::S0)
-								always_0[lane] = false;
-							if (bit != State::Sx && bit != State::S1)
-								always_1[lane] = false;
-							if (!always_0[lane] && !always_1[lane])
-								break;
+				for (auto &init : mem.inits) {
+					for (int i = 0; i < GetSize(init.data); i++) {
+						State bit = init.data[i];
+						int lane = i % mem.width;
+						if (bit != State::Sx && bit != State::S0) {
+							always_0[lane] = false;
+						}
+						if (bit != State::Sx && bit != State::S1) {
+							always_1[lane] = false;
 						}
 					}
 				}
@@ -110,10 +108,13 @@ struct OptMemPass : public Pass {
 					}
 					State bit;
 					if (!always_0[i]) {
+						log("%s.%s: removing const-1 lane %d\n", module->name.unescape(), mem.memid.unescape(), i);
 						bit = State::S1;
 					} else if (!always_1[i]) {
+						log("%s.%s: removing const-0 lane %d\n", module->name.unescape(), mem.memid.unescape(), i);
 						bit = State::S0;
 					} else {
+						log("%s.%s: removing const-x lane %d\n", module->name.unescape(), mem.memid.unescape(), i);
 						bit = State::Sx;
 					}
 					// Reconnect read port data.
@@ -217,6 +218,7 @@ struct OptMemPass : public Pass {
 
 		if (total_count)
 			design->scratchpad_set_bool("opt.did_something", true);
+		log("Performed a total of %d transformations.\n", total_count);
 	}
 } OptMemPass;
 

@@ -17,7 +17,6 @@
  *
  */
 
-// 为 clean 与 opt_clean 归并初始化信息并删除重复属性；清理接口直接传递模块与并行分析上下文。
 #include "passes/opt/clean/opt_clean.h"
 
 USING_YOSYS_NAMESPACE
@@ -106,9 +105,11 @@ ShardedVector<RTLIL::Wire*> deferred_init_transfer(const dict<SigBit, State>& qb
 	return wire_results;
 }
 
-bool remove_redundant_inits(ShardedVector<RTLIL::Wire*> wires) {
+bool remove_redundant_inits(ShardedVector<RTLIL::Wire*> wires, bool verbose) {
 	bool did_something = false;
 	for (RTLIL::Wire *wire : wires) {
+		if (verbose)
+			log_debug("  removing redundant init attribute on %s.\n", wire);
 		wire->attributes.erase(ID::init);
 		did_something = true;
 	}
@@ -118,7 +119,7 @@ bool remove_redundant_inits(ShardedVector<RTLIL::Wire*> wires) {
 PRIVATE_NAMESPACE_END
 YOSYS_NAMESPACE_BEGIN
 
-bool rmunused_module_init(RTLIL::Module *module, ParallelDispatchThreadPool::Subpool &subpool)
+bool rmunused_module_init(RTLIL::Module *module, ParallelDispatchThreadPool::Subpool &subpool, bool verbose)
 {
 	AnalysisContext actx(module, subpool);
 
@@ -126,7 +127,7 @@ bool rmunused_module_init(RTLIL::Module *module, ParallelDispatchThreadPool::Sub
 	dict<SigBit, State> qbits = qbits_from_inits(inits, actx.assign_map);
 	ShardedVector<RTLIL::Wire*> inits_to_transfer = deferred_init_transfer(qbits, actx);
 
-	bool did_something = remove_redundant_inits(inits_to_transfer);
+	bool did_something = remove_redundant_inits(inits_to_transfer, verbose);
 	if (did_something)
 		module->design->scratchpad_set_bool("opt.did_something", true);
 

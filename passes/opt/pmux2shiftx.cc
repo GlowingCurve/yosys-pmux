@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-// pmux2shiftx 转换可编码的 PMUX，onehot 化简独热比较；复用选择查询结果并减少递归保护集合更新。
+
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
 #include "kernel/ffinit.h"
@@ -29,6 +29,7 @@ struct OnehotDatabase
 {
 	Module *module;
 	const SigMap &sigmap;
+	bool verbose = false;
 	bool initialized = false;
 
 	FfInitVals initvals;
@@ -84,17 +85,23 @@ struct OnehotDatabase
 		}
 	}
 
-	void query_worker(const SigSpec &sig, bool &retval, bool &cache)
+	void query_worker(const SigSpec &sig, bool &retval, bool &cache, int indent)
 	{
+		if (verbose)
+			log("%*s %s\n", indent, "", log_signal(sig));
 		log_assert(retval);
 
 		if (recursion_guard.count(sig)) {
+			if (verbose)
+				log("%*s   - recursion\n", indent, "");
 			cache = false;
 			return;
 		}
 
 		auto it = sig_onehot_cache.find(sig);
 		if (it != sig_onehot_cache.end()) {
+			if (verbose)
+				log("%*s   - cached (%s)\n", indent, "", it->second ? "true" : "false");
 			if (!it->second)
 				retval = false;
 			return;
@@ -104,6 +111,8 @@ struct OnehotDatabase
 		for (auto bit : sig) {
 			if (initvals(bit) == State::S1) {
 				if (found_init_ones) {
+					if (verbose)
+						log("%*s   - non-onehot init value\n", indent, "");
 					retval = false;
 					break;
 				}
@@ -119,6 +128,8 @@ struct OnehotDatabase
 				for (auto bit : sig) {
 					if (bit == State::S1) {
 						if (found_ones) {
+							if (verbose)
+								log("%*s   - non-onehot constant\n", indent, "");
 							retval = false;
 							break;
 						}
@@ -130,18 +141,20 @@ struct OnehotDatabase
 			{
 				auto srcs = sig_sources_db.find(sig);
 				if (srcs == sig_sources_db.end()) {
+					if (verbose)
+						log("%*s   - no sources for non-const signal\n", indent, "");
 					retval = false;
 				} else {
-					recursion_guard.insert(sig);
 					for (auto &src : srcs->second) {
 						bool child_cache = true;
-						query_worker(src, retval, child_cache);
+						recursion_guard.insert(sig);
+						query_worker(src, retval, child_cache, indent+4);
+						recursion_guard.erase(sig);
 						if (!child_cache)
 							cache = false;
 						if (!retval)
 							break;
 					}
-					recursion_guard.erase(sig);
 				}
 			}
 		}
@@ -156,11 +169,16 @@ struct OnehotDatabase
 		bool retval = true;
 		bool cache = true;
 
+		if (verbose)
+			log("** ONEHOT QUERY START (%s)\n", log_signal(sig));
 
 		if (!initialized)
 			initialize();
 
-		query_worker(sig, retval, cache);
+		query_worker(sig, retval, cache, 3);
+
+		if (verbose)
+			log("** ONEHOT QUERY RESULT = %s\n", retval ? "true" : "false");
 
 		// it is always safe to cache the root result of a query
 		if (!cache)
@@ -179,6 +197,9 @@ struct Pmux2ShiftxPass : public Pass {
 		log("    pmux2shiftx [options] [selection]\n");
 		log("\n");
 		log("This pass transforms $pmux cells to $shiftx cells.\n");
+		log("\n");
+		log("    -v, -vv\n");
+		log("        verbose output\n");
 		log("\n");
 		log("    -min_density <percentage>\n");
 		log("        specifies the minimum density for the shifter\n");
@@ -202,8 +223,11 @@ struct Pmux2ShiftxPass : public Pass {
 		int min_choices = 3;
 		bool allow_onehot = false;
 		bool optimize_onehot = true;
+		bool verbose = false;
+		bool verbose_onehot = false;
 		bool norange = false;
 
+		log_header(design, "Executing PMUX2SHIFTX pass.\n");
 
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
@@ -233,7 +257,13 @@ struct Pmux2ShiftxPass : public Pass {
 				optimize_onehot = false;
 				continue;
 			}
-			if (args[argidx] == "-v" || args[argidx] == "-vv") {
+			if (args[argidx] == "-v") {
+				verbose = true;
+				continue;
+			}
+			if (args[argidx] == "-vv") {
+				verbose = true;
+				verbose_onehot = true;
 				continue;
 			}
 			if (args[argidx] == "-norange") {
@@ -248,6 +278,7 @@ struct Pmux2ShiftxPass : public Pass {
 		{
 			SigMap sigmap(module);
 			OnehotDatabase onehot_db(module, sigmap);
+			onehot_db.verbose = verbose_onehot;
 
 			dict<SigBit, pair<SigSpec, Const>> eqdb;
 
@@ -345,16 +376,23 @@ struct Pmux2ShiftxPass : public Pass {
 				SigSpec S = sigmap(cell->getPort(ID::S));
 				for (int i = 0; i < GetSize(S); i++)
 				{
-					auto found = eqdb.find(S[i]);
-					if (found == eqdb.end())
+					if (!eqdb.count(S[i]))
 						continue;
 
-					auto &entry = found->second;
+					auto &entry = eqdb.at(S[i]);
 					seldb[entry.first].insert(i);
 				}
 
 				if (seldb.empty())
 					continue;
+
+				bool printed_pmux_header = false;
+
+				if (verbose) {
+					printed_pmux_header = true;
+					log("Inspecting $pmux cell %s/%s.\n", module, cell);
+					log("  data width: %d (next power-of-2 = %d, log2 = %d)\n", width, extwidth, width_bits);
+				}
 
 				SigSpec updated_S = cell->getPort(ID::S);
 				SigSpec updated_B = cell->getPort(ID::B);
@@ -362,19 +400,18 @@ struct Pmux2ShiftxPass : public Pass {
 				while (!seldb.empty())
 				{
 					// pick the largest entry in seldb
-					auto chosen = seldb.begin();
-					for (auto it = seldb.begin(); it != seldb.end(); ++it) {
-						if (GetSize(chosen->first) < GetSize(it->first))
-							chosen = it;
-						else if (GetSize(chosen->second) < GetSize(it->second))
-							chosen = it;
+					SigSpec sig = seldb.begin()->first;
+					for (auto &it : seldb) {
+						if (GetSize(sig) < GetSize(it.first))
+							sig = it.first;
+						else if (GetSize(seldb.at(sig)) < GetSize(it.second))
+							sig = it.first;
 					}
-					SigSpec sig = chosen->first;
 
 					// find the relevant choices
 					bool is_onehot = GetSize(sig) > 2;
 					dict<Const, int> choices;
-					for (int i : chosen->second) {
+					for (int i : seldb.at(sig)) {
 						Const val = eqdb.at(S[i]).second;
 						int onebits = 0;
 						for (auto b : val)
@@ -389,20 +426,61 @@ struct Pmux2ShiftxPass : public Pass {
 
 					// TBD: also find choices that are using signals that are subsets of the bits in "sig"
 
-					if (is_onehot && !allow_onehot && !optimize_onehot) {
-						seldb.erase(sig);
-						continue;
+					if (!verbose)
+					{
+						if (is_onehot && !allow_onehot && !optimize_onehot) {
+							seldb.erase(sig);
+							continue;
+						}
+
+						if (GetSize(choices) < min_choices) {
+							seldb.erase(sig);
+							continue;
+						}
 					}
 
-					if (GetSize(choices) < min_choices) {
-						seldb.erase(sig);
-						continue;
+					if (!printed_pmux_header) {
+						printed_pmux_header = true;
+						log("Inspecting $pmux cell %s/%s.\n", module, cell);
+						log("  data width: %d (next power-of-2 = %d, log2 = %d)\n", width, extwidth, width_bits);
+					}
+
+					log("  checking ctrl signal %s\n", log_signal(sig));
+
+					auto print_choices = [&]() {
+						log("    table of choices:\n");
+						for (auto &it : choices)
+							log("    %3d: %s: %s\n", it.second, log_signal(it.first),
+									log_signal(B.extract(it.second*width, width)));
+					};
+
+					if (verbose)
+					{
+						if (is_onehot && !allow_onehot && !optimize_onehot) {
+							print_choices();
+							log("    ignoring one-hot encoding.\n");
+							seldb.erase(sig);
+							continue;
+						}
+
+						if (GetSize(choices) < min_choices) {
+							print_choices();
+							log("    insufficient choices.\n");
+							seldb.erase(sig);
+							continue;
+						}
 					}
 
 					if (is_onehot && optimize_onehot)
 					{
-						if (onehot_db.query(sig))
+						print_choices();
+						if (!onehot_db.query(sig))
 						{
+							log("    failed to detect onehot driver. do not optimize.\n");
+						}
+						else
+						{
+							log("    optimizing one-hot encoding.\n");
 							for (auto &it : choices)
 							{
 								const Const &val = it.first;
@@ -415,10 +493,12 @@ struct Pmux2ShiftxPass : public Pass {
 									}
 
 								if (index < 0) {
+									log("    %3d: zero encoding.\n", it.second);
 									continue;
 								}
 
 								SigBit new_ctrl = sig[index];
+								log("    %3d: new crtl signal is %s.\n", it.second, log_signal(new_ctrl));
 								updated_S[it.second] = new_ctrl;
 							}
 						}
@@ -522,6 +602,8 @@ struct Pmux2ShiftxPass : public Pass {
 					for (int i = 0; i < GetSize(sig); i++)
 						perm_sig[i] = sig[perm_new_from_old[i]];
 
+					log("    best permutation: %s\n", log_signal(perm_sig));
+					log("    best xor mask: %s\n", log_signal(perm_xormask));
 
 					// permutated choices
 					int min_choice = 1 << 30;
@@ -536,6 +618,7 @@ struct Pmux2ShiftxPass : public Pass {
 						for (int i = 0; i < GetSize(old_c); i++)
 							new_c.set(i, old_c[perm_new_from_old[i]]);
 
+						Const new_c_before_xor = new_c;
 						new_c = const_xor(new_c, perm_xormask, false, false, GetSize(new_c));
 
 						perm_choices[new_c] = it.second;
@@ -543,29 +626,42 @@ struct Pmux2ShiftxPass : public Pass {
 						min_choice = std::min(min_choice, new_c.as_int());
 						max_choice = std::max(max_choice, new_c.as_int());
 
+						log("    %3d: %s -> %s -> %s: %s\n", it.second, log_signal(old_c), log_signal(new_c_before_xor),
+								log_signal(new_c), log_signal(B.extract(it.second*width, width)));
 					}
 
 					int range_density = 100*GetSize(choices) / (max_choice-min_choice+1);
 					int absolute_density = 100*GetSize(choices) / (max_choice+1);
 
+					log("    choices: %d\n", GetSize(choices));
+					log("    min choice: %d\n", min_choice);
+					log("    max choice: %d\n", max_choice);
+					log("    range density: %d%%\n", range_density);
+					log("    absolute density: %d%%\n", absolute_density);
 
 					if (full_pmux) {
 						int full_density = 100*GetSize(choices) / (1 << GetSize(sig));
+						log("    full density: %d%%\n", full_density);
 						if (full_density < min_density) {
 							full_pmux = false;
 						} else {
 							min_choice = 0;
 							max_choice = (1 << GetSize(sig))-1;
+							log("    update to full case.\n");
+							log("    new min choice: %d\n", min_choice);
+							log("    new max choice: %d\n", max_choice);
 						}
 					}
 
 					bool full_case = (min_choice == 0) && (max_choice == (1 << GetSize(sig))-1) && (full_pmux || max_choice+1 == GetSize(choices));
+					log("    full case: %s\n", full_case ? "true" : "false");
 
 					// check density percentages
 					Const offset(State::S0, GetSize(sig));
 					if (!norange && absolute_density < min_density && range_density >= min_density)
 					{
 						offset = Const(min_choice, GetSize(sig));
+						log("    offset: %s\n", log_signal(offset));
 
 						min_choice -= offset.as_int();
 						max_choice -= offset.as_int();
@@ -576,6 +672,7 @@ struct Pmux2ShiftxPass : public Pass {
 						perm_choices.swap(new_perm_choices);
 					} else
 					if (absolute_density < min_density) {
+						log("    insufficient density.\n");
 						seldb.erase(sig);
 						continue;
 					}
@@ -614,9 +711,10 @@ struct Pmux2ShiftxPass : public Pass {
 					// create shiftx cell
 					SigSpec shifted_cmp = {cmp, SigSpec(State::S0, width_bits)};
 					SigSpec outsig = module->addWire(NEW_ID, width);
-					module->addShiftx(NEW_ID, data, shifted_cmp, outsig, false, src);
+					Cell *c = module->addShiftx(NEW_ID, data, shifted_cmp, outsig, false, src);
 					updated_S.append(en);
 					updated_B.append(outsig);
+					log("    created $shiftx cell %s.\n", c);
 
 					// remove this sig and continue with the next block
 					seldb.erase(sig);
@@ -641,14 +739,26 @@ struct OnehotPass : public Pass {
 		log("\n");
 		log("This pass optimizes $eq cells that compare one-hot signals against constants\n");
 		log("\n");
+		log("    -v, -vv\n");
+		log("        verbose output\n");
+		log("\n");
 	}
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
+		bool verbose = false;
+		bool verbose_onehot = false;
 
+		log_header(design, "Executing ONEHOT pass.\n");
 
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
-			if (args[argidx] == "-v" || args[argidx] == "-vv") {
+			if (args[argidx] == "-v") {
+				verbose = true;
+				continue;
+			}
+			if (args[argidx] == "-vv") {
+				verbose = true;
+				verbose_onehot = true;
 				continue;
 			}
 			break;
@@ -659,6 +769,7 @@ struct OnehotPass : public Pass {
 		{
 			SigMap sigmap(module);
 			OnehotDatabase onehot_db(module, sigmap);
+			onehot_db.verbose = verbose_onehot;
 
 			for (auto cell : module->selected_cells())
 			{
@@ -687,7 +798,12 @@ struct OnehotPass : public Pass {
 				if (!B.is_fully_const())
 					continue;
 
+				if (verbose)
+					log("Checking $eq(%s, %s) cell %s/%s.\n", log_signal(A), log_signal(B), module, cell);
+
 				if (!onehot_db.query(A)) {
+					if (verbose)
+						log("  onehot driver test on %s failed.\n", log_signal(A));
 					continue;
 				}
 
@@ -703,6 +819,8 @@ struct OnehotPass : public Pass {
 				}
 
 				if (index < 0) {
+					if (verbose)
+						log("  not optimizing the zero pattern.\n");
 					continue;
 				}
 
@@ -710,11 +828,19 @@ struct OnehotPass : public Pass {
 
 				if (not_onehot)
 				{
+					if (verbose)
+						log("  replacing with constant 0 driver.\n");
+					else
+						log("Replacing one-hot $eq(%s, %s) cell %s/%s with constant 0 driver.\n", log_signal(A), log_signal(B), module, cell);
 					module->connect(Y, SigSpec(1, GetSize(Y)));
 				}
 				else
 				{
 					SigSpec sig = A[index];
+					if (verbose)
+						log("  replacing with signal %s.\n", log_signal(sig));
+					else
+						log("Replacing one-hot $eq(%s, %s) cell %s/%s with signal %s.\n",log_signal(A), log_signal(B), module, cell, log_signal(sig));
 					sig.extend_u0(GetSize(Y));
 					module->connect(Y, sig);
 				}

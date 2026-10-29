@@ -16,7 +16,7 @@
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  */
-// 为 clean 与 opt_clean 清理未使用的信号；在单张连接表中记录原始与规范化信号类别，减少重复存储。
+
 #include "passes/opt/clean/opt_clean.h"
 
 USING_YOSYS_NAMESPACE
@@ -158,6 +158,13 @@ void add_spec(ShardedSigPool::Builder &builder, const ThreadIndex &thread, const
 	for (SigBit bit : spec)
 		if (bit.wire != nullptr)
 			builder.insert(thread, {bit, bit.hash_top().yield()});
+}
+
+bool check_any(const ShardedSigPool &sigs, const RTLIL::SigSpec &spec) {
+	for (SigBit b : spec)
+		if (sigs.find({b, b.hash_top().yield()}) != nullptr)
+			return true;
+	return false;
 }
 
 struct UpdateConnection {
@@ -312,50 +319,29 @@ struct DeferredUpdates {
 	DeferredUpdates(ParallelDispatchThreadPool::Subpool &subpool) : update_connections(subpool), initialized_wires(subpool) {}
 };
 struct UsedSignals {
-	enum Kind { CONNECTED = 1, RAW_CONNECTED = 2 };
-	struct Entry {
-		using Accumulated = Entry;
-		SigBit bit;
-		unsigned kinds;
-	};
-	struct Equality {
-		bool operator()(const Entry &a, const Entry &b) const { return a.bit == b.bit; }
-	};
-	struct Merge {
-		void operator()(Entry &a, Entry &b) const { a.kinds |= b.kinds; }
-	};
-	using Table = ShardedHashtable<Entry, Equality, Merge>;
-	Table connections;
-
-	static void add(Table::Builder &builder, const ThreadIndex &thread, const SigSpec &spec, unsigned kinds) {
-		for (auto bit : spec)
-			if (bit.wire)
-				builder.insert(thread, {{bit, kinds}, bit.hash_top().yield()});
-	}
-	bool check_any(const SigSpec &spec, unsigned kinds) const {
-		for (auto bit : spec) {
-			if (!bit.wire) continue;
-			auto entry = connections.find({{bit, 0}, bit.hash_top().yield()});
-			if (entry && (entry->kinds & kinds)) return true;
-		}
-		return false;
-	}
+	// here, "connected" means "driven or driving something"
+	// sigmapped
+	ShardedSigPool connected;
+	// pre-sigmapped
+	ShardedSigPool raw_connected;
 
 	void clear(ParallelDispatchThreadPool::Subpool &subpool) {
 		subpool.run([this](const ParallelDispatchThreadPool::RunCtx &ctx) {
-			connections.clear(ctx);
+			connected.clear(ctx);
+			raw_connected.clear(ctx);
 		});
 	}
 };
 
 DeferredUpdates analyse_connectivity(UsedSignals& used, SigConnKinds& sig_analysis, const AnalysisContext& actx) {
 	DeferredUpdates deferred(actx.subpool);
-	UsedSignals::Table::Builder conn_builder(actx.subpool);
+	ShardedSigPool::Builder conn_builder(actx.subpool);
+	ShardedSigPool::Builder raw_conn_builder(actx.subpool);
 
 	// gather the usage information for cells and update cell connections with the altered sigmap
 	// also gather the usage information for ports, wires with `keep`
 	// also gather init bits
-	actx.subpool.run([&deferred, &conn_builder, &sig_analysis, &actx](const ParallelDispatchThreadPool::RunCtx &ctx) {
+	actx.subpool.run([&deferred, &conn_builder, &raw_conn_builder, &sig_analysis, &actx](const ParallelDispatchThreadPool::RunCtx &ctx) {
 		// Parallel destruction of these sharded structures
 		sig_analysis.clear(ctx);
 
@@ -365,31 +351,33 @@ DeferredUpdates analyse_connectivity(UsedSignals& used, SigConnKinds& sig_analys
 				SigSpec spec = actx.assign_map(sig);
 				if (spec != sig)
 					deferred.update_connections.insert(ctx, {cell, port, spec});
-				UsedSignals::add(conn_builder, ctx, spec, UsedSignals::CONNECTED | UsedSignals::RAW_CONNECTED);
+				add_spec(raw_conn_builder, ctx, spec);
+				add_spec(conn_builder, ctx, spec);
 			}
 		}
 		for (int i : ctx.item_range(actx.mod->wires_size())) {
 			RTLIL::Wire *wire = actx.mod->wire_at(i);
 			if (wire->port_id > 0) {
 				RTLIL::SigSpec sig = RTLIL::SigSpec(wire);
-				UsedSignals::add(conn_builder, ctx, sig, UsedSignals::RAW_CONNECTED);
+				add_spec(raw_conn_builder, ctx, sig);
 				actx.assign_map.apply(sig);
-				UsedSignals::add(conn_builder, ctx, sig, UsedSignals::CONNECTED);
+				add_spec(conn_builder, ctx, sig);
 			}
 			if (wire->get_bool_attribute(ID::keep)) {
 				RTLIL::SigSpec sig = RTLIL::SigSpec(wire);
 				actx.assign_map.apply(sig);
-				UsedSignals::add(conn_builder, ctx, sig, UsedSignals::CONNECTED);
+				add_spec(conn_builder, ctx, sig);
 			}
 			auto it = wire->attributes.find(ID::init);
 			if (it != wire->attributes.end())
 				deferred.initialized_wires.insert(ctx, wire);
 		}
 	});
-	actx.subpool.run([&conn_builder](const ParallelDispatchThreadPool::RunCtx &ctx) {
+	actx.subpool.run([&conn_builder, &raw_conn_builder](const ParallelDispatchThreadPool::RunCtx &ctx) {
 		conn_builder.process(ctx);
+		raw_conn_builder.process(ctx);
 	});
-	used.connections = UsedSignals::Table(conn_builder);
+	used = {conn_builder, raw_conn_builder};
 	return deferred;
 }
 
@@ -427,10 +415,10 @@ struct WireDeleter {
 				if (wire->port_id != 0 || wire->get_bool_attribute(ID::keep) || !initval.is_fully_undef()) {
 					// do not delete anything with "keep" or module ports or initialized wires
 				} else
-				if (!purge_mode && check_public_name(wire->name) && (used_sig_analysis.check_any(s1, UsedSignals::RAW_CONNECTED) || used_sig_analysis.check_any(s2, UsedSignals::CONNECTED) || s1 != s2)) {
+				if (!purge_mode && check_public_name(wire->name) && (check_any(used_sig_analysis.raw_connected, s1) || check_any(used_sig_analysis.connected, s2) || s1 != s2)) {
 					// do not get rid of public names unless in purge mode or if the wire is entirely unused, not even aliased
 				} else
-				if (!used_sig_analysis.check_any(s1, UsedSignals::RAW_CONNECTED)) {
+				if (!check_any(used_sig_analysis.raw_connected, s1)) {
 					// delete wires that aren't used by anything directly
 					goto delete_this_wire;
 				}
@@ -476,8 +464,16 @@ struct WireDeleter {
 		for (auto &conn : new_connections)
 			mod->connect(std::move(conn));
 	}
-	void delete_wires(RTLIL::Module* mod) {
+	int delete_wires(RTLIL::Module* mod, bool verbose) {
+		int deleted_and_unreported = 0;
+		for (auto wire : del_wires_queue) {
+			if (ys_debug() || (check_public_name(wire->name) && verbose))
+				log_debug("  removing unused non-port wire %s.\n", wire->name);
+			else
+				deleted_and_unreported++;
+		}
 		mod->remove(del_wires_queue);
+		return deleted_and_unreported;
 	}
 };
 
@@ -493,39 +489,40 @@ bool rmunused_module_signals(RTLIL::Module *module, ParallelDispatchThreadPool::
 	AnalysisContext actx(module, subpool);
 	SigConnKinds conn_kinds(clean_ctx.flags.purge, actx, clean_ctx);
 
-	{
-		ExactCellWires cell_wires(conn_kinds.exact_cells, actx.assign_map);
-		// Collect sigmap representative candidates as built in parallel
-		// With parallel runs, this creates redundant candidates that have to resolve in update_assign_map
-		ShardedVector<RTLIL::SigBit> new_sigmap_rep_candidates = build_candidates(cell_wires, conn_kinds, actx);
+	ExactCellWires cell_wires(conn_kinds.exact_cells, actx.assign_map);
+	// Collect sigmap representative candidates as built in parallel
+	// With parallel runs, this creates redundant candidates that have to resolve in update_assign_map
+	ShardedVector<RTLIL::SigBit> new_sigmap_rep_candidates = build_candidates(cell_wires, conn_kinds, actx);
 
-		// Cache all the cell_wires results that we might possible need. This avoids the results
-		// changing when we update `assign_map` below.
-		cell_wires.cache_all(new_sigmap_rep_candidates);
-		// Modify assign_map to reflect the connectivity we want, not the one we have
-		// this changes representative selection in assign_map
-		update_assign_map(actx.assign_map, new_sigmap_rep_candidates, cell_wires, conn_kinds);
-	}
+	// Cache all the cell_wires results that we might possible need. This avoids the results
+	// changing when we update `assign_map` below.
+	cell_wires.cache_all(new_sigmap_rep_candidates);
+	// Modify assign_map to reflect the connectivity we want, not the one we have
+	// this changes representative selection in assign_map
+	update_assign_map(actx.assign_map, new_sigmap_rep_candidates, cell_wires, conn_kinds);
 
 	// Remove all wire-wire connections
 	module->connections_.clear();
 
 	UsedSignals used;
-	{
-		DeferredUpdates deferred = analyse_connectivity(used, conn_kinds, actx);
-		fixup_cell_ports(deferred.update_connections);
-		// Rip up and re-apply init attributes onto representative wires with x-bits
-		// in place of unset init bits
-		consume_inits(deferred.initialized_wires, actx.assign_map).apply_normalised_inits();
-	}
+	DeferredUpdates deferred = analyse_connectivity(used, conn_kinds, actx);
+	fixup_cell_ports(deferred.update_connections);
+	// Rip up and re-apply init attributes onto representative wires with x-bits
+	// in place of unset init bits
+	consume_inits(deferred.initialized_wires, actx.assign_map).apply_normalised_inits();
 
 	WireDeleter deleter(used, clean_ctx.flags.purge, actx);
 
 	used.clear(subpool);
 
 	deleter.commit_changes(module);
-	deleter.delete_wires(module);
+	int deleted_and_unreported = deleter.delete_wires(module, clean_ctx.flags.verbose);
 	int deleted_total = GetSize(deleter.del_wires_queue);
+
+	clean_ctx.stats.count_rm_wires += deleted_total;
+
+	if (clean_ctx.flags.verbose && deleted_and_unreported)
+		log_debug("  removed %d unused temporary wires.\n", deleted_and_unreported);
 
 	if (deleted_total)
 		module->design->scratchpad_set_bool("opt.did_something", true);
