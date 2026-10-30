@@ -1,9 +1,6 @@
 add_subdirectory(clean)
 add_subdirectory(dff)
 
-yosys_pass(native_opt
-	native_opt.cc
-)
 yosys_pass(opt_pmuxfactor
 	opt_pmuxfactor.cc
 	REQUIRES

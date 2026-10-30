@@ -226,9 +226,9 @@ struct SynthIntelPass : public ScriptPass {
 			run("opt_pmuxrel -coarse -lut4 " + pmux_lut);
 			run("opt_pmuxarith -lut4 " + pmux_lut);
 			run("opt_pmuxfactor");
-			run("opt_pmuxselect");
+			run("opt_pmuxselect -defer-recovered");
 			run("opt_pmuxcontext");
-			run("opt_pmuxlut -lut4 " + pmux_lut);
+			run("opt_pmuxlut -lut4 " + pmux_lut + (family_opt == "cycloneiv" && !dff ? " -priority-generic" : ""));
 			run("techmap -map +/cmp2lut.v -D LUT_WIDTH=4");
 			run("opt_expr");
 			run("opt_clean");
@@ -278,6 +278,7 @@ struct SynthIntelPass : public ScriptPass {
 			run("opt -undriven -fine");
 			std::string pmux_lut = family_opt == "max10" ? "fiftyfivenm_lcell_comb" : family_opt + "_lcell_comb";
 			run("opt_pmuxrel -tables -lut4 " + pmux_lut);
+			run("opt_pmuxselect -recovered-only");
 			run("techmap -map +/techmap.v");
 			run("opt -full");
 			run("clean -purge");

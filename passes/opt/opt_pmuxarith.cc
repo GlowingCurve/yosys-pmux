@@ -2,6 +2,7 @@
 // 在操作数选择、进位和余数计算之间共享节点，减少重复算术与选择逻辑。
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
+#include "kernel/utils.h"
 #include "passes/opt/pmux_celltypes.h"
 #include <array>
 #include <functional>
@@ -193,23 +194,30 @@ struct PmuxArithWorker {
 	PmuxCellTypes types;
 	IdString luttype;
 	dict<SigBit, Cell *> drivers;
-	dict<SigBit, pool<Cell *>> users;
+	dict<SigBit, std::vector<Cell *>> users;
 	pool<SigBit> protected_bits, kept_bits, input_bits, multiple_drivers;
 	pool<Cell *> selected;
 	int budget = 20000;
 	PmuxArithWorker(Module *m, Design *d, IdString luttype) : module(m), sigmap(m), types(m,d), luttype(luttype) {
-		for (auto wire : m->wires()) for (auto bit : sigmap(wire)) {
-			if (wire->port_input) {
-				drivers[bit] = nullptr;
-				input_bits.insert(bit);
+		for (auto wire : m->wires()) {
+			bool keep = wire->get_bool_attribute(ID::keep);
+			if (!wire->port_input && !wire->port_output && !keep) continue;
+			for (auto bit : sigmap(wire)) {
+				if (wire->port_input) {
+					drivers[bit] = nullptr;
+					input_bits.insert(bit);
+				}
+				if (wire->port_output || keep) protected_bits.insert(bit);
+				if (keep) kept_bits.insert(bit);
 			}
-			if (wire->port_output || wire->get_bool_attribute(ID::keep)) protected_bits.insert(bit);
-			if (wire->get_bool_attribute(ID::keep)) kept_bits.insert(bit);
 		}
 		for (auto cell : m->cells()) {
 			if (d->selected(m,cell)) selected.insert(cell);
+			bool keep = cell->get_bool_attribute(ID::keep);
 			for (auto &port : cell->connections()) {
-				bool output = types.cell_output(cell->type,port.first), input = types.cell_input(cell->type,port.first);
+				auto direction = types.cell_port_dir(cell->type, port.first);
+				bool output = direction == RTLIL::PD_OUTPUT || direction == RTLIL::PD_INOUT;
+				bool input = direction == RTLIL::PD_INPUT || direction == RTLIL::PD_INOUT;
 				for (auto bit : sigmap(port.second)) {
 					if (output) {
 						if (drivers.count(bit)) {
@@ -219,8 +227,11 @@ struct PmuxArithWorker {
 							drivers[bit] = cell;
 						}
 					}
-					if (input || !output) users[bit].insert(cell);
-					if (cell->get_bool_attribute(ID::keep) || (!input && !output)) kept_bits.insert(bit);
+					if (input || !output) {
+						auto &list = users[bit];
+						if (list.empty() || list.back() != cell) list.push_back(cell);
+					}
+					if (keep || (!input && !output)) kept_bits.insert(bit);
 				}
 			}
 		}
@@ -235,6 +246,12 @@ struct PmuxArithWorker {
 		bool sign = cell->getParam(ID::A_SIGNED).as_bool() && (!cell->hasParam(ID::B_SIGNED) || cell->getParam(ID::B_SIGNED).as_bool());
 		s.extend_u0(width, sign);
 		return s;
+	}
+	SigSpec without_zero_extension(SigSpec value) const
+	{
+		while (!value.empty() && value.back() == State::S0)
+			value.remove(GetSize(value)-1);
+		return value;
 	}
 	Cell *root(const SigSpec &value) const {
 		if (value.empty() || !drivers.count(value[0])) return nullptr;
@@ -296,7 +313,7 @@ struct PmuxArithWorker {
 				bool retain = !editable(cell);
 				for (auto bit : sigmap(cell->getPort(ID::Y))) {
 					if (protected_bits.count(bit) || leaves.count(bit)) retain = true;
-					for (auto user : users[bit]) if (!region.count(user)) retain = true;
+					for (auto user : reversed(users[bit])) if (!region.count(user)) retain = true;
 				}
 				if (retain) {
 					region.erase(cell);
@@ -308,9 +325,7 @@ struct PmuxArithWorker {
 		dict<SigSpec, int> divcost;
 		for (auto cell : region) {
 			if (cell->type.in(ID($div), ID($mod))) {
-				auto input = sigmap(cell->getPort(ID::A));
-				while (!input.empty() && input.back() == State::S0)
-					input.remove(GetSize(input)-1);
+				auto input = without_zero_extension(sigmap(cell->getPort(ID::A)));
 				auto &cost = divcost[input];
 				cost = std::max(cost, GetSize(input)*GetSize(input));
 			} else {
@@ -319,8 +334,14 @@ struct PmuxArithWorker {
 		}
 		for (auto &item : divcost)
 			old += item.second;
-		if (network.cost(outputs) >= old) return false;
+		int cost = network.cost(outputs);
+		if (cost >= old) return false;
+		int before = module->cells_size();
 		auto emitted = network.emit(module, luttype, outputs);
+		int emitted_cells = module->cells_size() - before;
+		log_assert(emitted_cells == cost);
+		log_debug("PMUX arithmetic commit: reference=%d candidate=%d removed=%d emitted=%d.\n",
+			old, cost, GetSize(region), emitted_cells);
 		int offset = 0;
 		for (auto cell : roots) {
 			auto port = cell->getPort(ID::Y);
@@ -391,6 +412,21 @@ struct PmuxArithWorker {
 		}
 		return false;
 	}
+	bool selected_branch(const SigSpec &s, const SigSpec &a, const SigSpec &b, int width,
+			const dict<SigBit, bool> &values, SigSpec &branch)
+	{
+		int active = -1;
+		for (int j = 0; j < GetSize(s); j++) {
+			bool value;
+			if (!eval(s[j], values, value)) return false;
+			if (value) {
+				if (active >= 0) return false;
+				active = j;
+			}
+		}
+		branch = active < 0 ? a : b.extract(active*width, width);
+		return true;
+	}
 	bool choice(Cell *pmux, std::vector<SigSpec> &branches, SigSpec &control, pool<Cell *> &region) {
 		pool<SigBit> support;
 		auto s = sigmap(pmux->getPort(ID::S));
@@ -400,23 +436,16 @@ struct PmuxArithWorker {
 		std::vector<SigBit> sorted(support.begin(), support.end());
 		std::sort(sorted.begin(), sorted.end());
 		control = SigSpec(sorted);
-		auto a=sigmap(pmux->getPort(ID::A)), b=sigmap(pmux->getPort(ID::B));
-		for (int code=0;code<(1<<GetSize(control));code++) {
+		auto a = sigmap(pmux->getPort(ID::A)), b = sigmap(pmux->getPort(ID::B));
+		for (int code = 0; code < (1 << GetSize(control)); code++) {
 			dict<SigBit, bool> values;
 			for (int j = 0; j < GetSize(control); j++)
 				values[control[j]] = (code >> j) & 1;
-			int active = -1;
-			for (int j = 0; j < GetSize(s); j++) {
-				bool value;
-				if (!eval(s[j], values, value)) return false;
-				if (value) {
-					if (active >= 0) return false;
-					active = j;
-				}
-			}
-			auto branch=active<0?a:b.extract(active*GetSize(a),GetSize(a));
-			if (branch.is_fully_undef()) branch=b.extract(0,GetSize(a));
-			for (auto bit:branch) if (!bit.wire && bit!=State::S0 && bit!=State::S1) return false;
+			SigSpec branch;
+			if (!selected_branch(s, a, b, GetSize(a), values, branch)) return false;
+			if (branch.is_fully_undef()) branch = b.extract(0, GetSize(a));
+			for (auto bit : branch)
+				if (!bit.wire && bit != State::S0 && bit != State::S1) return false;
 			branches.push_back(branch);
 		}
 		return true;
@@ -458,72 +487,71 @@ struct PmuxArithWorker {
 		pool<Cell *> predicates, region;
 		auto s = sigmap(pmux->getPort(ID::S));
 		if (GetSize(s) > 4) return false;
-		for(auto bit:s)if(!comparisons(bit,predicates,region))return false;
-		if(GetSize(predicates)!=3)return false;
+		for (auto bit : s)
+			if (!comparisons(bit, predicates, region)) return false;
+		if (GetSize(predicates) != 3) return false;
 		SigSpec a, b;
 		bool sign = false, first = true;
 		dict<Cell *, int> relation;
-		for(auto cell:predicates){
-			if(GetSize(cell->getPort(ID::Y))!=1)return false;
-			int w=std::max(GetSize(cell->getPort(ID::A)),GetSize(cell->getPort(ID::B)));
+		for (auto cell : predicates) {
+			if (GetSize(cell->getPort(ID::Y)) != 1) return false;
+			int w = std::max(GetSize(cell->getPort(ID::A)), GetSize(cell->getPort(ID::B)));
 			auto x = extended(cell, ID::A, w), y = extended(cell, ID::B, w);
 			bool signed_order = cell->getParam(ID::A_SIGNED).as_bool() && cell->getParam(ID::B_SIGNED).as_bool();
-			if(w!=width)return false;
+			if (w != width) return false;
 			if (first) {
 				a = x;
 				b = y;
 				sign = signed_order;
 				first = false;
 			}
-			for(auto bit:x)if(!bit.wire&&bit!=State::S0&&bit!=State::S1)return false;
-			for(auto bit:y)if(!bit.wire&&bit!=State::S0&&bit!=State::S1)return false;
-			if(signed_order!=sign)return false;
-			int r=cell->type==ID($lt)?0:cell->type==ID($eq)?1:2;
+			for (auto bit : x)
+				if (!bit.wire && bit != State::S0 && bit != State::S1) return false;
+			for (auto bit : y)
+				if (!bit.wire && bit != State::S0 && bit != State::S1) return false;
+			if (signed_order != sign) return false;
+			int r = 1;
+			if (cell->type == ID($lt)) r = 0;
+			if (cell->type == ID($gt)) r = 2;
 			if (x == b && y == a)
 				r = 2-r;
 			else if (x != a || y != b)
 				return false;
-			relation[cell]=r;
+			relation[cell] = r;
 		}
 		pool<int> kinds;
 		for (auto &entry : relation)
 			kinds.insert(entry.second);
 		if (GetSize(kinds) != 3) return false;
 		std::vector<SigSpec> branch;
-		auto av=sigmap(pmux->getPort(ID::A)),bv=sigmap(pmux->getPort(ID::B));
-		for(int state=0;state<3;state++){
+		auto av = sigmap(pmux->getPort(ID::A)), bv = sigmap(pmux->getPort(ID::B));
+		for (int state = 0; state < 3; state++) {
 			dict<SigBit, bool> values;
 			for (auto &entry : relation)
 				values[sigmap(entry.first->getPort(ID::Y))[0]] = entry.second == state;
-			int active = -1;
-			for (int j = 0; j < GetSize(s); j++) {
-				bool value;
-				if (!eval(s[j], values, value)) return false;
-				if (value) {
-					if (active >= 0) return false;
-					active = j;
-				}
-			}
-			branch.push_back(active<0?av:bv.extract(active*width,width));
+			SigSpec selected;
+			if (!selected_branch(s, av, bv, width, values, selected)) return false;
+			branch.push_back(selected);
 		}
-		bool minimum=branch[0]==a&&branch[2]==b, maximum=branch[0]==b&&branch[2]==a;
-		if((!minimum&&!maximum)||!equal_branch(branch[1],a,b,region))return false;
+		bool minimum = branch[0] == a && branch[2] == b;
+		bool maximum = branch[0] == b && branch[2] == a;
+		if ((!minimum && !maximum) || !equal_branch(branch[1], a, b, region)) return false;
 		ArithNetwork net;
 		auto ab = net.bits(a), bb = net.bits(b);
 		int less = 0;
-		for(int i=0;i<width;i++){
+		for (int i = 0; i < width; i++) {
 			int x = ab[i], y = bb[i];
 			if (sign && i == width-1) {
 				x = net.gate({x}, 1);
 				y = net.gate({y}, 1);
 			}
 			// 低位递推比较，高位不同的时候覆盖低位结果。
-			less=net.gate({x,y,less},0xd4);
+			less = net.gate({x, y, less}, 0xd4);
 		}
 		std::vector<int> output;
 		for (int i = 0; i < width; i++)
 			output.push_back(net.mux(minimum ? bb[i] : ab[i], minimum ? ab[i] : bb[i], less));
-		return commit(pmux,region,net,output);
+		return commit(pmux, region, net, output);
 	}
 	std::pair<std::vector<int>, std::vector<int>> divmod3(ArithNetwork &net, const SigSpec &input, int width) {
 		log_assert(width >= 2 && GetSize(input) >= width);
@@ -560,9 +588,7 @@ struct PmuxArithWorker {
 	bool shared_divisions() {
 		dict<SigSpec,std::vector<Cell *>> groups;
 		for(auto cell:module->cells())if(unsigned_div3(cell)&&GetSize(cell->getPort(ID::Y))<=32){
-			auto input = sigmap(cell->getPort(ID::A));
-			while (!input.empty() && input.back() == State::S0)
-				input.remove(GetSize(input)-1);
+			auto input = without_zero_extension(sigmap(cell->getPort(ID::A)));
 			if(GetSize(input)>=2&&GetSize(input)<=16)groups[input].push_back(cell);
 		}
 		int attempts=0;
@@ -639,153 +665,219 @@ struct PmuxArithWorker {
 		}
 		return commit(pmux,region,net,output);
 	}
-	bool expression(SigSpec value, int width, Polynomial &terms, pool<Cell *> &region, bool negative=false, int depth=0) {
-		if (--budget<=0 || depth>8 || GetSize(terms)>12) return false;
-		auto cell=root(value);
-		if (cell && cell->type.in(ID($add),ID($sub))) {
+	bool expression(SigSpec value, int width, Polynomial &terms, pool<Cell *> &region, bool negative = false, int depth = 0)
+	{
+		if (--budget <= 0 || depth > 8 || GetSize(terms) > 12) return false;
+		auto cell = root(value);
+		if (cell && cell->type.in(ID($add), ID($sub))) {
 			int yw = GetSize(cell->getPort(ID::Y));
 			bool safe = yw >= width;
-			if (!safe && !cell->getParam(ID::A_SIGNED).as_bool() && !cell->getParam(ID::B_SIGNED).as_bool() && cell->type==ID($add)) {
-				auto a=sigmap(cell->getPort(ID::A)),b=sigmap(cell->getPort(ID::B));
-				while(!a.empty() && a.back()==State::S0)a.remove(GetSize(a)-1);
-				while(!b.empty() && b.back()==State::S0)b.remove(GetSize(b)-1);
-				safe=std::max(GetSize(a),GetSize(b))+1<=yw;
+			if (!safe && !cell->getParam(ID::A_SIGNED).as_bool() && !cell->getParam(ID::B_SIGNED).as_bool() && cell->type == ID($add)) {
+				auto a = without_zero_extension(sigmap(cell->getPort(ID::A)));
+				auto b = without_zero_extension(sigmap(cell->getPort(ID::B)));
+				safe = std::max(GetSize(a), GetSize(b))+1 <= yw;
 			}
 			if (safe) {
 				region.insert(cell);
-				return expression(extended(cell,ID::A,width),width,terms,region,negative,depth+1) && expression(extended(cell,ID::B,width),width,terms,region,negative^(cell->type==ID($sub)),depth+1);
+				return expression(extended(cell, ID::A, width), width, terms, region, negative, depth+1) &&
+					expression(extended(cell, ID::B, width), width, terms, region, negative ^ (cell->type == ID($sub)), depth+1);
 			}
 		}
 		int shift = 0;
 		while (shift < GetSize(value) && value[shift] == State::S0)
 			shift++;
-		if(shift==GetSize(value))return true;
+		if (shift == GetSize(value)) return true;
 		value.remove(0, shift);
-		while (!value.empty() && value.back() == State::S0)
-			value.remove(GetSize(value)-1);
-		for(auto bit:value)if(!bit.wire && bit!=State::S0 && bit!=State::S1)return false;
-		Const coefficient=const_shl(Const(1,width),Const(shift,32),false,false,width);
-		if(negative)coefficient=const_neg(coefficient,{},false,false,width);
-		if(!terms.count(value))terms[value]=Const(0,width);
-		terms[value]=const_add(terms.at(value),coefficient,false,false,width);
+		value = without_zero_extension(std::move(value));
+		for (auto bit : value)
+			if (!bit.wire && bit != State::S0 && bit != State::S1) return false;
+		Const coefficient = const_shl(Const(1, width), Const(shift, 32), false, false, width);
+		if (negative) coefficient = const_neg(coefficient, {}, false, false, width);
+		if (!terms.count(value)) terms[value] = Const(0, width);
+		terms[value] = const_add(terms.at(value), coefficient, false, false, width);
 		return true;
 	}
-	bool arithmetic(Cell *pmux) {
-		int width = GetSize(pmux->getPort(ID::Y));
-		if (width < 2 || width > 32) return false;
-		std::vector<SigSpec> branches;
-		SigSpec control;
-		pool<Cell *> region;
-		if(!choice(pmux,branches,control,region))return false;
-		std::vector<Polynomial> polynomials;
-		pool<SigSpec> bases;
-		for (auto branch : branches) {
-			Polynomial polynomial;
-			if (!expression(branch, width, polynomial, region)) return false;
-			for (auto &term : polynomial)
-				if (term.second.as_bool()) bases.insert(term.first);
-			polynomials.push_back(std::move(polynomial));
-		}
-		if(GetSize(bases)==1){
-			auto base = *bases.begin();
-			std::vector<Const> coefficients;
-			for(auto &p:polynomials)coefficients.push_back(p.count(base)?p.at(base):Const(0,width));
-			std::vector<int> shifts;
-			for(int j=0;j<GetSize(control);j++){
-				auto delta = const_sub(coefficients[1 << j], coefficients[0], false, false, width);
-				int position = -1;
-				for (int k = 0; k < width; k++) if (delta[k] == State::S1) {
-					if (position >= 0) return false;
-					position = k;
-				}
-				shifts.push_back(position);
-			}
-			int initial = -1;
-			for (int k = 0; k < width; k++) if (coefficients[0][k] == State::S1) {
-				if (initial >= 0) return false;
-				initial = k;
-			}
-			for(int code=0;code<GetSize(branches);code++){
-				auto expected = coefficients[0];
-				for (int j = 0; j < GetSize(control); j++)
-					if (((code >> j) & 1) && shifts[j] >= 0)
-						expected = const_add(expected, const_shl(Const(1, width), Const(shifts[j], 32), false, false, width), false, false, width);
-				if(expected!=coefficients[code])return false;
-			}
-			ArithNetwork net;
-			auto cb = net.bits(control);
-			base.extend_u0(width);
-			auto x = net.bits(base);
-			std::vector<int> sum(width, 0);
-			if(initial>=0)for(int i=initial;i<width;i++)sum[i]=x[i-initial];
-			for (int j = 0; j < GetSize(control); j++) if (shifts[j] >= 0) {
-				std::vector<int> term(width, 0);
-				for (int i = shifts[j]; i < width; i++)
-					term[i] = net.gate({x[i-shifts[j]], cb[j]}, 8);
-				sum = net.add(sum, term);
-			}
-			return commit(pmux,region,net,sum);
-		}
-		if(GetSize(bases)==2){
-			std::vector<SigSpec> bs(bases.begin(), bases.end());
-			std::sort(bs.begin(), bs.end());
-			std::vector<std::array<int, 2>> signs;
-			std::vector<int> carries;
-			for (auto &polynomial : polynomials) {
-				std::array<int, 2> sign{};
-				int negative = 0;
-				for (int j = 0; j < 2; j++) {
-					auto term = polynomial.find(bs[j]);
-					if (term == polynomial.end()) continue;
-					if (term->second == Const(1, width)) {
-						sign[j] = 1;
-					} else if (term->second == Const(State::S1, width)) {
-						sign[j] = -1;
-						negative++;
-					} else if (term->second.as_bool()) {
-						return false;
-					}
-				}
-				if (negative > 1) return false;
-				signs.push_back(sign);
-				carries.push_back(negative);
-			}
-			ArithNetwork net;
-			auto cb = net.bits(control);
-			std::vector<int> operands[2];
-			for (int j = 0; j < 2; j++) {
-				bs[j].extend_u0(width);
-				for (int i = 0; i < width; i++) {
-					std::vector<int> values;
-					int data = net.leaf(bs[j][i]);
-					for (auto &sign : signs)
-						values.push_back(sign[j] == 0 ? 0 : sign[j] > 0 ? data : net.gate({data}, 1));
-					operands[j].push_back(net.select(values, cb));
+	// 返回 false 表示预算耗尽；准入失败时保留原多项式。
+	bool normalize_constant_offsets(std::vector<Polynomial> &polynomials, int width) {
+		if ((budget -= GetSize(polynomials)) <= 0) return false;
+		for (auto &polynomial : polynomials)
+			if (GetSize(polynomial) > 12) return true;
+		Const zero(0, width), one(1, width), minus_one(State::S1, width);
+		std::vector<Const> offsets(polynomials.size(), zero);
+		std::vector<Polynomial> normalized(polynomials.size());
+		pool<SigSpec> variables, constants;
+		for (int i = 0; i < GetSize(polynomials); i++) {
+			for (auto &term : polynomials[i]) {
+				if ((budget -= width) <= 0) return false;
+				log_assert(GetSize(term.second) == width && term.second.is_fully_def());
+				if (!term.second.as_bool()) continue;
+				if (term.first.is_fully_const()) {
+					log_assert(term.first.is_fully_def());
+					if ((budget -= 2*width) <= 0) return false;
+					auto product = const_mul(term.second, term.first.as_const(), false, false, width);
+					offsets[i] = const_add(offsets[i], product, false, false, width);
+					constants.insert(term.first);
+				} else {
+					if (term.second != one && term.second != minus_one) return true;
+					variables.insert(term.first);
+					normalized[i][term.first] = term.second;
 				}
 			}
-			return commit(pmux,region,net,net.add(operands[0],operands[1],net.select(carries,cb)));
 		}
-		std::vector<std::array<SigSpec,3>> terms;
+		if (constants.empty() || variables.empty() || GetSize(variables) > 2) return true;
+		if ((budget -= 5*width*GetSize(polynomials)) <= 0) return false;
+		Const base = zero;
+		for (int i = 0; i < GetSize(normalized); i++) {
+			bool negative = false;
+			for (auto &term : normalized[i]) negative |= term.second == minus_one;
+			if (!negative || offsets[i] == zero) continue;
+			if (base != zero && base != offsets[i]) return true;
+			base = offsets[i];
+		}
+		for (auto &offset : offsets) if (base == zero && offset != zero) {
+			auto opposite = const_neg(offset, {}, false, false, width);
+			base = const_lt(opposite, offset, false, false, 1).as_bool() ? opposite : offset;
+			break;
+		}
+		if (base != zero && GetSize(variables) != 1) return true;
+		auto opposite = const_neg(base, {}, false, false, width);
+		for (int i = 0; i < GetSize(normalized); i++) {
+			int negative = 0;
+			for (auto &term : normalized[i]) negative += term.second == minus_one;
+			if (offsets[i] != zero) {
+				Const coefficient;
+				if (offsets[i] == base) coefficient = one;
+				else if (offsets[i] == opposite) coefficient = minus_one;
+				else return true;
+				negative += coefficient == minus_one;
+				normalized[i][SigSpec(base)] = coefficient;
+			}
+			if (negative > 1) return true;
+		}
+		polynomials.swap(normalized);
+		log_debug("PMUX arithmetic constant offsets: width=%d constant_bases=%d->%d K=%s.\n",
+			width, GetSize(constants), base != zero, log_signal(SigSpec(base)));
+		for (int i = 0; i < GetSize(offsets); i++)
+			log_debug("PMUX arithmetic offset branch=%d value=%s.\n", i, log_signal(SigSpec(offsets[i])));
+		return true;
+	}
+	bool scaled_base(Cell *pmux, const std::vector<Polynomial> &polynomials, SigSpec base,
+			const SigSpec &control, const pool<Cell *> &region, int width)
+	{
+		std::vector<Const> coefficients;
+		for (auto &polynomial : polynomials)
+			coefficients.push_back(polynomial.count(base) ? polynomial.at(base) : Const(0, width));
+		std::vector<int> shifts;
+		for (int j = 0; j < GetSize(control); j++) {
+			auto delta = const_sub(coefficients[1 << j], coefficients[0], false, false, width);
+			int position = -1;
+			for (int k = 0; k < width; k++) if (delta[k] == State::S1) {
+				if (position >= 0) return false;
+				position = k;
+			}
+			shifts.push_back(position);
+		}
+		int initial = -1;
+		for (int k = 0; k < width; k++) if (coefficients[0][k] == State::S1) {
+			if (initial >= 0) return false;
+			initial = k;
+		}
+		for (int code = 0; code < GetSize(polynomials); code++) {
+			auto expected = coefficients[0];
+			for (int j = 0; j < GetSize(control); j++)
+				if (((code >> j) & 1) && shifts[j] >= 0)
+					expected = const_add(expected, const_shl(Const(1, width), Const(shifts[j], 32), false, false, width), false, false, width);
+			if (expected != coefficients[code]) return false;
+		}
+		ArithNetwork net;
+		auto cb = net.bits(control);
+		base.extend_u0(width);
+		auto x = net.bits(base);
+		std::vector<int> sum(width, 0);
+		if (initial >= 0)
+			for (int i = initial; i < width; i++) sum[i] = x[i-initial];
+		for (int j = 0; j < GetSize(control); j++) if (shifts[j] >= 0) {
+			std::vector<int> term(width, 0);
+			for (int i = shifts[j]; i < width; i++)
+				term[i] = net.gate({x[i-shifts[j]], cb[j]}, 8);
+			sum = net.add(sum, term);
+		}
+		return commit(pmux, region, net, sum);
+	}
+	bool signed_bases(Cell *pmux, const std::vector<Polynomial> &polynomials, std::vector<SigSpec> bases,
+			const SigSpec &control, const pool<Cell *> &region, int width)
+	{
+		std::vector<std::array<int, 2>> signs;
 		for (auto &polynomial : polynomials) {
-			std::vector<SigSpec> values;
+			std::array<int, 2> sign{};
+			int negative = 0;
+			for (int j = 0; j < 2; j++) {
+				auto term = polynomial.find(bases[j]);
+				if (term == polynomial.end()) continue;
+				if (term->second == Const(1, width)) {
+					sign[j] = 1;
+				} else if (term->second == Const(State::S1, width)) {
+					sign[j] = -1;
+					negative++;
+				} else if (term->second.as_bool()) {
+					return false;
+				}
+			}
+			if (negative > 1) return false;
+			signs.push_back(sign);
+		}
+		log_debug("PMUX arithmetic two-base emitter %s: bases=%s, %s.\n",
+			log_id(pmux), log_signal(bases[0]), log_signal(bases[1]));
+		ArithNetwork net;
+		auto cb = net.bits(control);
+		std::vector<int> operands[2];
+		for (int j = 0; j < 2; j++) {
+			bases[j].extend_u0(width);
+			for (int i = 0; i < width; i++) {
+				std::vector<int> values;
+				int data = net.leaf(bases[j][i]);
+				for (auto &sign : signs) {
+					if (sign[j] == 0) values.push_back(0);
+					else if (sign[j] > 0) values.push_back(data);
+					else values.push_back(net.gate({data}, 1));
+				}
+				operands[j].push_back(net.select(values, cb));
+			}
+		}
+		// 负项按逐位取反和一次进位表示；每个分支最多包含一个负项。
+		std::vector<int> carries;
+		for (auto &sign : signs)
+			carries.push_back((sign[0] < 0) + (sign[1] < 0));
+		return commit(pmux, region, net, net.add(operands[0], operands[1], net.select(carries, cb)));
+	}
+	bool three_term_sums(Cell *pmux, const std::vector<Polynomial> &polynomials, std::vector<SigSpec> bases,
+			const SigSpec &control, const pool<Cell *> &region, int width)
+	{
+		// 编号采用原始 SigSpec 的排序；扩展位宽后仍保留各自编号。
+		dict<SigSpec, int> indices;
+		for (int i = 0; i < GetSize(bases); i++) indices[bases[i]] = i;
+		std::vector<std::array<int, 3>> terms;
+		for (auto &polynomial : polynomials) {
+			std::vector<int> values;
 			for (auto &term : polynomial) {
 				if (!term.second.as_bool()) continue;
 				int count = term.second.as_int();
 				if (count < 1 || count > 3) return false;
 				for (int j = 0; j < count; j++)
-					values.push_back(term.first);
+					values.push_back(indices.at(term.first));
 			}
 			if (GetSize(values) != 3) return false;
 			std::sort(values.begin(), values.end());
 			terms.push_back({values[0], values[1], values[2]});
 		}
-		if(terms.size()>4)return false;
+		if (terms.size() > 4) return false;
+		for (auto &base : bases) base.extend_u0(width);
 		ArithNetwork best;
 		std::vector<int> bestout;
 		int bestcost = INT_MAX;
-		std::vector<std::array<SigSpec, 3>> ordered = terms;
-		std::function<void(int)> enumerate=[&](int branch){
-			if(budget<=0)return;
+		auto ordered = terms;
+		std::function<void(int)> enumerate = [&](int branch) {
+			if (budget <= 0) return;
 			if (branch < GetSize(terms)) {
 				auto permutation = terms[branch];
 				do {
@@ -794,18 +886,17 @@ struct PmuxArithWorker {
 				} while (std::next_permutation(permutation.begin(), permutation.end()));
 				return;
 			}
-			budget-=2*width;
+			budget -= 2*width;
 			ArithNetwork net;
 			auto cb = net.bits(control);
 			std::vector<int> operands[3];
-			for (int column = 0; column < 3; column++) for (int i = 0; i < width; i++) {
-				std::vector<int> values;
-				for (auto &row : ordered) {
-					auto signal = row[column];
-					signal.extend_u0(width);
-					values.push_back(net.leaf(signal[i]));
+			for (int column = 0; column < 3; column++) {
+				for (int i = 0; i < width; i++) {
+					std::vector<int> values;
+					for (auto &row : ordered)
+						values.push_back(net.leaf(bases[row[column]][i]));
+					operands[column].push_back(net.select(values, cb));
 				}
-				operands[column].push_back(net.select(values, cb));
 			}
 			auto output = net.sum3(operands[0], operands[1], operands[2]);
 			int cost = net.cost(output);
@@ -815,8 +906,36 @@ struct PmuxArithWorker {
 				bestout = std::move(output);
 			}
 		};
+		// 三项整体换位不改变求和，固定第一个分支的排列。
 		enumerate(1);
-		return !bestout.empty()&&commit(pmux,region,best,bestout);
+		return !bestout.empty() && commit(pmux, region, best, bestout);
+	}
+	bool arithmetic(Cell *pmux)
+	{
+		int width = GetSize(pmux->getPort(ID::Y));
+		if (width < 2 || width > 32) return false;
+		std::vector<SigSpec> branches;
+		SigSpec control;
+		pool<Cell *> region;
+		if (!choice(pmux, branches, control, region)) return false;
+		std::vector<Polynomial> polynomials;
+		for (auto branch : branches) {
+			Polynomial polynomial;
+			if (!expression(branch, width, polynomial, region)) return false;
+			polynomials.push_back(std::move(polynomial));
+		}
+		if (!normalize_constant_offsets(polynomials, width)) return false;
+		pool<SigSpec> bases;
+		for (auto &polynomial : polynomials)
+			for (auto &term : polynomial)
+				if (term.second.as_bool()) bases.insert(term.first);
+		if (GetSize(bases) == 1)
+			return scaled_base(pmux, polynomials, *bases.begin(), control, region, width);
+		std::vector<SigSpec> sorted(bases.begin(), bases.end());
+		std::sort(sorted.begin(), sorted.end());
+		if (GetSize(bases) == 2)
+			return signed_bases(pmux, polynomials, std::move(sorted), control, region, width);
+		return three_term_sums(pmux, polynomials, std::move(sorted), control, region, width);
 	}
 };
 

@@ -2,7 +2,9 @@
 // 合并相同真值表节点，减少重复译码与选择运算。
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
+#include "kernel/utils.h"
 #include "passes/opt/pmux_celltypes.h"
+#include "passes/opt/pmux_lut_cost.h"
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
@@ -123,22 +125,36 @@ struct PmuxLutWorker {
 	PmuxCellTypes types;
 	struct Driver { Cell *cell = nullptr; int count = 0; };
 	dict<SigBit, Driver> drivers;
-	dict<SigBit, pool<Cell *>> users;
+	dict<SigBit, std::vector<Cell *>> users;
 	pool<SigBit> observed, kept, unknown, input_bits;
 	int budget = 200000;
-	PmuxLutWorker(Module *m, Design *d) : module(m), design(d), sigmap(m), types(m, d) {
-		for (auto wire : module->wires()) for (auto bit : sigmap(wire)) {
-			if (wire->port_input) { drivers[bit].count++; input_bits.insert(bit); }
-			if (wire->port_output || wire->get_bool_attribute(ID::keep)) observed.insert(bit);
-			if (wire->get_bool_attribute(ID::keep)) kept.insert(bit);
+	IdString celltype;
+	bool priority_generic;
+	PmuxLutWorker(Module *m, Design *d, IdString celltype, bool priority_generic) : module(m), design(d), sigmap(m), types(m, d), celltype(celltype), priority_generic(priority_generic) {
+		for (auto wire : module->wires()) {
+			bool keep = wire->get_bool_attribute(ID::keep);
+			if (!wire->port_input && !wire->port_output && !keep) continue;
+			for (auto bit : sigmap(wire)) {
+				if (wire->port_input) { drivers[bit].count++; input_bits.insert(bit); }
+				if (wire->port_output || keep) observed.insert(bit);
+				if (keep) kept.insert(bit);
+			}
 		}
-		for (auto cell : module->cells()) for (auto &port : cell->connections()) {
-			bool input = types.cell_input(cell->type, port.first), output = types.cell_output(cell->type, port.first);
-			for (auto bit : sigmap(port.second)) {
-				if (output) { drivers[bit].count++; drivers[bit].cell = cell; }
-				if (input || !output) users[bit].insert(cell);
-				if (!input && !output) { unknown.insert(bit); observed.insert(bit); }
-				if (cell->get_bool_attribute(ID::keep)) kept.insert(bit);
+		for (auto cell : module->cells()) {
+			bool keep = cell->get_bool_attribute(ID::keep);
+			for (auto &port : cell->connections()) {
+				auto direction = types.cell_port_dir(cell->type, port.first);
+				bool input = direction == RTLIL::PD_INPUT || direction == RTLIL::PD_INOUT;
+				bool output = direction == RTLIL::PD_OUTPUT || direction == RTLIL::PD_INOUT;
+				for (auto bit : sigmap(port.second)) {
+					if (output) { drivers[bit].count++; drivers[bit].cell = cell; }
+					if (input || !output) {
+						auto &list = users[bit];
+						if (list.empty() || list.back() != cell) list.push_back(cell);
+					}
+					if (!input && !output) { unknown.insert(bit); observed.insert(bit); }
+					if (keep) kept.insert(bit);
+				}
 			}
 		}
 	}
@@ -206,12 +222,90 @@ struct PmuxLutWorker {
 		pool<Cell *> expanded, remove;
 		SigSpec y;
 		int reference = 0;
+		int cost = 0, retained = 0;
+		bool priority = false;
+		int cover_before = -1, cover_after = -1;
+		bool extended_priority = false;
 		bool private_decoders = false;
 	};
-	bool private_logic(Plan &plan) {
+	struct PriorityReference {
+		PmuxLutGraph graph;
+		dict<Cell *, std::vector<int>> outputs;
+	};
+	IdString emission_type(const Plan &plan) const {
+		if (priority_generic && plan.priority && (plan.extended_priority || plan.cost == 0)) return IdString();
+		return celltype;
+	}
+	bool priority_cover(Plan &plan, const PriorityReference &reference,
+		const std::vector<int> &original_roots, const std::vector<int> &retained_roots) {
+		PmuxLutCost::LutCostGraph graph(budget);
+		dict<SigBit, std::pair<Cell *, int>> sources;
+		for (auto &entry : reference.outputs) {
+			auto output = sigmap(entry.first->getPort(ID::Y));
+			log_assert(GetSize(output) == GetSize(entry.second));
+			for (int i = 0; i < GetSize(output); i++) {
+				if (--budget < 0) return false;
+				sources[output[i]] = {entry.first, entry.second[i]};
+			}
+		}
+		dict<int, int> original, candidate;
+		pool<int> active;
+		bool valid = true;
+		enum class SourceGraph { Original, Candidate };
+		std::function<int(SourceGraph, int)> import_node = [&](SourceGraph source_graph, int index) -> int {
+			if (--budget < 0) { valid = false; return 0; }
+			bool from_original = source_graph == SourceGraph::Original;
+			if (from_original && !active.insert(index).second) { valid = false; return 0; }
+			auto &cache = from_original ? original : candidate;
+			auto found = cache.find(index);
+			if (found != cache.end()) {
+				if (from_original) active.erase(index);
+				return found->second;
+			}
+			auto &source_nodes = from_original ? reference.graph.nodes : plan.graph.nodes;
+			auto &node = source_nodes.at(index);
+			int result;
+			if (node.inputs.empty()) {
+				auto source = sources.find(node.bit);
+				if (source == sources.end()) result = graph.leaf(node.bit);
+				else {
+					if (!from_original && plan.remove.count(source->second.first)) { valid = false; return 0; }
+					result = import_node(SourceGraph::Original, source->second.second);
+				}
+			} else {
+				std::vector<int> inputs;
+				for (int input : node.inputs) {
+					if (--budget < 0) { valid = false; return 0; }
+					inputs.push_back(import_node(source_graph, input));
+				}
+				result = graph.gate(node.mask, inputs);
+			}
+			if (from_original) active.erase(index);
+			cache[index] = result;
+			return result;
+		};
+		std::vector<int> before, after;
+		for (int root : original_roots) before.push_back(import_node(SourceGraph::Original, root));
+		for (int root : plan.roots) after.push_back(import_node(SourceGraph::Candidate, root));
+		for (int root : retained_roots) after.push_back(import_node(SourceGraph::Original, root));
+		if (!valid || !graph.valid || budget < 0) return false;
+		plan.cover_before = GetSize(graph.cover(before));
+		if (!graph.valid) return false;
+		plan.cover_after = GetSize(graph.cover(after));
+		if (!graph.valid) return false;
+		bool strict = plan.extended_priority || plan.cost == 0;
+		bool accepted = strict ? plan.cover_after < plan.cover_before : plan.cover_after <= plan.cover_before;
+		if (!accepted)
+			log_debug("PMUX LUT priority cover rejected %s: before=%d after=%d strict=%d.\n",
+				log_id(plan.root), plan.cover_before, plan.cover_after, strict);
+		return accepted;
+	}
+	bool private_logic(Plan &plan, PriorityReference *reference = nullptr) {
 		pool<SigBit> referenced;
 		int cost = plan.graph.cost(plan.roots, referenced);
-		if (plan.graph.overflow || cost == 0) return false;
+		bool priority = plan.priority;
+		log_assert(priority == (reference != nullptr));
+		if (plan.graph.overflow || (cost == 0 && !priority)) return false;
 		plan.remove = plan.expanded;
 		plan.remove.insert(plan.root);
 		bool changed;
@@ -223,7 +317,7 @@ struct PmuxLutWorker {
 				bool preserve = !editable(cell);
 				for (auto &port : cell->connections()) if (types.cell_output(cell->type, port.first)) for (auto bit : sigmap(port.second)) {
 					if (observed.count(bit) || kept.count(bit) || referenced.count(bit)) preserve = true;
-					for (auto user : users[bit]) if (!plan.remove.count(user)) preserve = true;
+					for (auto user : reversed(users[bit])) if (!plan.remove.count(user)) preserve = true;
 				}
 				if (preserve) {
 					plan.remove.erase(cell);
@@ -231,26 +325,100 @@ struct PmuxLutWorker {
 				}
 			}
 		} while (changed);
-		if (plan.private_decoders) for (auto cell : plan.expanded) if (!plan.remove.count(cell)) return false;
+		bool all_private = plan.private_decoders || (priority && (plan.extended_priority || cost == 0));
+		if (all_private)
+			for (auto cell : plan.expanded) if (!plan.remove.count(cell)) return false;
 		// 使用固定点后实际可删除的控制逻辑核算剩余成本。
 		int retained = 0;
-		for (auto cell : plan.expanded) if (!plan.remove.count(cell)) {
-			int width = cell->hasPort(ID::A) ? GetSize(cell->getPort(ID::A)) : 1;
-			retained += std::max(1, (width+1)/3);
+		std::vector<int> original_roots, retained_roots;
+		if (priority) {
+			if ((budget -= 2*GetSize(reference->graph.nodes)) < 0) return false;
+			original_roots = reference->outputs.at(plan.root);
+			for (auto cell : plan.expanded) if (!plan.remove.count(cell)) {
+				auto &roots = reference->outputs.at(cell);
+				original_roots.insert(original_roots.end(), roots.begin(), roots.end());
+				retained_roots.insert(retained_roots.end(), roots.begin(), roots.end());
+			}
+			pool<SigBit> original_inputs, retained_inputs;
+			plan.reference = reference->graph.cost(original_roots, original_inputs);
+			retained = reference->graph.cost(retained_roots, retained_inputs);
+		} else {
+			for (auto cell : plan.expanded) if (!plan.remove.count(cell)) {
+				int width = cell->hasPort(ID::A) ? GetSize(cell->getPort(ID::A)) : 1;
+				retained += std::max(1, (width+1)/3);
+			}
 		}
 		if (cost + retained >= plan.reference) return false;
+		plan.cost = cost;
+		plan.retained = retained;
 		pool<SigBit> outputs;
 		dict<SigBit, int> state;
 		for (auto bit : plan.y) outputs.insert(bit);
 		for (auto bit : referenced) if (!upstream(bit, outputs, state)) return false;
+		if (priority && (emission_type(plan).empty() || plan.extended_priority || cost == 0) &&
+			!priority_cover(plan, *reference, original_roots, retained_roots)) return false;
+		plan.graph.leaves = dict<SigBit, int>();
+		plan.graph.shared.clear();
 		return true;
 	}
-	bool priority(Cell *cell, Plan &plan) {
+	int priority_reference(PriorityReference &reference, const std::vector<Cell *> &chain, const std::vector<SigBit> &select,
+			const std::vector<SigSpec> &data, int width) {
+		auto &g = reference.graph;
+		std::vector<int> previous(width, g.leaf(State::S0));
+		for (int depth = 3; depth >= 0; depth--) {
+			auto &outputs = reference.outputs[chain[depth]];
+			int s = g.leaf(select[depth]);
+			for (int j = 0; j < width; j++) {
+				if (--budget < 0) return -1;
+				outputs.push_back(g.mux(previous[j], g.leaf(data[depth][j]), s));
+			}
+			previous = outputs;
+		}
+		if (g.overflow || (budget -= GetSize(g.nodes)) < 0) return -1;
+		pool<SigBit> referenced;
+		return g.cost(previous, referenced);
+	}
+	int priority_function(PmuxLutGraph &g, const std::vector<int> &select, const std::vector<int> &data,
+			int first, int last, int previous) {
+		if ((budget -= 1+2*(last-first)) < 0) return -1;
+		std::vector<int> inputs;
+		auto add = [&](int index) {
+			auto &node = g.nodes[index];
+			if (node.inputs.empty() && !node.bit.wire) {
+				log_assert(node.bit.data <= State::S1);
+				return;
+			}
+			if (std::find(inputs.begin(), inputs.end(), index) == inputs.end()) inputs.push_back(index);
+		};
+		add(previous);
+		for (int depth = first; depth < last; depth++) {
+			add(select[depth]);
+			add(data[depth]);
+		}
+		if (GetSize(inputs) > 4) return -1;
+		if ((budget -= 1 << GetSize(inputs)) < 0) return -1;
+		// 每颗 LUT 覆盖完整优先子函数，保留未知控制下的已知输出。
+		return g.function(inputs, [&](int code) {
+			auto value = [&](int index) {
+				auto &node = g.nodes[index];
+				if (node.inputs.empty() && !node.bit.wire) return node.bit == State::S1;
+				auto found = std::find(inputs.begin(), inputs.end(), index);
+				log_assert(found != inputs.end());
+				return bool(code & (1 << (found-inputs.begin())));
+			};
+			bool result = value(previous);
+			for (int depth = last-1; depth >= first; depth--)
+				if (value(select[depth])) result = value(data[depth]);
+			return result;
+		});
+	}
+	bool priority(Cell *cell, Plan &plan, PriorityReference &reference) {
 		if (cell->type != ID($mux) || !editable(cell)) return false;
 		int width = GetSize(cell->getPort(ID::Y));
 		if (width < 2 || width > 128) return false;
 		std::vector<SigBit> select;
 		std::vector<SigSpec> data;
+		std::vector<Cell *> chain;
 		auto current = cell;
 		for (int depth = 0; depth < 4; depth++) {
 			if (!editable(current) || current->type != ID($mux) || GetSize(current->getPort(ID::Y)) != width ||
@@ -258,6 +426,7 @@ struct PmuxLutWorker {
 			select.push_back(sigmap(current->getPort(ID::S))[0]);
 			data.push_back(sigmap(current->getPort(ID::B)));
 			plan.expanded.insert(current);
+			chain.push_back(current);
 			auto a = sigmap(current->getPort(ID::A));
 			if (depth == 3) {
 				if (a != SigSpec(State::S0, width)) return false;
@@ -276,13 +445,31 @@ struct PmuxLutWorker {
 		}
 		for (int j = 0; j < width; j++) {
 			pool<SigBit> distinct;
-			for (int i = 0; i < 4; i++) if (!data[i][j].wire || !distinct.insert(data[i][j]).second) return false;
-			int u = g.function({s[0], g.leaf(data[0][j]), s[1], g.leaf(data[1][j])}, [](int c) { return c & 1 ? bool(c & 2) : bool((c & 4) && (c & 8)); });
-			int v = g.function({s[2], g.leaf(data[2][j]), s[3], g.leaf(data[3][j])}, [](int c) { return c & 1 ? bool(c & 2) : bool((c & 4) && (c & 8)); });
-			plan.roots.push_back(g.function({s[0], s[1], u, v}, [](int c) { return c & 3 ? bool(c & 4) : bool(c & 8); }));
+			std::vector<int> d;
+			for (int i = 0; i < 4; i++) {
+				auto bit = data[i][j];
+				if (!bit.wire && bit.data > State::S1) return false;
+				if (!bit.wire || !distinct.insert(bit).second) plan.extended_priority = true;
+				d.push_back(g.leaf(bit));
+			}
+			int root = priority_function(g, s, d, 0, 4, g.leaf(State::S0));
+			if (budget < 0) return false;
+			if (root < 0) {
+				int v = priority_function(g, s, d, 2, 4, g.leaf(State::S0));
+				if (budget < 0) return false;
+				log_assert(v >= 0);
+				root = priority_function(g, s, d, 0, 2, v);
+				if (budget < 0) return false;
+				if (root < 0) {
+					if ((budget -= 2) < 0) return false;
+					root = g.mux(g.mux(v, d[1], s[1]), d[0], s[0]);
+				}
+			}
+			plan.roots.push_back(root);
 		}
-		plan.reference = 4*width;
-		return true;
+		plan.priority = true;
+		plan.reference = priority_reference(reference, chain, select, data, width);
+		return plan.reference >= 0;
 	}
 	bool onehot(Plan &plan, const std::vector<Cube> &cubes, const SigSpec &a, const SigSpec &b) {
 		int branches = GetSize(cubes), width = GetSize(a);
@@ -474,7 +661,10 @@ struct PmuxLutWorker {
 		if (!editable(cell)) return false;
 		plan.root = cell;
 		plan.y = sigmap(cell->getPort(ID::Y));
-		if (cell->type == ID($mux)) return priority(cell, plan) && private_logic(plan);
+		if (cell->type == ID($mux)) {
+			PriorityReference reference;
+			return priority(cell, plan, reference) && private_logic(plan, &reference);
+		}
 		if (cell->type != ID($pmux)) return false;
 		auto a = sigmap(cell->getPort(ID::A)), b = sigmap(cell->getPort(ID::B)), s = sigmap(cell->getPort(ID::S));
 		int width = GetSize(plan.y), branches = GetSize(s);
@@ -482,20 +672,15 @@ struct PmuxLutWorker {
 		for (auto bit : b) if (!bit.wire && bit.data > State::S1) return false;
 		std::vector<Cube> cubes(branches);
 		for (int i = 0; i < branches; i++) if (!decode(s[i], cubes[i], plan.expanded)) return false;
-		Plan trial = plan;
-		if (leading(trial, cubes, a, b) && private_logic(trial)) {
-			plan = std::move(trial);
-			return true;
-		}
-		trial = plan;
-		if (onehot(trial, cubes, a, b) && private_logic(trial)) {
-			plan = std::move(trial);
-			return true;
-		}
-		trial = plan;
-		if (encoded(trial, cubes, a, b) && private_logic(trial)) {
-			plan = std::move(trial);
-			return true;
+		for (auto build : {&PmuxLutWorker::leading, &PmuxLutWorker::onehot, &PmuxLutWorker::encoded}) {
+			Plan trial;
+			trial.root = plan.root;
+			trial.y = plan.y;
+			trial.expanded = plan.expanded;
+			if ((this->*build)(trial, cubes, a, b) && private_logic(trial)) {
+				plan = std::move(trial);
+				return true;
+			}
 		}
 		return false;
 	}
@@ -523,11 +708,19 @@ struct PmuxLutWorker {
 		cache[index] = SigBit(wire);
 		return SigBit(wire);
 	}
-	void commit(Plan &plan, IdString celltype) {
+	void commit(Plan &plan) {
 		log_assert(GetSize(plan.y) == GetSize(plan.roots));
 		dict<int, SigBit> cache;
 		SigSpec result;
-		for (int root : plan.roots) result.append(materialize(plan, root, cache, celltype));
+		IdString emitted_type = emission_type(plan);
+		for (int root : plan.roots) result.append(materialize(plan, root, cache, emitted_type));
+		if (plan.priority) {
+			log_assert(GetSize(cache) == plan.cost);
+			log_debug("PMUX LUT priority %s: reference=%d candidate=%d retained=%d removed=%d emitted=%d.\n",
+				log_id(plan.root), plan.reference, plan.cost, plan.retained, GetSize(plan.remove), GetSize(cache));
+			if (plan.cover_before >= 0)
+				log_debug("PMUX LUT priority cover %s: before=%d after=%d.\n", log_id(plan.root), plan.cover_before, plan.cover_after);
+		}
 		module->connect(plan.y, result);
 		for (auto cell : plan.remove) module->remove(cell);
 	}
@@ -536,20 +729,28 @@ struct PmuxLutWorker {
 struct OptPmuxLutPass : public Pass {
 	OptPmuxLutPass() : Pass("opt_pmuxlut", "construct bounded shared LUT4 selection networks") {}
 	void help() override {
-		log("    opt_pmuxlut [-lut4 <celltype>] [selection]\n\n");
+		log("    opt_pmuxlut [-lut4 <celltype>] [-priority-generic] [selection]\n\n");
 		log("Recognize complete equality tables, single-active-bit tables, consecutive\n");
 		log("leading-zero prefixes and four-level priority selectors. Preserve defaults\n");
 		log("and all priority conditions. Emit shared four-input $lut cells by default.\n");
 		log("-lut4 emits Intel-style dataa/datab/datac/datad/combout cells with lut_mask\n");
 		log("and sum_lutc_input=datac. Run after proc and width reduction, before techmap.\n");
+		log("-priority-generic emits $lut cells for repeated-data, constant-data and\n");
+		log("zero-LUT priority rewrites for subsequent general logic mapping. Ordinary\n");
+		log("priority networks and the other families follow -lut4.\n");
 	}
 	void execute(std::vector<std::string> args, Design *design) override {
 		IdString celltype;
+		bool priority_generic = false;
 		size_t argidx = 1;
-		if (argidx < args.size() && args[argidx] == "-lut4") {
-			if (argidx+1 >= args.size()) log_cmd_error("Missing cell type for -lut4.\n");
-			celltype = RTLIL::escape_id(args[argidx+1]);
-			argidx += 2;
+		for (; argidx < args.size(); argidx++) {
+			if (args[argidx] == "-lut4") {
+				if (argidx+1 >= args.size()) log_cmd_error("Missing cell type for -lut4.\n");
+				celltype = RTLIL::escape_id(args[++argidx]);
+				continue;
+			}
+			if (args[argidx] == "-priority-generic") { priority_generic = true; continue; }
+			break;
 		}
 		extra_args(args, argidx, design);
 		for (auto module : design->selected_modules()) {
@@ -559,20 +760,20 @@ struct OptPmuxLutPass : public Pass {
 				if (cell->type == ID($pmux) && GetSize(cell->getPort(ID::S)) >= 4 && GetSize(cell->getPort(ID::S)) <= 16) candidates.push_back(cell);
 			}
 			if (candidates.empty()) continue;
-			PmuxLutWorker worker(module, design);
-			std::vector<PmuxLutWorker::Plan> plans;
+			PmuxLutWorker worker(module, design, celltype, priority_generic);
+			std::vector<std::unique_ptr<PmuxLutWorker::Plan>> plans;
 			pool<Cell *> reserved;
 			for (auto cell : candidates) {
 				if (worker.budget < 0) break;
-				PmuxLutWorker::Plan plan;
-				if (!worker.candidate(cell, plan)) continue;
+				auto plan = std::make_unique<PmuxLutWorker::Plan>();
+				if (!worker.candidate(cell, *plan)) continue;
 				bool overlap = false;
-				for (auto remove : plan.remove) if (reserved.count(remove)) overlap = true;
+				for (auto remove : plan->remove) if (reserved.count(remove)) overlap = true;
 				if (overlap) continue;
-				for (auto remove : plan.remove) reserved.insert(remove);
+				for (auto remove : plan->remove) reserved.insert(remove);
 				plans.push_back(std::move(plan));
 			}
-			for (auto &plan : plans) worker.commit(plan, celltype);
+			for (auto &plan : plans) worker.commit(*plan);
 		}
 	}
 } OptPmuxLutPass;

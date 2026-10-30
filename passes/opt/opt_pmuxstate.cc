@@ -18,38 +18,48 @@ struct PmuxStateWorker {
 	dict<SigBit, pool<Cell *>> users;
 	pool<SigBit> protected_bits, kept_bits, conflicted, input_bits;
 	pool<Cell *> removed;
-	int budget = 262144;
+	pool<Cell *> onehot_states;
+	int proved_states = 0, reused_states = 0, proved_muxes = 0, proved_permutations = 0;
+	int compressed_groups = 0;
+	int &budget;
 
-	PmuxStateWorker(Module *module, Design *design) : module(module), design(design), sigmap(module), initvals(&sigmap, module), types(module, design)
+	PmuxStateWorker(Module *module, Design *design, int &budget) : module(module), design(design), sigmap(module), initvals(&sigmap, module), types(module, design), budget(budget)
 	{
 		for (auto wire : module->wires()) {
+			bool keep = wire->get_bool_attribute(ID::keep);
+			if (!wire->port_input && !wire->port_output && !keep) continue;
 			for (auto bit : sigmap(wire)) {
 				if (wire->port_input) {
 					drivers[bit] = nullptr;
 					input_bits.insert(bit);
 				}
-				if (wire->port_output || wire->get_bool_attribute(ID::keep)) protected_bits.insert(bit);
-				if (wire->get_bool_attribute(ID::keep)) kept_bits.insert(bit);
+				if (wire->port_output || keep) protected_bits.insert(bit);
+				if (keep) kept_bits.insert(bit);
 			}
 		}
-		for (auto cell : module->cells()) for (auto &port : cell->connections()) {
-			bool input = types.cell_input(cell->type, port.first), output = types.cell_output(cell->type, port.first);
-			for (auto bit : sigmap(port.second)) {
-				if (output) {
-					if (drivers.count(bit)) {
-						drivers[bit] = nullptr;
-						conflicted.insert(bit);
-					} else {
-						drivers[bit] = cell;
+		for (auto cell : module->cells()) {
+			bool keep = cell->get_bool_attribute(ID::keep);
+			for (auto &port : cell->connections()) {
+				auto direction = types.cell_port_dir(cell->type, port.first);
+				bool input = direction == RTLIL::PD_INPUT || direction == RTLIL::PD_INOUT;
+				bool output = direction == RTLIL::PD_OUTPUT || direction == RTLIL::PD_INOUT;
+				for (auto bit : sigmap(port.second)) {
+					if (output) {
+						if (drivers.count(bit)) {
+							drivers[bit] = nullptr;
+							conflicted.insert(bit);
+						} else {
+							drivers[bit] = cell;
+						}
 					}
-				}
-				if (input || !output) users[bit].insert(cell);
-				if ((!input && !output) || cell->get_bool_attribute(ID::keep)) {
-					protected_bits.insert(bit);
-					kept_bits.insert(bit);
-					if (!input && !output) {
-						drivers[bit] = nullptr;
-						conflicted.insert(bit);
+					if (input || !output) users[bit].insert(cell);
+					if ((!input && !output) || keep) {
+						protected_bits.insert(bit);
+						kept_bits.insert(bit);
+						if (!input && !output) {
+							drivers[bit] = nullptr;
+							conflicted.insert(bit);
+						}
 					}
 				}
 			}
@@ -161,7 +171,82 @@ struct PmuxStateWorker {
 		return GetSize(expected) == GetSize(q) && actual == expected;
 	}
 
-	void decode_onehot(Cell *cell)
+	struct OnehotUpdate {
+		pool<Cell *> active, muxes;
+		dict<SigSpec, int> heights;
+		pool<SigSpec> permutations;
+	};
+
+	bool onehot_update(SigSpec value, const SigSpec &q, OnehotUpdate &proof, int &height, int depth = 0)
+	{
+		if (depth > 8 || GetSize(value) != GetSize(q) || !spend(GetSize(value))) return false;
+		value = sigmap(value);
+		auto found = proof.heights.find(value);
+		if (found != proof.heights.end()) {
+			height = found->second;
+			return depth + height <= 8;
+		}
+		if (permutation(value, q)) {
+			proof.permutations.insert(value);
+			proof.heights[value] = 0;
+			height = 0;
+			return true;
+		}
+		if (value.is_fully_def() && onehot(value.as_const())) {
+			proof.heights[value] = 0;
+			height = 0;
+			return true;
+		}
+		auto cell = driver(value[0]);
+		if (!editable(cell) || cell->type != ID($mux) || sigmap(cell->getPort(ID::Y)) != value) return false;
+		if (GetSize(cell->getPort(ID::A)) != GetSize(q) || GetSize(cell->getPort(ID::B)) != GetSize(q) ||
+			GetSize(cell->getPort(ID::S)) != 1) return false;
+		if (proof.active.count(cell) || (!proof.muxes.count(cell) && GetSize(proof.muxes) >= 16)) return false;
+		if (!spend(2 * GetSize(q) + 1)) return false;
+		proof.active.insert(cell);
+		proof.muxes.insert(cell);
+		int a_height = 0, b_height = 0;
+		bool valid = onehot_update(cell->getPort(ID::A), q, proof, a_height, depth + 1) &&
+			onehot_update(cell->getPort(ID::B), q, proof, b_height, depth + 1);
+		proof.active.erase(cell);
+		if (!valid) return false;
+		height = 1 + std::max(a_height, b_height);
+		log_assert(depth + height <= 8);
+		proof.heights[value] = height;
+		return true;
+	}
+
+	bool prove_onehot_state(Cell *state)
+	{
+		if (onehot_states.count(state)) {
+			reused_states++;
+			return true;
+		}
+		if (!ff_type(state) || !editable(state, ID::Q)) return false;
+		FfData ff(&initvals, state);
+		auto q = sigmap(ff.sig_q);
+		int width = GetSize(q);
+		if (!ff.has_clk || ff.has_aload || ff.has_sr || width < 2 || width > 64 || !spend(width)) return false;
+		pool<SigBit> unique(q.begin(), q.end());
+		if (GetSize(unique) != width || GetSize(ff.val_init) != width || !onehot(ff.val_init)) return false;
+		if (ff.has_arst && (GetSize(ff.val_arst) != width || !onehot(ff.val_arst))) return false;
+		if (ff.has_srst && (GetSize(ff.val_srst) != width || !onehot(ff.val_srst))) return false;
+		OnehotUpdate proof;
+		int height = 0;
+		if (!onehot_update(ff.sig_d, q, proof, height)) return false;
+		onehot_states.insert(state);
+		proved_states++;
+		proved_muxes += GetSize(proof.muxes);
+		proved_permutations += GetSize(proof.permutations);
+		return true;
+	}
+
+	struct OnehotDecode {
+		Cell *cell;
+		SigBit replacement;
+	};
+
+	void collect_onehot_decode(Cell *cell, std::vector<OnehotDecode> &replacements)
 	{
 		if (!editable(cell) || !cell->type.in(ID($eq), ID($logic_not)) || GetSize(cell->getPort(ID::Y)) != 1) return;
 		auto q = sigmap(cell->getPort(ID::A));
@@ -172,16 +257,29 @@ struct PmuxStateWorker {
 		constant.extend_u0(GetSize(q));
 		if (!onehot(constant.as_const())) return;
 		auto state = driver(q[0]);
-		if (!ff_type(state) || !editable(state, ID::Q)) return;
-		FfData ff(&initvals, state);
-		if (!ff.has_clk || ff.has_aload || ff.has_sr || sigmap(ff.sig_q) != q || !onehot(ff.val_init)) return;
-		if ((ff.has_arst && !onehot(ff.val_arst)) || (ff.has_srst && !onehot(ff.val_srst))) return;
-		if (!permutation(sigmap(ff.sig_d), q)) return;
-		// 初始条件与每种 reset 均为 onehot；双射置换和 enable 保持使不变量逐步成立。
+		if (!ff_type(state) || sigmap(state->getPort(ID::Q)) != q || !prove_onehot_state(state)) return;
 		int index = 0;
 		while (constant[index] != State::S1) index++;
-		module->connect(cell->getPort(ID::Y), q[index]);
-		removed.insert(cell);
+		replacements.push_back({cell, q[index]});
+	}
+
+	bool rewrite_onehot_decodes()
+	{
+		std::vector<OnehotDecode> replacements;
+		for (auto cell : module->selected_cells()) {
+			if (budget <= 0) break;
+			collect_onehot_decode(cell, replacements);
+		}
+		onehot_states.clear();
+		for (auto &item : replacements) {
+			log_assert(editable(item.cell));
+			module->connect(item.cell->getPort(ID::Y), item.replacement);
+		}
+		for (auto &item : replacements) module->remove(item.cell);
+		if (!replacements.empty())
+			log("opt_pmuxstate %s: onehot_states=%d reuses=%d update_muxes=%d permutations=%d decodes=%d.\n",
+				log_id(module), proved_states, reused_states, proved_muxes, proved_permutations, GetSize(replacements));
+		return !replacements.empty();
 	}
 
 	struct Decode {
@@ -215,6 +313,12 @@ struct PmuxStateWorker {
 			for (auto user : users[bit]) if (!removed.count(user) && !allowed.count(user)) return false;
 		}
 		return true;
+	}
+
+	void index_inputs(Cell *cell)
+	{
+		for (auto &port : cell->connections()) if (types.cell_input(cell->type, port.first))
+			for (auto bit : sigmap(port.second)) users[bit].insert(cell);
 	}
 
 	void compress(Cell *cell)
@@ -278,9 +382,10 @@ struct PmuxStateWorker {
 			if (!private_to(sigmap(item->getPort(ID::Y)), old_cells)) return;
 		for (auto signal : {new_b, new_s, sigmap(ff.sig_clk)}) for (auto bit : signal)
 			if (old_cells.count(driver(bit))) return;
+		if (!spend(2 * width + GetSize(new_b) + GetSize(new_s) + 1)) return;
 		// 关系 y=M(sr,bank) 在初始条件成立；每个时钟边沿所选 bank 捕获对应输入，因此关系经一步保持。
 		auto input = module->addWire(NEW_ID, width);
-		module->addPmux(NEW_ID, cell->getPort(ID::A), new_b, new_s, input);
+		auto shared_mux = module->addPmux(NEW_ID, cell->getPort(ID::A), new_b, new_s, input);
 		FfData output(module, &initvals, NEW_ID);
 		output.has_clk = true;
 		output.pol_clk = ff.pol_clk;
@@ -289,20 +394,35 @@ struct PmuxStateWorker {
 		output.sig_q = cell->getPort(ID::Y);
 		output.sig_d = input;
 		output.val_init = output_init;
-		output.emit();
+		auto shared_ff = output.emit();
+		log_assert(shared_ff);
+		index_inputs(shared_mux);
+		index_inputs(shared_ff);
 		for (auto old : old_cells) {
 			if (ff_type(old)) initvals.remove_init(sigmap(old->getPort(ID::Q)));
 			removed.insert(old);
 		}
+		compressed_groups++;
 	}
 
-	void run()
+	bool compress_banks()
 	{
 		auto cells = module->selected_cells();
 		for (auto cell : cells) if (cell->type == ID($pmux) && budget > 0) compress(cell);
-		for (auto cell : cells) if (!removed.count(cell) && budget > 0) decode_onehot(cell);
-		for (auto cell : cells) if (!removed.count(cell) && budget > 0) specialize(cell);
+		if (removed.empty()) return false;
+		int count = GetSize(removed);
 		for (auto cell : removed) module->remove(cell);
+		removed.clear();
+		log("opt_pmuxstate %s: compressed_bank_groups=%d removed_cells=%d.\n", log_id(module), compressed_groups, count);
+		return true;
+	}
+
+	void specialize_branches()
+	{
+		for (auto cell : module->selected_cells()) {
+			if (budget <= 0) break;
+			specialize(cell);
+		}
 	}
 };
 
@@ -312,7 +432,7 @@ struct OptPmuxStatePass : Pass {
 	{
 		log("    opt_pmuxstate [selection]\n\n");
 		log("Propagate branch-local comparison facts into mux data.\n");
-		log("Replace onehot equality decodes after proving initialization and permutation transitions.\n");
+		log("Replace onehot equality decodes after proving initialized bounded mux updates.\n");
 		log("Compress private, initialized, synchronously captured banks with complete binary selection.\n");
 	}
 	void execute(std::vector<std::string> args, Design *design) override
@@ -324,7 +444,18 @@ struct OptPmuxStatePass : Pass {
 				candidate = true;
 				break;
 			}
-			if (candidate) PmuxStateWorker(module, design).run();
+			if (!candidate) continue;
+			int budget = 262144;
+			auto worker = std::make_unique<PmuxStateWorker>(module, design, budget);
+			if (worker->compress_banks()) {
+				worker.reset();
+				worker = std::make_unique<PmuxStateWorker>(module, design, budget);
+			}
+			if (worker->rewrite_onehot_decodes()) {
+				worker.reset();
+				worker = std::make_unique<PmuxStateWorker>(module, design, budget);
+			}
+			worker->specialize_branches();
 		}
 	}
 } OptPmuxStatePass;
