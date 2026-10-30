@@ -269,7 +269,9 @@ struct PmuxSelectWorker {
 		}
 		for (auto cell : module->cells()) for (auto &port : cell->connections()) {
 			auto signal = sigmap(port.second);
-			bool output = types.cell_output(cell->type, port.first), input = types.cell_input(cell->type, port.first);
+			auto direction = types.cell_port_dir(cell->type, port.first);
+			bool output = direction == RTLIL::PD_OUTPUT || direction == RTLIL::PD_INOUT;
+			bool input = direction == RTLIL::PD_INPUT || direction == RTLIL::PD_INOUT;
 			for (int i = 0; i < GetSize(signal); i++) {
 				auto bit = signal[i];
 				if (output) {
@@ -291,10 +293,31 @@ struct PmuxSelectWorker {
 	bool unique(SigBit bit) const {
 		return bit.wire && !unknown.count(bit) && drivers.count(bit) && drivers.at(bit).count == 1;
 	}
-	bool editable(Cell *cell) const {
+	const SigSpec &normalized_port(Cell *cell, IdString name) {
+		auto &ports = cost_ports[cell];
+		auto found = ports.find(name);
+		if (found != ports.end()) return found->second;
+		return ports[name] = sigmap(cell->getPort(name));
+	}
+	RTLIL::PortDir port_direction(Cell *cell, IdString name) {
+		auto &directions = cost_directions[cell];
+		auto found = directions.find(name);
+		if (found != directions.end()) return found->second;
+		return directions[name] = types.cell_port_dir(cell->type, name);
+	}
+	static bool candidate_shape(Cell *cell) {
+		if (cell->type != ID($pmux) || cell->get_bool_attribute(ID::keep) || !cell->hasParam(ID::WIDTH) ||
+			!cell->hasParam(ID::S_WIDTH) || !cell->hasPort(ID::A) || !cell->hasPort(ID::B) ||
+			!cell->hasPort(ID::S) || !cell->hasPort(ID::Y)) return false;
+		int width = GetSize(cell->getPort(ID::Y)), branches = GetSize(cell->getPort(ID::S));
+		return width >= 1 && width <= 256 && branches >= 3 && branches <= 64 &&
+			cell->getParam(ID::WIDTH).as_int() == width && cell->getParam(ID::S_WIDTH).as_int() == branches &&
+			GetSize(cell->getPort(ID::A)) == width && GetSize(cell->getPort(ID::B)) == width*branches;
+	}
+	bool editable(Cell *cell) {
 		if (!design->selected(module, cell) || cell->get_bool_attribute(ID::keep) || !cell->hasPort(ID::Y)) return false;
 		pool<SigBit> outputs;
-		for (auto bit : sigmap(cell->getPort(ID::Y)))
+		for (auto bit : normalized_port(cell, ID::Y))
 			if (!unique(bit) || drivers.at(bit).cell != cell || kept.count(bit) || !outputs.insert(bit).second) return false;
 		return true;
 	}
@@ -316,10 +339,8 @@ struct PmuxSelectWorker {
 			for (auto &port : cell->connections()) {
 				if (!cost_spend()) return false;
 				if (!cost_spend(GetSize(port.second))) return false;
-				auto signal = sigmap(port.second);
-				cost_ports[cell][port.first] = signal;
-				auto direction = types.cell_port_dir(cell->type, port.first);
-				cost_directions[cell][port.first] = direction;
+				auto signal = normalized_port(cell, port.first);
+				auto direction = port_direction(cell, port.first);
 				bool input = direction == RTLIL::PD_INPUT || direction == RTLIL::PD_INOUT;
 				bool output = direction == RTLIL::PD_OUTPUT;
 				if (!input && output) continue;
@@ -340,7 +361,7 @@ struct PmuxSelectWorker {
 		SigSpec y, inner_y;
 	};
 	bool wrapper(Cell *cell, Wrapper &result) {
-		auto y = sigmap(cell->getPort(ID::Y));
+		auto y = normalized_port(cell, ID::Y);
 		log_assert(!y.empty());
 		auto found = users.find(y[0]);
 		if (found == users.end() || GetSize(found->second) != 1) return false;
@@ -419,6 +440,11 @@ struct PmuxSelectWorker {
 		return true;
 	}
 	enum class SourceState { Active, Logic, HighZ };
+	struct SourceCell { int inputs = 0; bool active = true, incoming_z = false; };
+	struct SourceContext {
+		dict<SigBit, SourceState> bits;
+		dict<Cell *, SourceCell> cells;
+	};
 	bool source_z(SigBit bit, const dict<SigBit, SourceState> &state) const {
 		if (!bit.wire) return bit == State::Sz;
 		auto found = state.find(bit);
@@ -450,14 +476,14 @@ struct PmuxSelectWorker {
 			result = source_z(operand(cell, ID::A, offset), state);
 		} else if (cell->type == ID($mux)) {
 			if (!spend(GetSize(cell->getPort(ID::A)) + GetSize(cell->getPort(ID::B)) + 4)) return false;
-			auto s = sigmap(cell->getPort(ID::S));
+			auto s = normalized_port(cell, ID::S);
 			log_assert(GetSize(s) == 1);
 			result = false;
 			if (s[0] != State::S1) result |= source_z(operand(cell, ID::A, offset), state);
 			if (s[0] != State::S0) result |= source_z(operand(cell, ID::B, offset), state);
 		} else if (cell->type == ID($pmux)) {
 			if (!spend(2*GetSize(cell->getPort(ID::A)) + 2*GetSize(cell->getPort(ID::B)) + 4*GetSize(cell->getPort(ID::S)))) return false;
-			auto a = sigmap(cell->getPort(ID::A)), b = sigmap(cell->getPort(ID::B)), s = sigmap(cell->getPort(ID::S));
+			auto a = normalized_port(cell, ID::A), b = normalized_port(cell, ID::B), s = normalized_port(cell, ID::S);
 			log_assert(offset >= 0 && offset < GetSize(a) && GetSize(b) == GetSize(a)*GetSize(s));
 			int selected = -1;
 			for (int i = 0; i < GetSize(s); i++) if (s[i] == State::S1) {
@@ -473,7 +499,8 @@ struct PmuxSelectWorker {
 		return true;
 	}
 	// 只穿过组合单元检查依赖；时序单元的输出作为独立输入边界。
-	bool upstream(SigBit bit, const pool<SigBit> &outputs, dict<SigBit, SourceState> &state) {
+	bool upstream(SigBit bit, const pool<SigBit> &outputs, SourceContext &context) {
+		auto &state = context.bits;
 		if (!spend() || outputs.count(bit) || unknown.count(bit)) return false;
 		if (!bit.wire) return !drivers.count(bit);
 		if (!unique(bit)) return false;
@@ -484,11 +511,23 @@ struct PmuxSelectWorker {
 		if (!types.cell_evaluable(cell->type)) return false;
 		state[bit] = SourceState::Active;
 		bool incoming_z = false;
-		for (auto &port : cell->connections()) if (types.cell_input(cell->type, port.first)) {
-			for (auto input : sigmap(port.second)) {
-				if (!upstream(input, outputs, state)) return false;
-				incoming_z |= source_z(input, state);
+		auto cached = context.cells.find(cell);
+		if (cached != context.cells.end()) {
+			if (cached->second.active || !spend(cached->second.inputs)) return false;
+			incoming_z = cached->second.incoming_z;
+		} else {
+			context.cells[cell];
+			int inputs = 0;
+			for (auto &port : cell->connections()) {
+				auto direction = port_direction(cell, port.first);
+				if (direction != RTLIL::PD_INPUT && direction != RTLIL::PD_INOUT) continue;
+				for (auto input : normalized_port(cell, port.first)) {
+					if (!upstream(input, outputs, context)) return false;
+					incoming_z |= source_z(input, state);
+					inputs++;
+				}
 			}
+			context.cells[cell] = {inputs, false, incoming_z};
 		}
 		bool high_z;
 		if (!forwarded_z(cell, driver.offset, state, incoming_z, high_z)) return false;
@@ -717,11 +756,9 @@ struct PmuxSelectWorker {
 		return true;
 	}
 	bool selection_table(Cell *cell, bool expand, Selection &result) {
-		if (!editable(cell)) return false;
-		auto a = sigmap(cell->getPort(ID::A)), b = sigmap(cell->getPort(ID::B)), s = sigmap(cell->getPort(ID::S)), y = sigmap(cell->getPort(ID::Y));
+		if (!candidate_shape(cell) || !editable(cell)) return false;
+		auto s = normalized_port(cell, ID::S), y = normalized_port(cell, ID::Y);
 		int width = GetSize(y), branches = GetSize(s);
-		if (width < 1 || width > 256 || branches < 3 || branches > 64 || cell->getParam(ID::WIDTH).as_int() != width ||
-			cell->getParam(ID::S_WIDTH).as_int() != branches || GetSize(a) != width || GetSize(b) != width*branches) return false;
 		ControlContext context;
 		context.expand = expand;
 		std::vector<Function> select(branches);
@@ -791,17 +828,44 @@ struct PmuxSelectWorker {
 		for (auto value : f.table) values.push_back(graph.leaf(value));
 		return build(graph, values, f.support, state);
 	}
-	int reference_tree(const std::vector<SigBit> &table, const std::vector<int> &permuted, int depth, int code, std::map<std::vector<SigBit>, int> &memo) {
-		std::vector<SigBit> values;
-		for (int c = 0; c < (GetSize(permuted) >> depth); c++)
-			values.push_back(table[permuted[code | (c << depth)]]);
-		if (!spend(GetSize(values))) return 0;
-		bool same = true;
-		for (auto value : values) if (value != values[0]) same = false;
-		if (same) return 0;
-		if (memo.count(values)) return 0;
-		memo[values] = 1;
-		return 1 + reference_tree(table, permuted, depth+1, code, memo) + reference_tree(table, permuted, depth+1, code | (1 << depth), memo);
+	int reference_tree(const std::vector<SigBit> &table, const std::vector<int> &permuted) {
+		struct Node { int a, b; };
+		std::array<Node, 127> nodes;
+		std::array<int, 64> refs;
+		std::array<bool, 127> seen = {};
+		dict<SigBit, int> leaves;
+		dict<std::tuple<int, int, int>, int> unique;
+		int count = 0, size = GetSize(permuted), depth = 0;
+		log_assert(size > 0 && size <= 64 && !(size & (size-1)));
+		for (int code = 0; code < size; code++) {
+			auto bit = table[permuted[code]];
+			auto found = leaves.find(bit);
+			if (found != leaves.end()) refs[code] = found->second;
+			else {
+				refs[code] = leaves[bit] = count;
+				nodes[count++] = {-1, -1};
+			}
+		}
+		while ((1 << depth) < size) depth++;
+		for (int level = depth-1; level >= 0; level--) for (int code = 0; code < (1 << level); code++) {
+			int a = refs[code], b = refs[code | (1 << level)];
+			if (a == b && nodes[a].a < 0) continue;
+			auto key = std::make_tuple(level, a, b);
+			auto found = unique.find(key);
+			if (found != unique.end()) refs[code] = found->second;
+			else {
+				log_assert(count < GetSize(nodes));
+				refs[code] = unique[key] = count;
+				nodes[count++] = {a, b};
+			}
+		}
+		auto visit = [&](auto &&self, int ref, int level) -> int {
+			if (!spend(size >> level)) return 0;
+			if (nodes[ref].a < 0 || seen[ref]) return 0;
+			seen[ref] = true;
+			return 1+self(self, nodes[ref].a, level+1)+self(self, nodes[ref].b, level+1);
+		};
+		return visit(visit, refs[0], 0);
 	}
 	struct Plan {
 		PmuxSelectGraph graph;
@@ -1170,15 +1234,12 @@ struct PmuxSelectWorker {
 		bool dependent;
 	};
 	struct CostSnapshot {
-		struct Primary { uint16_t table; std::vector<int> inputs; bool leaf; };
-		std::vector<Primary> nodes;
-		dict<SigBit, int> leaves;
-		dict<std::pair<uint16_t, std::vector<int>>, int> functions;
+		PmuxLutCost::LutCostGraph::ReadOnlyGraph topology;
 		dict<CostKey, CostRead> reads;
 		pool<SigBit> expanded, opaque, fixed;
 		std::vector<SigBit> expanded_order;
 		int64_t copy_work() const {
-			return 32LL*GetSize(nodes) + 8LL*GetSize(reads) +
+			return 32LL*GetSize(topology.nodes) + 8LL*GetSize(reads) +
 				4LL*(GetSize(expanded)+GetSize(opaque)+GetSize(fixed)+GetSize(expanded_order));
 		}
 	};
@@ -1207,11 +1268,35 @@ struct PmuxSelectWorker {
 		pool<SigBit> active, expanded, opaque;
 		std::vector<SigBit> expanded_order;
 		CostSnapshot *record = nullptr;
+		const CostSnapshot *baseline = nullptr;
 		const CostSnapshot *original = nullptr;
 		pool<CostKey> replayed;
 		CostBuilder(PmuxSelectWorker &worker, PmuxLutCost::LutCostGraph &graph, const std::vector<CostView> &edits,
 			const dict<SigBit, std::pair<int, int>> &replacements, const pool<SigBit> &removed, bool changed) :
 			worker(worker), graph(graph), edits(edits), replacements(replacements), removed(removed), changed(changed) {}
+		int expanded_count() const {
+			return GetSize(expanded_order) + (baseline ? GetSize(baseline->expanded_order) : 0);
+		}
+		SigBit expanded_at(int index) const {
+			int prefix = baseline ? GetSize(baseline->expanded_order) : 0;
+			return index < prefix ? baseline->expanded_order[index] : expanded_order[index-prefix];
+		}
+		bool expanded_contains(SigBit value) const {
+			return expanded.count(value) || (baseline && baseline->expanded.count(value));
+		}
+		void expand(SigBit value) {
+			if (baseline && baseline->expanded.count(value)) return;
+			if (expanded.insert(value).second) expanded_order.push_back(value);
+		}
+		void mark_opaque(SigBit value) {
+			if (!baseline || !baseline->opaque.count(value)) opaque.insert(value);
+		}
+		CostSignal cached_bit(const CostKey &key) const {
+			auto found = bits.find(key);
+			if (found != bits.end()) return found->second;
+			log_assert(baseline && !changed);
+			return baseline->reads.at(key).signal;
+		}
 		CostSignal operation(uint16_t table, const std::vector<CostSignal> &args) {
 			if (!graph.valid) return {0, 0};
 			std::vector<int> values, care;
@@ -1248,11 +1333,11 @@ struct PmuxSelectWorker {
 			log_assert(!read.dependent);
 			auto value = key.first;
 			if (read.kind == CostReadKind::Opaque) {
-				opaque.insert(value);
+				mark_opaque(value);
 				if (!worker.cost_live.count(value)) { fail(CostStatus::UnsupportedActivatedBoundary); return false; }
-			} else if (read.kind == CostReadKind::Fixed) graph.fixed_bits.insert(value);
+			} else if (read.kind == CostReadKind::Fixed) graph.add_fixed(value);
 			else if (read.kind == CostReadKind::Expanded) {
-				if (expanded.insert(value).second) expanded_order.push_back(value);
+				expand(value);
 				log_assert(worker.cost_expressions.count(value));
 				const auto &expression = worker.cost_expressions.at(value);
 				if (!cost_read(graph.work, GetSize(expression.inputs))) {
@@ -1276,6 +1361,10 @@ struct PmuxSelectWorker {
 			auto key = std::make_pair(value, depth);
 			auto found = bits.find(key);
 			if (found != bits.end()) return found->second;
+			if (baseline) {
+				auto cached = baseline->reads.find(key);
+				if (cached != baseline->reads.end()) return cached->second.signal;
+			}
 			if (original) {
 				auto cached = original->reads.find(key);
 				if (cached != original->reads.end() && !cached->second.dependent) {
@@ -1300,16 +1389,16 @@ struct PmuxSelectWorker {
 					if (graph.work < 0) result = fail(CostStatus::BudgetExhausted);
 					else if (expression.kind == CostKind::Opaque) {
 						kind = CostReadKind::Opaque;
-						opaque.insert(value);
+						mark_opaque(value);
 						if (changed && !worker.cost_live.count(value)) result = fail(CostStatus::UnsupportedActivatedBoundary);
 						else result = {graph.leaf(value), 1};
 					} else if (worker.kept.count(value) || !worker.design->selected(worker.module, cell) || cell->get_bool_attribute(ID::keep)) {
 						kind = CostReadKind::Fixed;
-						graph.fixed_bits.insert(value);
+						graph.add_fixed(value);
 						result = {graph.leaf(value), 1};
 					} else {
 						kind = CostReadKind::Expanded;
-						if (expanded.insert(value).second) expanded_order.push_back(value);
+						expand(value);
 						std::vector<CostSignal> args;
 						for (auto input : expression.inputs) {
 							args.push_back(bit(input, depth-1));
@@ -1358,7 +1447,7 @@ struct PmuxSelectWorker {
 		}
 	};
 	CostStatus make_cost_snapshot(const CostView &edit, CostSnapshot &snapshot) {
-		log_assert(cost_boundaries_frozen && !edit.wrapper && snapshot.nodes.empty());
+		log_assert(cost_boundaries_frozen && !edit.wrapper && snapshot.topology.nodes.empty());
 		if (cost_stopped || work <= 0 || cost_work <= 0) {
 			cost_stopped = true;
 			return CostStatus::BudgetExhausted;
@@ -1378,40 +1467,33 @@ struct PmuxSelectWorker {
 		if (!graph.valid) return budget.remaining < 0 ? CostStatus::BudgetExhausted :
 			before.status == CostStatus::NoGain ? CostStatus::NodeLimit : before.status;
 		log_assert(before.active.empty() && graph.certificates.empty() && graph.checked_certificates.empty() && graph.required.empty());
-		int64_t copy_work = 32LL*GetSize(graph.nodes) + 8LL*GetSize(snapshot.reads) +
+		int64_t copy_work = 32LL*graph.node_count() + 8LL*GetSize(snapshot.reads) +
 			4LL*(GetSize(before.expanded)+GetSize(before.opaque)+GetSize(graph.fixed_bits)+GetSize(before.expanded_order));
 		if (!cost_read(budget.remaining, copy_work)) return CostStatus::BudgetExhausted;
-		log_assert(snapshot.leaves.empty() && snapshot.functions.empty() && snapshot.fixed.empty());
+		log_assert(snapshot.topology.leaves.empty() && snapshot.topology.functions.empty() && snapshot.fixed.empty());
 		log_assert(snapshot.expanded.empty() && snapshot.opaque.empty() && snapshot.expanded_order.empty());
-		snapshot.nodes.reserve(GetSize(graph.nodes));
+		snapshot.topology.nodes.reserve(graph.node_count());
 		for (auto &node : graph.nodes) {
-			log_assert(node.cost == -1 && node.cuts.empty() && node.best.empty());
-			snapshot.nodes.push_back({node.table, std::move(node.inputs), node.leaf});
+			log_assert(node.cost == -1 && node.cuts.empty() && node.best_cut().empty());
+			snapshot.topology.nodes.push_back(node);
 		}
-		snapshot.leaves = std::move(graph.leaves);
-		snapshot.functions = std::move(graph.functions);
+		snapshot.topology.leaves = std::move(graph.leaves);
+		snapshot.topology.functions = std::move(graph.functions);
 		snapshot.fixed = std::move(graph.fixed_bits);
 		snapshot.expanded = std::move(before.expanded);
 		snapshot.opaque = std::move(before.opaque);
 		snapshot.expanded_order = std::move(before.expanded_order);
 		log_assert(copy_work == snapshot.copy_work());
 		if (cost_diagnostic()) log_debug("PMUX select %s.%s: recovered snapshot nodes=%d reads=%d copy=%lld work=%d.\n",
-			log_id(module), log_id(edit.cell), GetSize(snapshot.nodes), GetSize(snapshot.reads), (long long)copy_work, budget.initial-budget.remaining);
+			log_id(module), log_id(edit.cell), GetSize(snapshot.topology.nodes), GetSize(snapshot.reads), (long long)copy_work, budget.initial-budget.remaining);
 		return CostStatus::NoGain;
 	}
-	bool restore_cost_snapshot(const CostSnapshot &snapshot, PmuxLutCost::LutCostGraph &graph, CostBuilder &before) {
-		log_assert(graph.valid && GetSize(graph.nodes) == 2 && before.bits.empty() && !before.changed && GetSize(snapshot.nodes) <= 4096);
+	bool restore_cost_snapshot(const CostSnapshot &snapshot, PmuxLutCost::LutCostGraph &graph, CostBuilder &before,
+			PmuxLutCost::LutCostGraph::CertificateCache *certificates) {
+		log_assert(graph.valid && graph.node_count() == 2 && before.bits.empty() && !before.changed && !before.baseline);
 		if (!cost_read(graph.work, snapshot.copy_work())) return false;
-		graph.nodes.clear();
-		graph.nodes.reserve(GetSize(snapshot.nodes));
-		for (const auto &node : snapshot.nodes) graph.nodes.emplace_back(node.table, node.inputs, node.leaf);
-		graph.leaves = snapshot.leaves;
-		graph.functions = snapshot.functions;
-		graph.fixed_bits = snapshot.fixed;
-		for (const auto &read : snapshot.reads) before.bits[read.first] = read.second.signal;
-		before.expanded = snapshot.expanded;
-		before.opaque = snapshot.opaque;
-		before.expanded_order = snapshot.expanded_order;
+		graph.use_snapshot(snapshot.topology, snapshot.fixed, certificates);
+		before.baseline = &snapshot;
 		return true;
 	}
 	bool cost_observed(SigBit bit, const pool<SigBit> &modeled, const pool<Cell *> &rewritten,
@@ -1479,7 +1561,8 @@ struct PmuxSelectWorker {
 		}
 		log_abort();
 	}
-	CostResult estimate_select(const std::vector<CostView> &edits, const CostSnapshot *snapshot = nullptr) {
+	CostResult estimate_select(const std::vector<CostView> &edits, const CostSnapshot *snapshot = nullptr,
+			PmuxLutCost::LutCostGraph::CertificateCache *certificates = nullptr) {
 		log_assert(cost_boundaries_frozen && !edits.empty());
 		if (cost_stopped || work <= 0 || cost_work <= 0) {
 			cost_stopped = true;
@@ -1520,7 +1603,7 @@ struct PmuxSelectWorker {
 		CostBuilder before(*this, graph, edits, replacements, removed, false), after(*this, graph, edits, replacements, removed, true);
 		if (snapshot) {
 			log_assert(GetSize(edits) == 1 && !edits[0].wrapper);
-			if (!restore_cost_snapshot(*snapshot, graph, before)) return finish(CostStatus::BudgetExhausted);
+			if (!restore_cost_snapshot(*snapshot, graph, before, certificates)) return finish(CostStatus::BudgetExhausted);
 			after.original = snapshot;
 		}
 		auto add_root = [&](SigBit bit) { before.bit(bit); after.bit(bit); };
@@ -1534,14 +1617,14 @@ struct PmuxSelectWorker {
 		std::vector<SigBit> pending;
 		int before_count = 0, after_count = 0;
 		auto collect = [&]() {
-			while (before_count < GetSize(before.expanded_order)) {
+			while (before_count < before.expanded_count()) {
 				if (!graph.spend()) return;
-				auto bit = before.expanded_order[before_count++];
+				auto bit = before.expanded_at(before_count++);
 				if (modeled.insert(bit).second) pending.push_back(bit);
 			}
-			while (after_count < GetSize(after.expanded_order)) {
+			while (after_count < after.expanded_count()) {
 				if (!graph.spend()) return;
-				auto bit = after.expanded_order[after_count++];
+				auto bit = after.expanded_at(after_count++);
 				if (modeled.insert(bit).second) pending.push_back(bit);
 			}
 		};
@@ -1584,14 +1667,14 @@ struct PmuxSelectWorker {
 		auto old_cover = graph.cover(old_roots);
 		dict<int, PmuxLutCost::Cut> old_cuts;
 		if (ys_debug(1) && !snapshot) for (int id : old_cover) {
-			if (!cost_diagnostic(1+GetSize(graph.nodes[id].best))) break;
-			old_cuts[id] = graph.nodes[id].best;
+			if (!cost_diagnostic(1+GetSize(graph.mapping(id).best_cut()))) break;
+			old_cuts[id] = graph.mapping(id).best_cut();
 		}
 		auto new_cover = graph.cover(new_roots);
 		if (budget.remaining < 0) return finish(CostStatus::BudgetExhausted);
 		if (!graph.valid) return finish(CostStatus::NodeLimit);
-		result.before = GetSize(old_cover)+GetSize(graph.fixed_bits);
-		result.after = GetSize(new_cover)+GetSize(graph.fixed_bits);
+		result.before = GetSize(old_cover)+graph.fixed_count();
+		result.after = GetSize(new_cover)+graph.fixed_count();
 		if (ys_debug(1)) {
 			for (auto &edit : edits) {
 				if (!cost_diagnostic()) break;
@@ -1600,11 +1683,17 @@ struct PmuxSelectWorker {
 			}
 			for (auto bit : roots) {
 				if (!cost_diagnostic()) break;
-				log_debug("Select cost root %s before %d care %d after %d care %d.\n", log_signal(bit), before.bits.at({bit, 64}).value, before.bits.at({bit, 64}).care, after.bits.at({bit, 64}).value, after.bits.at({bit, 64}).care);
+				auto old_signal = before.cached_bit({bit, 64}), new_signal = after.cached_bit({bit, 64});
+				log_debug("Select cost root %s before %d care %d after %d care %d.\n", log_signal(bit), old_signal.value, old_signal.care, new_signal.value, new_signal.care);
 			}
-			for (auto bit : before.expanded) {
+			for (int index = 0; index < before.expanded_count(); index++) {
 				if (!cost_diagnostic()) break;
-				log_debug("Select cost source %s retained %d.\n", log_signal(bit), after.expanded.count(bit));
+				auto bit = before.expanded_at(index);
+				log_debug("Select cost source %s retained %d.\n", log_signal(bit), int(after.expanded_contains(bit)));
+			}
+			if (snapshot) for (auto bit : snapshot->fixed) {
+				if (!cost_diagnostic()) break;
+				log_debug("Select cost fixed %s.\n", log_signal(bit));
 			}
 			for (auto bit : graph.fixed_bits) {
 				if (!cost_diagnostic()) break;
@@ -1614,18 +1703,19 @@ struct PmuxSelectWorker {
 				if (!cost_diagnostic()) break;
 				log_debug("Select cost leaf %s node %d.\n", log_signal(entry.first), entry.second);
 			}
-			if (!snapshot) for (int id = 0; id < GetSize(graph.nodes); id++) {
-				const auto &node = graph.nodes[id];
-				if (!cost_diagnostic(1+GetSize(node.inputs)+(old_cuts.count(id) ? GetSize(old_cuts.at(id)) : 0)+(new_cover.count(id) ? GetSize(node.best) : 0))) break;
+			if (!snapshot) for (int id = 0; id < graph.node_count(); id++) {
+				const auto &node = graph.primary(id);
+				const auto &state = graph.mapping(id);
+			if (!cost_diagnostic(1+GetSize(node.inputs)+(old_cuts.count(id) ? GetSize(old_cuts.at(id)) : 0)+(new_cover.count(id) ? GetSize(state.best_cut()) : 0))) break;
 				log_debug("Select cost node %d table %u leaf %d before %d after %d inputs", id, unsigned(node.table), node.leaf, old_cover.count(id), new_cover.count(id));
 				for (int input : node.inputs) log_debug(" %d", input);
 				log_debug(" cuts");
 				if (old_cuts.count(id)) for (int input : old_cuts.at(id)) log_debug(" %d", input);
 				log_debug(" / ");
-				if (new_cover.count(id)) for (int input : node.best) log_debug(" %d", input);
+			if (new_cover.count(id)) for (int input : state.best_cut()) log_debug(" %d", input);
 				log_debug("\n");
 			}
-			if (cost_diagnostic()) log_debug("Select cost certificates 5/6/7=%d/%d/%d partial=%d nodes=%d.\n", graph.certificate_widths[5], graph.certificate_widths[6], graph.certificate_widths[7], graph.partial_functions, GetSize(graph.nodes));
+			if (cost_diagnostic()) log_debug("Select cost certificates 5/6/7=%d/%d/%d partial=%d nodes=%d.\n", graph.certificate_widths[5], graph.certificate_widths[6], graph.certificate_widths[7], graph.partial_functions, graph.node_count());
 		}
 		return finish(result.before > result.after ? CostStatus::Profitable : CostStatus::NoGain);
 	}
@@ -1657,7 +1747,7 @@ struct PmuxSelectWorker {
 					const auto &driver = drivers.at(bit);
 					if (driver.cell != outer || driver.offset != i || !outputs.insert(bit).second) return false;
 				}
-				dict<SigBit, SourceState> dependency;
+				SourceContext dependency;
 				for (auto port : {ID::A, ID::B, ID::S}) for (auto input : cost_port(outer, port))
 					if (!upstream(input, outputs, dependency)) return false;
 			}
@@ -1676,6 +1766,7 @@ struct PmuxSelectWorker {
 		}
 		int chosen = -1;
 		std::tuple<int, int, int, int, int> best;
+		PmuxLutCost::LutCostGraph::CertificateCache certificates;
 		for (int index = 0; index < GetSize(record.plans); index++) {
 			if (cost_stopped || work <= 0 || cost_work <= 0) { cost_stopped = true; return -1; }
 			auto &alternative = record.plans[index];
@@ -1688,7 +1779,7 @@ struct PmuxSelectWorker {
 				continue;
 			}
 			view.plan = &plan;
-			auto result = estimate_select({view}, &snapshot);
+			auto result = estimate_select({view}, &snapshot, &certificates);
 			if (cost_diagnostic()) log_debug("PMUX select %s.%s: recovered order=%d count=%d reference=%d gates=%d original_gates=%d %s %d -> %d.\n",
 				log_id(module), log_id(record.cell), alternative.order, plan.count, plan.reference, plan.gates, record.original_gates,
 				cost_status_name(result.status), result.before, result.after);
@@ -1705,7 +1796,7 @@ struct PmuxSelectWorker {
 			const Wrapper *wrapper = nullptr, Recovered *recovered = nullptr) {
 		log_assert(!wrapper || !recovered);
 		if (wrapper && cost_stopped) return false;
-		auto a = sigmap(cell->getPort(ID::A)), b = sigmap(cell->getPort(ID::B)), s = sigmap(cell->getPort(ID::S)), y = sigmap(cell->getPort(ID::Y));
+		auto a = normalized_port(cell, ID::A), b = normalized_port(cell, ID::B), s = normalized_port(cell, ID::S), y = normalized_port(cell, ID::Y);
 		int width = GetSize(y), branches = GetSize(s);
 		auto &controls = selection.controls;
 		log_assert(!controls.empty() && GetSize(controls) <= 6);
@@ -1717,7 +1808,7 @@ struct PmuxSelectWorker {
 		if (wrapper) for (auto bit : wrapper->y) outputs.insert(bit);
 		dict<SigBit, int> positions;
 		for (int i = 0; i < GetSize(controls); i++) positions[controls[i]] = i;
-		dict<SigBit, SourceState> dependency;
+		SourceContext dependency;
 		for (auto bit : a) if (!upstream(bit, outputs, dependency)) return false;
 		for (auto bit : b) if (!upstream(bit, outputs, dependency)) return false;
 		for (auto bit : controls) if (!upstream(bit, outputs, dependency)) return false;
@@ -1728,6 +1819,7 @@ struct PmuxSelectWorker {
 			if (!spend(width*size)) return false;
 		}
 		tables.assign(width, {});
+		for (auto &table : tables) table.reserve(size);
 		for (int c = 0; c < size; c++) {
 			int branch = selection.branch_for_code[c];
 			bool use_inner = true;
@@ -1741,18 +1833,40 @@ struct PmuxSelectWorker {
 		// 每个编码最多保存八个数据赋值，每个 State 使用三个比特。
 		struct Cofactors { std::vector<SigBit> atoms; std::vector<uint32_t> values; };
 		std::vector<Cofactors> cofactors(width);
+		struct TableKey {
+			const std::vector<SigBit> *table;
+			bool operator==(const TableKey &other) const { return *table == *other.table; }
+			[[nodiscard]] Hasher hash_into(Hasher h) const { h.eat(*table); return h; }
+		};
+		dict<TableKey, int> output_tables;
+		std::vector<int> representatives;
+		representatives.reserve(width);
+		for (int j = 0; j < width; j++) {
+			auto found = output_tables.find({&tables[j]});
+			if (found != output_tables.end()) representatives.push_back(found->second);
+			else { output_tables[{&tables[j]}] = j; representatives.push_back(j); }
+		}
 		std::vector<int> masks;
 		int field_choices = 0, support_saved = 0;
+		bool need_fields = !recovered_only || ys_debug(1);
 		{
 			dict<std::pair<SigBit, int>, Function> cache; pool<SigBit> active; pool<Cell *> expanded;
 			for (int j = 0; j < width; j++) {
-				int mask = 0;
-				for (int i = 0; i < GetSize(controls); i++)
-					for (int c = 0; c < size; c++) if (!(c & (1 << i)) && tables[j][c] != tables[j][c | (1 << i)]) { mask |= 1 << i; break; }
-				masks.push_back(mask);
-				int support_size = __builtin_popcount(unsigned(mask));
-				field_choices += 1 << support_size;
-				support_saved += GetSize(controls) - support_size;
+				int representative = representatives[j];
+				if (need_fields) {
+					int mask = representative < j ? masks[representative] : 0;
+					if (representative == j) for (int i = 0; i < GetSize(controls); i++)
+						for (int c = 0; c < size; c++) if (!(c & (1 << i)) && tables[j][c] != tables[j][c | (1 << i)]) { mask |= 1 << i; break; }
+					masks.push_back(mask);
+					int support_size = __builtin_popcount(unsigned(mask));
+					field_choices += 1 << support_size;
+					support_saved += GetSize(controls) - support_size;
+				}
+				if (representative < j) {
+					for (int c = 0; c < size; c++) expression(tables[j][c], c, positions, cache, active, expanded, 8);
+					continue;
+				}
+				functions[j].reserve(size);
 				for (int c = 0; c < size; c++) functions[j].push_back(expression(tables[j][c], c, positions, cache, active, expanded, 8));
 				pool<SigBit> data;
 				for (auto &function : functions[j]) for (auto bit : function.support) data.insert(bit);
@@ -1770,17 +1884,18 @@ struct PmuxSelectWorker {
 			}
 		}
 		// 按原始 PMUX 的数据选择数量计算字段支持缩减。
-		bool field_gain = !wrapper && support_saved > 0 && 4*field_choices <= 3*width*branches;
+		bool field_gain = !recovered_only && !wrapper && support_saved > 0 && 4*field_choices <= 3*width*branches;
 		// 原始数据叶节点全局互异时，完整选择图与参考树具有相同节点数量。
 		auto legacy_no_gain = [&]() {
 			if (wrapper || recovered || size < 4) return false;
 			pool<SigBit> seen;
 			for (int j = 0; j < width; j++) {
-				if (!cofactors[j].atoms.empty()) return false;
+				int representative = representatives[j];
+				if (!cofactors[representative].atoms.empty()) return false;
 				for (int c = 0; c < size; c++) {
 					auto bit = tables[j][c];
 					if (!bit.wire || !seen.insert(bit).second) return false;
-					const auto &function = functions[j][c];
+					const auto &function = functions[representative][c];
 					if (GetSize(function.support) > 1) continue;
 					if (GetSize(function.support) != 1 || function.support[0] != bit || GetSize(function.table) != 2 ||
 						function.table[0] != State::S0 || function.table[1] != State::S1) return false;
@@ -1792,8 +1907,8 @@ struct PmuxSelectWorker {
 			log_debug("PMUX select %s.%s: complete distinct data table has no legacy gain.\n", log_id(module), log_id(cell));
 			return false;
 		}
-		int original_gates;
-		{
+		int original_gates = 0;
+		if (!recovered_only || ys_debug(1)) {
 			PmuxSelectGateCost old_cost;
 			std::vector<int> original_select;
 			for (auto bit : s) original_select.push_back(old_cost.leaf(bit));
@@ -1828,16 +1943,29 @@ struct PmuxSelectWorker {
 			for (int c = 0; c < size; c++)
 				for (int i = 0; i < GetSize(order); i++)
 					if (c & (1 << i)) permuted[c] |= 1 << order[i];
+			struct BuiltOutput { int root, reference, work, complements, swaps; };
+			std::vector<BuiltOutput> built(width);
 			for (int j = 0; j < width; j++) {
-				std::map<std::vector<SigBit>, int> memo;
-				plan.reference += reference_tree(tables[j], permuted, 0, 0, memo);
+				int representative = representatives[j];
+				if (representative < j) {
+					const auto &output = built[representative];
+					if (!spend(output.work)) break;
+					plan.reference += output.reference;
+					plan.graph.complements += output.complements;
+					plan.swaps += output.swaps;
+					plan.roots.push_back(output.root);
+					continue;
+				}
+				int initial_work = work, initial_complements = plan.graph.complements, initial_swaps = plan.swaps;
+				int reference = reference_tree(tables[j], permuted);
+				plan.reference += reference;
 				std::vector<int> leaves(size);
 				for (int c = 0; c < size; c++) {
 					int index = permuted[c];
 					auto &function = functions[j][index];
-					leaves[c] = GetSize(function.support) <= 1 ? function_graph(plan.graph, function, dependency) : graph_leaf(plan.graph, tables[j][index], dependency);
+					leaves[c] = GetSize(function.support) <= 1 ? function_graph(plan.graph, function, dependency.bits) : graph_leaf(plan.graph, tables[j][index], dependency.bits);
 				}
-				int normal = build(plan.graph, leaves, selectors, dependency), result = normal;
+				int normal = build(plan.graph, leaves, selectors, dependency.bits), result = normal;
 				const auto &cofactor = cofactors[j];
 				if (!cofactor.atoms.empty()) {
 					std::vector<int> cofactor_roots;
@@ -1847,15 +1975,16 @@ struct PmuxSelectWorker {
 							int index = permuted[c];
 							values[c] = plan.graph.leaf(State((cofactor.values[index] >> (3*d)) & 7));
 						}
-						cofactor_roots.push_back(build(plan.graph, values, selectors, dependency));
+						cofactor_roots.push_back(build(plan.graph, values, selectors, dependency.bits));
 					}
-					int swapped = build(plan.graph, cofactor_roots, cofactor.atoms, dependency);
+					int swapped = build(plan.graph, cofactor_roots, cofactor.atoms, dependency.bits);
 					if (plan.graph.cost({swapped}, cost_context).first < plan.graph.cost({normal}, cost_context).first) {
 						result = swapped;
 						plan.swaps++;
 					}
 				}
 				plan.roots.push_back(result);
+				built[j] = {result, reference, initial_work-work, plan.graph.complements-initial_complements, plan.swaps-initial_swaps};
 			}
 			if (exhausted || plan.graph.overflow) {
 				if (recovered) release_recovered(*recovered);
@@ -1866,7 +1995,7 @@ struct PmuxSelectWorker {
 			plan.count = cost.first;
 			plan.gates = cost.second;
 			int separate = 0;
-			for (int root : plan.roots) separate += plan.graph.cost({root}, cost_context).first;
+			if (!recovered_only) for (int root : plan.roots) separate += plan.graph.cost({root}, cost_context).first;
 			bool structural = plan.support_saved || plan.swaps || separate > plan.count || plan.graph.complements;
 			bool graph_gain = structural && 4*plan.count <= 3*plan.reference && plan.count+2 <= plan.reference;
 			if (recovered_only || (!graph_gain && !field_gain) || plan.gates >= original_gates) {
@@ -2045,7 +2174,7 @@ struct OptPmuxSelectPass : public Pass {
 				design->scratchpad_unset(budget_key + ".diagnostic");
 			}
 			bool has_candidate = false;
-			for (auto cell : module->selected_cells()) if (cell->type == ID($pmux)) {
+			for (auto cell : module->selected_cells()) if (PmuxSelectWorker::candidate_shape(cell)) {
 				has_candidate = true;
 				break;
 			}

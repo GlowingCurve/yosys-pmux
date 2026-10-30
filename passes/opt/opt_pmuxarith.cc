@@ -427,6 +427,13 @@ struct PmuxArithWorker {
 		branch = active < 0 ? a : b.extract(active*width, width);
 		return true;
 	}
+	struct ChoiceInfo {
+		bool ready = false, valid = false;
+		int work = 0;
+		std::vector<SigSpec> branches;
+		SigSpec control;
+		pool<Cell *> region;
+	};
 	bool choice(Cell *pmux, std::vector<SigSpec> &branches, SigSpec &control, pool<Cell *> &region) {
 		pool<SigBit> support;
 		auto s = sigmap(pmux->getPort(ID::S));
@@ -449,6 +456,20 @@ struct PmuxArithWorker {
 			branches.push_back(branch);
 		}
 		return true;
+	}
+	bool choice(Cell *pmux, ChoiceInfo &info) {
+		// 预算不足时执行原遍历，保留首次耗尽位置。
+		if (info.ready && budget > info.work) {
+			budget -= info.work;
+			return info.valid;
+		}
+		int before = budget;
+		ChoiceInfo next;
+		next.valid = choice(pmux, next.branches, next.control, next.region);
+		next.work = before - budget;
+		next.ready = true;
+		info = std::move(next);
+		return info.valid;
 	}
 	using Polynomial = dict<SigSpec,Const>;
 	bool comparisons(SigBit bit, pool<Cell *> &predicates, pool<Cell *> &region, int depth=0) {
@@ -612,13 +633,13 @@ struct PmuxArithWorker {
 		}
 		return false;
 	}
-	bool selected_divmod(Cell *pmux) {
+	bool selected_divmod(Cell *pmux, ChoiceInfo &info) {
 		int width = GetSize(pmux->getPort(ID::Y));
 		if (width < 3 || width > 16) return false;
-		std::vector<SigSpec> branches;
-		SigSpec control;
-		pool<Cell *> region;
-		if(!choice(pmux,branches,control,region))return false;
+		if (!choice(pmux, info)) return false;
+		const auto &branches = info.branches;
+		const auto &control = info.control;
+		auto region = info.region;
 		SigSpec input;
 		dict<Cell *, bool> division;
 		std::vector<Cell *> roots;
@@ -910,14 +931,14 @@ struct PmuxArithWorker {
 		enumerate(1);
 		return !bestout.empty() && commit(pmux, region, best, bestout);
 	}
-	bool arithmetic(Cell *pmux)
+	bool arithmetic(Cell *pmux, ChoiceInfo &info)
 	{
 		int width = GetSize(pmux->getPort(ID::Y));
 		if (width < 2 || width > 32) return false;
-		std::vector<SigSpec> branches;
-		SigSpec control;
-		pool<Cell *> region;
-		if (!choice(pmux, branches, control, region)) return false;
+		if (!choice(pmux, info)) return false;
+		const auto &branches = info.branches;
+		const auto &control = info.control;
+		auto region = info.region;
 		std::vector<Polynomial> polynomials;
 		for (auto branch : branches) {
 			Polynomial polynomial;
@@ -977,7 +998,10 @@ struct OptPmuxArithPass : Pass {
 				if (!cell) continue;
 				prepare();
 				bool changed = false;
-				if(worker->editable(cell))changed=worker->minimum_maximum(cell)||worker->selected_divmod(cell)||worker->arithmetic(cell);
+				if (worker->editable(cell)) {
+					PmuxArithWorker::ChoiceInfo choice;
+					changed = worker->minimum_maximum(cell) || worker->selected_divmod(cell, choice) || worker->arithmetic(cell, choice);
+				}
 				remaining = worker->budget;
 				if (changed) worker.reset();
 			}

@@ -51,9 +51,16 @@ struct PmuxContextWorker {
 	PmuxCellTypes types;
 	dict<SigBit, Cell *> drivers;
 	dict<SigBit, pool<Cell *>> users;
+	bool users_built = false;
 	pool<SigBit> protected_bits, kept_bits;
 	pool<Cell *> selected, removed;
 	dict<std::pair<SigBit, bool>, dict<SigBit, State>> condition_cache;
+	struct ConeSummary {
+		std::vector<SigBit> dependencies;
+		int work = 0;
+	};
+	dict<SigSpec, ConeSummary> cone_cache;
+	int cached_cone_bits = 0;
 	int cached_facts = 0, cache_hits = 0, cache_insertions = 0, cache_clears = 0;
 	int changes = 0, copies = 0, total_budget = 262144;
 	static constexpr int max_bits = 4096, max_cells = 64, max_depth = 16;
@@ -81,7 +88,6 @@ struct PmuxContextWorker {
 						if (drivers.count(bit)) drivers[bit] = nullptr;
 						else drivers[bit] = cell;
 					}
-					if (input || !output) users[bit].insert(cell);
 					if ((!input && !output) || keep) {
 						protected_bits.insert(bit);
 						kept_bits.insert(bit);
@@ -90,6 +96,19 @@ struct PmuxContextWorker {
 				}
 			}
 		}
+	}
+
+	void ensure_users()
+	{
+		if (users_built) return;
+		for (auto cell : module->cells()) for (auto &port : cell->connections()) {
+			auto direction = types.cell_port_dir(cell->type, port.first);
+			bool input = direction == RTLIL::PD_INPUT || direction == RTLIL::PD_INOUT;
+			bool output = direction == RTLIL::PD_OUTPUT || direction == RTLIL::PD_INOUT;
+			if (input || !output)
+				for (auto bit : sigmap(port.second)) users[bit].insert(cell);
+		}
+		users_built = true;
 	}
 
 	Cell *driver(SigBit bit)
@@ -259,18 +278,38 @@ struct PmuxContextWorker {
 		return true;
 	}
 
-	void invalidate_condition_cache()
+	void invalidate_caches()
 	{
 		condition_cache.clear();
 		cached_facts = 0;
+		cone_cache.clear();
+		cached_cone_bits = 0;
 		cache_clears++;
 	}
 
+	struct ConeTrace {
+		pool<SigBit> dependencies;
+		int limit;
+		bool complete = true;
+		ConeTrace(int limit) : limit(limit) {}
+		void record(SigBit bit)
+		{
+			if (!complete || dependencies.count(bit)) return;
+			if (GetSize(dependencies) >= limit) {
+				complete = false;
+				dependencies.clear();
+				return;
+			}
+			dependencies.insert(bit);
+		}
+	};
+
 	bool cone(SigBit bit, const dict<SigBit, State> &facts, pool<Cell *> &cells, pool<Cell *> &active,
-		pool<SigBit> &leaves, bool &affected, int &budget, Eligibility &eligibility, int depth = 0)
+		pool<SigBit> &leaves, bool &affected, int &budget, Eligibility &eligibility, ConeTrace *trace = nullptr, int depth = 0)
 	{
 		if (!spend(budget) || depth > max_depth) return false;
 		if (!bit.wire) return true;
+		if (trace) trace->record(bit);
 		if (facts.count(bit)) {
 			affected = true;
 			return true;
@@ -286,7 +325,7 @@ struct PmuxContextWorker {
 		if (!spend(budget, GetSize(cell->getPort(ID::Y)))) return false;
 		active.insert(cell);
 		for (auto &port : cell->connections()) if (types.cell_input(cell->type, port.first))
-			for (auto input : port.second) if (!cone(sigmap(input), facts, cells, active, leaves, affected, budget, eligibility, depth+1)) return false;
+			for (auto input : port.second) if (!cone(sigmap(input), facts, cells, active, leaves, affected, budget, eligibility, trace, depth+1)) return false;
 		active.erase(cell);
 		cells.insert(cell);
 		return true;
@@ -296,6 +335,7 @@ struct PmuxContextWorker {
 		const pool<SigBit> &retained, int &budget, Eligibility *eligibility = nullptr)
 	{
 		auto result = cells;
+		if (!result.empty()) ensure_users();
 		bool changed;
 		do {
 			changed = false;
@@ -329,6 +369,7 @@ struct PmuxContextWorker {
 
 	void index_inputs(Cell *cell)
 	{
+		log_assert(users_built);
 		for (auto &port : cell->connections()) if (types.cell_input(cell->type, port.first))
 			for (auto bit : sigmap(port.second)) users[bit].insert(cell);
 	}
@@ -419,14 +460,42 @@ struct PmuxContextWorker {
 		if (facts.empty() || copies >= 64 || total_budget <= 0) return;
 		int budget = max_bits;
 		auto original = sigmap(consumer->getPort(port).extract(offset, width));
+		auto cached = cone_cache.find(original);
+		// 完整遍历的消耗必须同时满足两个预算，才能省略逐次扣费。
+		if (cached != cone_cache.end() && cached->second.work <= budget && cached->second.work <= total_budget) {
+			bool intersects = false;
+			for (auto &entry : facts)
+				if (std::binary_search(cached->second.dependencies.begin(), cached->second.dependencies.end(), entry.first)) {
+					intersects = true;
+					break;
+				}
+			if (!intersects) {
+				bool available = spend(budget, cached->second.work);
+				log_assert(available);
+				return;
+			}
+		}
+		bool record = cached == cone_cache.end() && GetSize(cone_cache) < 64 && cached_cone_bits + GetSize(original) <= max_bits;
+		ConeTrace trace(record ? max_bits - cached_cone_bits - GetSize(original) : 0);
 		pool<Cell *> cells, active, deleted;
 		pool<SigBit> leaves;
 		{
 			Eligibility eligibility;
 			bool affected = false, has_pmux = false;
-			for (auto bit : original) if (!cone(bit, facts, cells, active, leaves, affected, budget, eligibility)) return;
+			for (auto bit : original) if (!cone(bit, facts, cells, active, leaves, affected, budget, eligibility, record ? &trace : nullptr)) return;
+			if (!affected) {
+				if (record && trace.complete) {
+					ConeSummary summary;
+					summary.dependencies.assign(trace.dependencies.begin(), trace.dependencies.end());
+					std::sort(summary.dependencies.begin(), summary.dependencies.end());
+					summary.work = max_bits - budget;
+					cached_cone_bits += GetSize(original) + GetSize(summary.dependencies);
+					cone_cache[original] = std::move(summary);
+				}
+				return;
+			}
 			for (auto cell : cells) if (cell->type == ID($pmux)) has_pmux = true;
-			if (!affected || !has_pmux) return;
+			if (!has_pmux) return;
 			deleted = deletable(cells, consumer, port, offset, width, leaves, budget, &eligibility);
 		}
 		int old_cost = 0;
@@ -466,7 +535,7 @@ struct PmuxContextWorker {
 		index_inputs(consumer);
 		for (auto cell : deleted) removed.insert(cell);
 		changes++;
-		invalidate_condition_cache();
+		invalidate_caches();
 	}
 
 	struct Relation {
@@ -594,7 +663,7 @@ struct PmuxContextWorker {
 		index_inputs(cell);
 		for (auto old_cell : deleted) removed.insert(old_cell);
 		changes++;
-		invalidate_condition_cache();
+		invalidate_caches();
 	}
 
 	void run()

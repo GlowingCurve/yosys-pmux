@@ -19,6 +19,7 @@ struct PmuxFactorWorker {
 	PmuxCellTypes types;
 	dict<SigBit, OpBit> drivers;
 	dict<SigBit, std::vector<Cell *>> users;
+	bool users_built = false;
 	dict<std::pair<Cell *, IdString>, const SigSpec *> ports;
 	std::deque<SigSpec> port_signals;
 	dict<Cell *, bool> pmux_readable;
@@ -36,6 +37,7 @@ struct PmuxFactorWorker {
 	bool live_built = false;
 	pool<Cell *> selected, uncertain_cells;
 	dict<Signature, std::vector<SigBit>> operators;
+	bool operators_built = false;
 	int changes = 0;
 	int analysis_work = 1048576, cost_work = 1048576;
 
@@ -76,7 +78,7 @@ struct PmuxFactorWorker {
 		pool<OpBit> erased;
 	};
 
-	PmuxFactorWorker(Module *module, Design *design, bool need_users = true) : module(module), sigmap(module), types(module, design)
+	PmuxFactorWorker(Module *module, Design *design) : module(module), sigmap(module), types(module, design)
 	{
 		for (auto wire : module->wires()) {
 			bool keep = wire->get_bool_attribute(ID::keep);
@@ -98,7 +100,6 @@ struct PmuxFactorWorker {
 				bool unknown = direction == RTLIL::PD_UNKNOWN || direction == RTLIL::PD_INOUT;
 				if (unknown) uncertain_cells.insert(cell);
 				bool output = unknown || direction == RTLIL::PD_OUTPUT;
-				bool input = unknown || direction == RTLIL::PD_INPUT;
 				for (int i = 0; i < GetSize(signal); i++) {
 					if (unknown) uncertain_bits.insert(signal[i]);
 					if (output) {
@@ -107,10 +108,6 @@ struct PmuxFactorWorker {
 							uncertain_bits.insert(signal[i]);
 						} else drivers[signal[i]] = {cell, i};
 					}
-					if (input && need_users) {
-						auto &list = users[signal[i]];
-						if (list.empty() || list.back() != cell) list.push_back(cell);
-					}
 					if (keep) {
 						protected_bits.insert(signal[i]);
 						kept_bits.insert(signal[i]);
@@ -118,6 +115,20 @@ struct PmuxFactorWorker {
 				}
 			}
 		}
+	}
+
+	void ensure_users()
+	{
+		if (users_built) return;
+		for (auto cell : module->cells()) for (auto &port : cell->connections()) {
+			auto direction = types.cell_port_dir(cell->type, port.first);
+			if (direction != RTLIL::PD_UNKNOWN && direction != RTLIL::PD_INOUT && direction != RTLIL::PD_INPUT) continue;
+			for (auto bit : sigmap(port.second)) {
+				auto &list = users[bit];
+				if (list.empty() || list.back() != cell) list.push_back(cell);
+			}
+		}
+		users_built = true;
 	}
 
 	bool check_supported(Cell *cell)
@@ -143,8 +154,9 @@ struct PmuxFactorWorker {
 		return valid;
 	}
 
-	void index_operators()
+	void ensure_operators()
 	{
+		if (operators_built) return;
 		log_assert(operators.empty());
 		for (auto cell : module->cells()) if (supported(cell)) {
 			const auto &y = port(cell, ID::Y);
@@ -152,6 +164,7 @@ struct PmuxFactorWorker {
 				if (!uncertain_bits.count(y[i]) && drivers.count(y[i]) && drivers.at(y[i]) == OpBit(cell, i))
 					operators[signature(cell->type, expression_inputs(cell, i))].push_back(y[i]);
 		}
+		operators_built = true;
 	}
 
 	bool editable(Cell *cell)
@@ -428,6 +441,7 @@ struct PmuxFactorWorker {
 			else inputs.append(arg->result);
 		}
 		if (existing) {
+			ensure_operators();
 			auto found = operators.find(signature(type, inputs));
 			if (found != operators.end()) for (auto result : found->second)
 				if (independent(result, avoid)) return direct(result);
@@ -672,6 +686,7 @@ struct PmuxFactorWorker {
 			source_bits[bit] = source;
 			if (protected_bits.count(bit) || !can_remove(source)) roots.insert(bit);
 		}
+		if (!region.empty()) ensure_users();
 		for (auto source : region) {
 			auto bit = port(source.first, ID::Y)[source.second];
 			if (users.count(bit)) for (auto user : reversed(users.at(bit))) {
@@ -905,6 +920,7 @@ struct PmuxFactorWorker {
 		auto bit = port(source.first, ID::Y)[source.second];
 		if (!live_bits.count(bit)) return false;
 		if (protected_bits.count(bit)) return true;
+		ensure_users();
 		if (!users.count(bit)) return false;
 		for (auto user : reversed(users.at(bit))) {
 			if (!supported(user) && !(user->type == ID($pmux) && readable_pmux(user))) {
@@ -986,6 +1002,7 @@ struct PmuxFactorWorker {
 			auto inputs = expression_inputs(cell, source.second);
 			auto original_key = signature(cell->type, inputs);
 			if (!checked.insert(original_key).second) continue;
+			ensure_operators();
 			auto found = operators.find(original_key);
 			log_assert(found != operators.end());
 			for (auto other : found->second) {
@@ -1040,7 +1057,7 @@ struct PmuxFactorWorker {
 		}
 		auto old_cover = graph.cover(old_roots);
 		dict<int, PmuxLutCost::Cut> old_cuts;
-		if (ys_debug(1)) for (int id : old_cover) old_cuts[id] = graph.nodes[id].best;
+		if (ys_debug(1)) for (int id : old_cover) old_cuts[id] = graph.nodes[id].best_cut();
 		auto new_cover = graph.cover(new_roots);
 		result.valid = graph.valid && cost_work >= 0;
 		if (!result.valid) return result;
@@ -1081,7 +1098,7 @@ struct PmuxFactorWorker {
 				log_debug(" old_cut");
 				if (old_cuts.count(id)) for (int input : old_cuts.at(id)) log_debug(" %d", input);
 				log_debug(" new_cut");
-				if (new_cover.count(id)) for (int input : node.best) log_debug(" %d", input);
+				if (new_cover.count(id)) for (int input : node.best_cut()) log_debug(" %d", input);
 				log_debug("\n");
 			}
 		}
@@ -1363,7 +1380,6 @@ struct PmuxFactorWorker {
 			if (editable(cell)) pmuxes.push_back(cell);
 		}
 		if (pmuxes.empty()) return;
-		index_operators();
 		std::vector<Candidate> candidates;
 		int output_count = 0;
 		for (auto cell : pmuxes) {
@@ -1442,6 +1458,7 @@ struct PmuxFactorWorker {
 			if (GetSize(input) < 4 || !drivers.count(input[0]) || !drivers.at(input[0]).first) continue;
 			auto pmux = drivers.at(input[0]).first;
 			if (pmux->type != ID($pmux) || !editable(pmux) || input != sigmap(pmux->getPort(ID::Y))) continue;
+			ensure_users();
 			bool private_output = true;
 			for (auto bit : input) {
 				if (protected_bits.count(bit)) private_output = false;
@@ -1523,7 +1540,7 @@ struct OptPmuxFactorPass : public Pass {
 			}
 			if (changes) {
 				{
-					PmuxFactorWorker xors(module, design, false);
+					PmuxFactorWorker xors(module, design);
 					xors.simplify_xors();
 				}
 				if (whole_module) {

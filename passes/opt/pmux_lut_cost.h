@@ -27,6 +27,7 @@ public:
 	void clear() { length = 0; }
 	const int *begin() const { return inputs.data(); }
 	const int *end() const { return inputs.data()+length; }
+	int operator[](int index) const { return inputs[index]; }
 	bool operator==(const Cut &other) const
 	{
 		return length == other.length && std::equal(begin(), end(), other.begin());
@@ -44,15 +45,47 @@ public:
 };
 
 struct LutCostGraph {
-	struct Node {
+	struct Primary {
+		Cut inputs;
 		uint16_t table;
-		std::vector<int> inputs;
 		bool leaf = false;
-		int cost = -1;
-		std::vector<Cut> cuts;
-		Cut best;
-		Node(uint16_t table, std::vector<int> inputs, bool leaf = false) : table(table), inputs(std::move(inputs)), leaf(leaf) {}
+		Primary(uint16_t table, const std::vector<int> &inputs, bool leaf = false) :
+			inputs(inputs.begin(), inputs.end()), table(table), leaf(leaf) {}
 	};
+	struct MapState {
+		std::vector<Cut> cuts;
+		int cost = -1;
+		unsigned generation = 0;
+		const Cut &best_cut() const
+		{
+			static constexpr Cut empty;
+			return cost > 0 ? cuts.front() : empty;
+		}
+	};
+	struct Node : Primary, MapState {
+		Node(uint16_t table, const std::vector<int> &inputs, bool leaf = false) : Primary(table, inputs, leaf) {}
+	};
+	struct ReadOnlyGraph {
+		std::vector<Primary> nodes;
+		dict<SigBit, int> leaves;
+		dict<std::pair<uint16_t, std::vector<int>>, int> functions;
+	};
+	struct CertificateTruth {
+		std::vector<int> inputs;
+		std::array<uint64_t, 2> values;
+		int traversal_work, evaluation_work;
+		bool partial;
+	};
+	using CertificateCache = dict<std::pair<int, int>, CertificateTruth>;
+
+private:
+	const ReadOnlyGraph *original = nullptr;
+	const pool<SigBit> *original_fixed = nullptr;
+	CertificateCache *original_certificates = nullptr;
+	std::vector<MapState> original_mapping;
+	unsigned mapping_generation = 0;
+
+public:
 	std::vector<Node> nodes = {{0, {}}, {1, {}}};
 	dict<SigBit, int> leaves;
 	dict<std::pair<uint16_t, std::vector<int>>, int> functions;
@@ -66,19 +99,65 @@ struct LutCostGraph {
 
 	LutCostGraph(int &work) : work(work) {}
 
-	bool spend()
+	void use_snapshot(const ReadOnlyGraph &snapshot, const pool<SigBit> &fixed, CertificateCache *cache = nullptr)
 	{
-		if (--work < 0) valid = false;
+		log_assert(valid && !original && GetSize(nodes) == 2 && leaves.empty() && functions.empty() && fixed_bits.empty());
+		log_assert(certificates.empty() && checked_certificates.empty() && required.empty() && original_mapping.empty());
+		log_assert(GetSize(snapshot.nodes) >= 2 && GetSize(snapshot.nodes) <= 4096);
+		original = &snapshot;
+		original_fixed = &fixed;
+		original_certificates = cache;
+		nodes.clear();
+		original_mapping.resize(GetSize(snapshot.nodes));
+	}
+
+	int node_count() const
+	{
+		return GetSize(nodes) + (original ? GetSize(original->nodes) : 0);
+	}
+
+	const Primary &primary(int id) const
+	{
+		int prefix = original ? GetSize(original->nodes) : 0;
+		return id < prefix ? original->nodes[id] : nodes[id-prefix];
+	}
+
+	MapState &mapping(int id)
+	{
+		int prefix = original ? GetSize(original->nodes) : 0;
+		auto &state = id < prefix ? original_mapping[id] : nodes[id-prefix];
+		if ((state.generation & ~3u) != mapping_generation) {
+			state.cost = -1;
+			state.cuts.clear();
+			state.generation = mapping_generation;
+		}
+		return state;
+	}
+
+	void add_fixed(SigBit bit)
+	{
+		if (!original_fixed || !original_fixed->count(bit)) fixed_bits.insert(bit);
+	}
+
+	int fixed_count() const
+	{
+		return GetSize(fixed_bits) + (original_fixed ? GetSize(*original_fixed) : 0);
+	}
+
+	bool spend(int amount = 1)
+	{
+		if (work < amount) { work = -1; valid = false; }
+		else work -= amount;
 		return valid;
 	}
 
 	int append(Node node)
 	{
-		if (!spend() || GetSize(nodes) >= 4096) {
+		if (!spend() || node_count() >= 4096) {
 			valid = false;
 			return 0;
 		}
-		int id = GetSize(nodes);
+		int id = node_count();
 		nodes.push_back(std::move(node));
 		return id;
 	}
@@ -86,6 +165,10 @@ struct LutCostGraph {
 	int leaf(SigBit bit)
 	{
 		if (bit == State::S0 || bit == State::S1) return bit == State::S1 ? 1 : 0;
+		if (original) {
+			auto found = original->leaves.find(bit);
+			if (found != original->leaves.end()) return found->second;
+		}
 		auto found = leaves.find(bit);
 		if (found != leaves.end()) return found->second;
 		int id = append({0, {}, true});
@@ -129,6 +212,10 @@ struct LutCostGraph {
 		if (inputs.empty()) return normalized & 1;
 		if (GetSize(inputs) == 1 && normalized == 2) return inputs[0];
 		auto key = std::make_pair(normalized, inputs);
+		if (original) {
+			auto found = original->functions.find(key);
+			if (found != original->functions.end()) return found->second;
+		}
 		auto found = functions.find(key);
 		if (found != functions.end()) return found->second;
 		int id = append({normalized, inputs});
@@ -150,41 +237,87 @@ struct LutCostGraph {
 
 	void prepare_certificate(int root, int care)
 	{
-		if (!checked_certificates.insert({root, care}).second || root <= 1 || nodes[root].leaf) return;
-		pool<int> visited, support;
-		std::vector<int> pending = {root, care};
-		for (int i = 0; i < GetSize(pending); i++) {
-			int id = pending[i];
-			if (!spend()) return;
-			if (id <= 1 || !visited.insert(id).second) continue;
-			if (GetSize(visited) > 64) return;
-			if (nodes[id].leaf) {
-				support.insert(id);
-				if (GetSize(support) > 7) return;
-			} else for (int input : nodes[id].inputs) pending.push_back(input);
+		if (!checked_certificates.insert({root, care}).second || root <= 1 || primary(root).leaf) return;
+		CertificateTruth calculated;
+		const CertificateTruth *truth = nullptr;
+		bool share = original_certificates && root < GetSize(original->nodes) && care < GetSize(original->nodes);
+		if (share) {
+			auto found = original_certificates->find({root, care});
+			if (found != original_certificates->end()) {
+				truth = &found->second;
+				if (!spend(truth->traversal_work) || !spend(truth->evaluation_work)) return;
+			}
 		}
-		int width = GetSize(support);
-		if (width <= 4) return;
-		std::vector<int> inputs(support.begin(), support.end()), order(visited.begin(), visited.end());
-		std::sort(inputs.begin(), inputs.end());
-		std::sort(order.begin(), order.end());
-		std::vector<int> truth;
-		for (int assignment = 0; assignment < (1 << width); assignment++) {
-			dict<int, int> values = {{0, 0}, {1, 1}};
-			for (int i = 0; i < width; i++) values[inputs[i]] = (assignment >> i) & 1;
-			for (int id : order) {
+		if (!truth) {
+			int initial_work = work;
+			std::array<uint64_t, 64> visited = {};
+			std::vector<int> pending = {root, care}, inputs, order;
+			order.reserve(64);
+			inputs.reserve(7);
+			for (int i = 0; i < GetSize(pending); i++) {
+				int id = pending[i];
 				if (!spend()) return;
-				if (values.count(id)) continue;
-				int address = 0;
-				for (int i = 0; i < GetSize(nodes[id].inputs); i++) address |= values.at(nodes[id].inputs[i]) << i;
-				values[id] = (nodes[id].table >> address) & 1;
+				if (id <= 1 || (visited[id/64] & (uint64_t(1) << (id%64)))) continue;
+				visited[id/64] |= uint64_t(1) << (id%64);
+				order.push_back(id);
+				if (GetSize(order) > 64) return;
+				if (primary(id).leaf) {
+					inputs.push_back(id);
+					if (GetSize(inputs) > 7) return;
+				} else for (int input : primary(id).inputs) pending.push_back(input);
 			}
-			if (!values.at(care)) {
-				partial_functions++;
-				return;
+			int width = GetSize(inputs);
+			if (width <= 4) return;
+			std::sort(inputs.begin(), inputs.end());
+			std::sort(order.begin(), order.end());
+			calculated.traversal_work = initial_work-work;
+			std::array<std::array<uint64_t, 2>, 66> values = {};
+			values[1] = {~uint64_t(0), ~uint64_t(0)};
+			auto local = [&](int id) {
+				return id <= 1 ? id : 2+int(std::lower_bound(order.begin(), order.end(), id)-order.begin());
+			};
+			static constexpr uint64_t patterns[] = {
+				0xaaaaaaaaaaaaaaaaULL, 0xccccccccccccccccULL, 0xf0f0f0f0f0f0f0f0ULL,
+				0xff00ff00ff00ff00ULL, 0xffff0000ffff0000ULL, 0xffffffff00000000ULL,
+			};
+			for (int i = 0; i < GetSize(order); i++) {
+				const auto &node = primary(order[i]);
+				if (node.leaf) {
+					int input = std::lower_bound(inputs.begin(), inputs.end(), order[i])-inputs.begin();
+					values[i+2] = input == 6 ? std::array<uint64_t, 2>{0, ~uint64_t(0)} :
+						std::array<uint64_t, 2>{patterns[input], patterns[input]};
+					continue;
+				}
+				std::array<int, 4> args = {};
+				for (int j = 0; j < node.inputs.size(); j++) args[j] = local(node.inputs[j]);
+				for (int lane = 0; lane < (width == 7 ? 2 : 1); lane++) {
+					std::array<uint64_t, 16> rows;
+					int count = 1 << node.inputs.size();
+					for (int row = 0; row < count; row++) rows[row] = uint64_t(0)-((node.table >> row) & 1);
+					for (int j = 0; j < node.inputs.size(); j++) {
+						uint64_t select = values[args[j]][lane];
+						count /= 2;
+						for (int row = 0; row < count; row++) rows[row] = (select & rows[2*row+1]) | (~select & rows[2*row]);
+					}
+					values[i+2][lane] = rows[0];
+				}
 			}
-			truth.push_back(values.at(root));
+			int assignments = 1 << width;
+			uint64_t mask = width == 5 ? 0xffffffffULL : ~uint64_t(0);
+			const auto &defined = values[local(care)];
+			if ((defined[0] & mask) != mask) assignments = __builtin_ctzll(~defined[0] & mask)+1;
+			else if (width == 7 && defined[1] != ~uint64_t(0)) assignments = 65+__builtin_ctzll(~defined[1]);
+			calculated.evaluation_work = GetSize(order)*assignments;
+			if (!spend(calculated.evaluation_work)) return;
+			calculated.inputs = std::move(inputs);
+			calculated.values = values[local(root)];
+			calculated.partial = assignments < (1 << width) ||
+				(width == 7 ? defined[1] != ~uint64_t(0) : (defined[0] & mask) != mask);
+			truth = share ? &((*original_certificates)[{root, care}] = std::move(calculated)) : &calculated;
 		}
+		if (truth->partial) { partial_functions++; return; }
+		const auto &inputs = truth->inputs;
+		int width = GetSize(inputs);
 		int partitions = 0;
 		for (int mask = 0; mask < (1 << width); mask++) {
 			int bound_width = __builtin_popcount(unsigned(mask));
@@ -201,7 +334,7 @@ struct LutCostGraph {
 					int assignment = 0;
 					for (int i = 0; i < bound_width; i++) assignment |= ((b >> i) & 1) << bound[i];
 					for (int i = 0; i < GetSize(free); i++) assignment |= ((a >> i) & 1) << free[i];
-					column |= truth[assignment] << a;
+					column |= ((truth->values[assignment/64] >> (assignment%64)) & 1) << a;
 				}
 				auto found = std::find(patterns.begin(), patterns.end(), column);
 				if (found == patterns.end()) {
@@ -230,8 +363,9 @@ struct LutCostGraph {
 	{
 		int cost = 0;
 		for (int id : cut) {
-			map_node(id);
-			if (!required.count(id)) cost += nodes[id].cost;
+			auto &state = mapping(id);
+			if (state.cost < 0) map_node(id);
+			if (!(state.generation & 1)) cost += state.cost;
 		}
 		return cost;
 	}
@@ -240,27 +374,21 @@ struct LutCostGraph {
 	{
 		if (GetSize(cuts) <= 1 && GetSize(cuts) <= limit) return;
 		struct RankedCut {
-			int index;
-			mutable int cost = 0;
-			mutable bool evaluated = false;
+			int index, cost;
 		};
 		std::vector<RankedCut> ranked;
 		ranked.reserve(GetSize(cuts));
-		for (int i = 0; i < GetSize(cuts); i++) ranked.push_back({i, 0, false});
-		auto cost = [&](const RankedCut &cut) {
-			if (!cut.evaluated) {
-				cut.cost = cut_cost(cuts[cut.index]);
-				cut.evaluated = true;
-			}
-			return cut.cost;
-		};
-		std::sort(ranked.begin(), ranked.end(), [&](const RankedCut &a, const RankedCut &b) {
+		for (int i = 0; i < GetSize(cuts); i++) ranked.push_back({i, cut_cost(cuts[i])});
+		auto compare = [&](const RankedCut &a, const RankedCut &b) {
 			const auto &a_inputs = cuts[a.index], &b_inputs = cuts[b.index];
-			using Rank = std::tuple<int, int, const Cut &>;
-			return Rank(cost(a), GetSize(a_inputs), a_inputs) < Rank(cost(b), GetSize(b_inputs), b_inputs);
-		});
+			if (a.cost != b.cost) return a.cost < b.cost;
+			if (a_inputs.size() != b_inputs.size()) return a_inputs.size() < b_inputs.size();
+			return a_inputs < b_inputs;
+		};
 		std::vector<Cut> result;
 		int count = std::min(GetSize(ranked), limit);
+		if (count < GetSize(ranked)) std::nth_element(ranked.begin(), ranked.begin()+count, ranked.end(), compare);
+		std::sort(ranked.begin(), ranked.begin()+count, compare);
 		result.reserve(count+1);
 		for (int i = 0; i < count; i++) result.push_back(std::move(cuts[ranked[i].index]));
 		cuts = std::move(result);
@@ -268,17 +396,21 @@ struct LutCostGraph {
 
 	void map_node(int id)
 	{
-		if (!valid || nodes[id].cost >= 0) return;
-		if (id <= 1 || nodes[id].leaf) {
-			nodes[id].cost = 0;
-			nodes[id].cuts = id <= 1 ? std::vector<Cut>{{}} : std::vector<Cut>{{id}};
+		if (!valid) return;
+		auto &state = mapping(id);
+		if (state.cost >= 0) return;
+		const auto &node = primary(id);
+		if (id <= 1 || node.leaf) {
+			state.cost = 0;
+			state.cuts.push_back(id <= 1 ? Cut{} : Cut{id});
 			return;
 		}
 		std::vector<Cut> cuts = {{}};
-		for (int input : nodes[id].inputs) {
-			map_node(input);
+		for (int input : node.inputs) {
+			auto &input_state = mapping(input);
+			if (input_state.cost < 0) map_node(input);
 			if (!valid) return;
-			const auto &choices = nodes[input].cuts;
+			const auto &choices = input_state.cuts;
 			pool<Cut> merged;
 			for (auto &a : cuts) for (auto &b : choices) {
 				if (!spend()) return;
@@ -293,22 +425,23 @@ struct LutCostGraph {
 		log_assert(!cuts.empty());
 		for (auto &cut : cuts) log_assert(GetSize(cut) <= 4 && std::find(cut.begin(), cut.end(), id) == cut.end());
 		rank_cuts(cuts, 31);
-		nodes[id].best = cuts[0];
-		nodes[id].cost = 1 + cut_cost(cuts[0]);
+		state.cost = 1 + cut_cost(cuts[0]);
 		cuts.push_back({id});
-		nodes[id].cuts = std::move(cuts);
+		state.cuts = std::move(cuts);
 	}
 
 	pool<int> cover(const std::vector<int> &roots)
 	{
 		required.clear();
 		for (int root : roots) required.insert(root);
-		for (auto &node : nodes) {
-			if (!spend()) return {};
-			node.cost = -1;
-			node.cuts.clear();
-			node.best.clear();
+		if (!spend(node_count())) return {};
+		mapping_generation += 4;
+		if (!mapping_generation) {
+			for (auto &state : original_mapping) state.generation = 0;
+			for (auto &node : nodes) node.generation = 0;
+			mapping_generation = 4;
 		}
+		for (int root : roots) mapping(root).generation |= 1;
 		pool<int> covered;
 		auto pending = roots;
 		for (int i = 0; i < GetSize(pending); i++) {
@@ -316,8 +449,11 @@ struct LutCostGraph {
 			if (!spend()) return {};
 			map_node(id);
 			if (!valid) return {};
-			if (id <= 1 || nodes[id].leaf || !covered.insert(id).second) continue;
-			for (int input : nodes[id].best) pending.push_back(input);
+			auto &state = mapping(id);
+			if (id <= 1 || primary(id).leaf || (state.generation & 2)) continue;
+			state.generation |= 2;
+			covered.insert(id);
+			for (int input : state.best_cut()) pending.push_back(input);
 		}
 		return covered;
 	}

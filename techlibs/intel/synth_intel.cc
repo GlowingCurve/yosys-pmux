@@ -21,6 +21,7 @@
 #include "kernel/log.h"
 #include "kernel/register.h"
 #include "kernel/rtlil.h"
+#include <initializer_list>
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
@@ -85,6 +86,18 @@ struct SynthIntelPass : public ScriptPass {
 
 	string top_opt, family_opt, vout_file, blif_file;
 	bool flatten, nobram, dff, nodsp, iopads;
+
+	bool has_cells(std::initializer_list<RTLIL::IdString> types)
+	{
+		if (help_mode)
+			return true;
+		for (auto module : active_design->selected_modules())
+			for (auto cell : module->selected_cells())
+				for (auto type : types)
+					if (cell->type == type)
+						return true;
+		return false;
+	}
 
 	bool has_memories(bool include_bmux = false)
 	{
@@ -215,9 +228,9 @@ struct SynthIntelPass : public ScriptPass {
 			}
 			run("opt_expr");
 			run("opt_clean");
-			run("opt -nodffe -nosdff");
+			run("opt_intel -nodffe -nosdff");
 			run("fsm");
-			run("opt");
+			run("opt_intel");
 			run("wreduce");
 			run("peepopt");
 			run("opt_clean");
@@ -229,7 +242,8 @@ struct SynthIntelPass : public ScriptPass {
 			run("opt_pmuxselect -defer-recovered");
 			run("opt_pmuxcontext");
 			run("opt_pmuxlut -lut4 " + pmux_lut + (family_opt == "cycloneiv" && !dff ? " -priority-generic" : ""));
-			run("techmap -map +/cmp2lut.v -D LUT_WIDTH=4");
+			if (has_cells({ID($lt), ID($le), ID($gt), ID($ge)}))
+				run("techmap -map +/cmp2lut.v -D LUT_WIDTH=4");
 			run("opt_expr");
 			run("opt_clean");
 
@@ -247,7 +261,7 @@ struct SynthIntelPass : public ScriptPass {
 			} else {
 				run("alumacc");
 			}
-			run("opt");
+			run("opt_intel");
 			if (has_memories(true)) {
 				run("memory -nomap");
 			} else {
@@ -265,35 +279,37 @@ struct SynthIntelPass : public ScriptPass {
 				    help_mode) {
 				if (has_memories())
 					run("memory_bram -rules +/intel/common/brams_m9k.txt", "(if applicable for family)");
-				run("techmap -map +/intel/common/brams_map_m9k.v", "(if applicable for family)");
+				if (has_cells({ID($__M9K_ALTSYNCRAM_SINGLEPORT_FULL)}))
+					run("techmap -map +/intel/common/brams_map_m9k.v", "(if applicable for family)");
 			} else {
 				log_warning("BRAM mapping is not currently supported for %s.\n", family_opt);
 			}
 		}
 
 		if (check_label("map_ffram")) {
-			run("opt -fast -mux_undef -undriven -fine -full");
+			run("opt_intel -fast -mux_undef -undriven -fine -full");
 			if (has_memories())
 				run("memory_map");
-			run("opt -undriven -fine");
+			run("opt_intel -undriven -fine");
 			std::string pmux_lut = family_opt == "max10" ? "fiftyfivenm_lcell_comb" : family_opt + "_lcell_comb";
 			run("opt_pmuxrel -tables -lut4 " + pmux_lut);
 			run("opt_pmuxselect -recovered-only");
 			run("techmap -map +/techmap.v");
-			run("opt -full");
+			run("opt_intel -full");
 			run("clean -purge");
 			run("setundef -undriven -zero");
 		}
 
 		if (check_label("map_ffs")) {
 			run("dfflegalize -cell $_DFFE_PN0P_ 01");
-			run("techmap -map +/intel/common/ff_map.v");
+			if (has_cells({ID($_DFFE_PN0P_)}))
+				run("techmap -map +/intel/common/ff_map.v");
 		}
 
 		if (check_label("map_luts")) {
-			run("abc9 -lut 4 -W 300" + string(dff ? " -dff" : ""));
+			run("abc9 -lut 4 -W 300 -script +&scorr;&sweep;&dc2;&b;&syn2,-m;&b;&blut,-K,4;&dch,-f,-r;&ps;&if,-a" + string(dff ? " -dff" : ""));
 			run("clean");
-			run("opt -fast");
+			run("opt_intel -fast");
 			run("autoname");
 			run("clean");
 		}

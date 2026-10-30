@@ -64,6 +64,18 @@ yosys_pass(opt
 		opt_reduce
 		opt_share
 )
+yosys_pass(opt_intel
+	opt_intel.cc
+	REQUIRES
+		opt_clean
+		opt_dff
+		opt_expr
+		opt_hier
+		opt_merge
+		opt_muxtree
+		opt_reduce
+		opt_share
+)
 
 yosys_pass(opt_mem
 	opt_mem.cc
