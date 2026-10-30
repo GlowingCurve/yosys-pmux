@@ -307,7 +307,7 @@ struct SynthIntelPass : public ScriptPass {
 		}
 
 		if (check_label("map_luts")) {
-			run("abc9 -lut 4 -W 300 -script +&scorr;&sweep;&dc2;&b;&syn2,-m;&b;&blut,-K,4;&dch,-f,-r;&ps;&if,-a" + string(dff ? " -dff" : ""));
+			run("abc9 -lut 4 -W 300" + string(dff ? " -dff" : ""));
 			run("clean");
 			run("opt_intel -fast");
 			run("autoname");
