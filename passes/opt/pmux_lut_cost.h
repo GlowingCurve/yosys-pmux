@@ -8,8 +8,8 @@ namespace PmuxLutCost {
 
 struct Cut {
 private:
-	std::array<int, 4> inputs = {};
-	int length = 0;
+	std::array<uint16_t, 4> inputs = {};
+	uint8_t length = 0;
 
 public:
 	Cut() = default;
@@ -17,7 +17,8 @@ public:
 	{
 		auto count = std::distance(first, last);
 		log_assert(count >= 0 && count <= 4);
-		length = int(count);
+		for (auto it = first; it != last; ++it) log_assert(*it >= 0 && *it < 4096);
+		length = uint8_t(count);
 		std::copy(first, last, inputs.begin());
 	}
 	Cut(std::initializer_list<int> values) : Cut(values.begin(), values.end()) {}
@@ -25,8 +26,8 @@ public:
 	int size() const { return length; }
 	bool empty() const { return length == 0; }
 	void clear() { length = 0; }
-	const int *begin() const { return inputs.data(); }
-	const int *end() const { return inputs.data()+length; }
+	const uint16_t *begin() const { return inputs.data(); }
+	const uint16_t *end() const { return inputs.data()+length; }
 	int operator[](int index) const { return inputs[index]; }
 	bool operator==(const Cut &other) const
 	{

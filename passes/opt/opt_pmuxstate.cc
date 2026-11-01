@@ -15,7 +15,8 @@ struct PmuxStateWorker {
 	FfInitVals initvals;
 	PmuxCellTypes types;
 	dict<SigBit, Cell *> drivers;
-	dict<SigBit, pool<Cell *>> users;
+	dict<SigBit, std::vector<Cell *>> users;
+	bool users_ready = false;
 	pool<SigBit> protected_bits, kept_bits, conflicted, input_bits;
 	pool<Cell *> removed;
 	pool<Cell *> onehot_states;
@@ -52,7 +53,6 @@ struct PmuxStateWorker {
 							drivers[bit] = cell;
 						}
 					}
-					if (input || !output) users[bit].insert(cell);
 					if ((!input && !output) || keep) {
 						protected_bits.insert(bit);
 						kept_bits.insert(bit);
@@ -310,6 +310,11 @@ struct PmuxStateWorker {
 	{
 		for (auto bit : signal) {
 			if (!bit.wire || protected_bits.count(bit) || conflicted.count(bit)) return false;
+			// 压缩检查实际需要用户关系时才建立索引。
+			if (!users_ready) {
+				for (auto cell : module->cells()) index_inputs(cell);
+				users_ready = true;
+			}
 			for (auto user : users[bit]) if (!removed.count(user) && !allowed.count(user)) return false;
 		}
 		return true;
@@ -317,8 +322,15 @@ struct PmuxStateWorker {
 
 	void index_inputs(Cell *cell)
 	{
-		for (auto &port : cell->connections()) if (types.cell_input(cell->type, port.first))
-			for (auto bit : sigmap(port.second)) users[bit].insert(cell);
+		for (auto &port : cell->connections()) {
+			auto direction = types.cell_port_dir(cell->type, port.first);
+			bool input = direction == RTLIL::PD_INPUT || direction == RTLIL::PD_INOUT;
+			bool output = direction == RTLIL::PD_OUTPUT || direction == RTLIL::PD_INOUT;
+			if (input || !output) for (auto bit : sigmap(port.second)) {
+				auto &list = users[bit];
+				if (list.empty() || list.back() != cell) list.push_back(cell);
+			}
+		}
 	}
 
 	void compress(Cell *cell)

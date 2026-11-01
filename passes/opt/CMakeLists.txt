@@ -4,31 +4,43 @@ add_subdirectory(dff)
 yosys_pass(opt_pmuxfactor
 	opt_pmuxfactor.cc
 	REQUIRES
+		opt_pmuxprep
 		opt_clean
 		opt_expr
 		opt_merge
 )
 yosys_pass(opt_pmuxselect
 	opt_pmuxselect.cc
+	REQUIRES
+		opt_pmuxprep
 )
 yosys_pass(opt_pmuxcontext
 	opt_pmuxcontext.cc
 	REQUIRES
+		opt_pmuxprep
 		opt_clean
 		opt_expr
 		opt_reduce
 )
 yosys_pass(opt_pmuxarith
 	opt_pmuxarith.cc
+	REQUIRES
+		opt_pmuxprep
 )
 yosys_pass(opt_pmuxstate
 	opt_pmuxstate.cc
+	REQUIRES
+		opt_pmuxprep
 )
 yosys_pass(opt_pmuxrel
 	opt_pmuxrel.cc
+	REQUIRES
+		opt_pmuxprep
 )
 yosys_pass(opt_pmuxlut
 	opt_pmuxlut.cc
+	REQUIRES
+		opt_pmuxprep
 )
 
 yosys_pass(opt_merge
@@ -64,8 +76,11 @@ yosys_pass(opt
 		opt_reduce
 		opt_share
 )
-yosys_pass(opt_intel
-	opt_intel.cc
+yosys_pass(opt_pmuxprep
+	opt_pmuxprep.cc
+	opt_pmuxmap.cc
+	PROVIDES
+		opt_pmuxmap
 	REQUIRES
 		opt_clean
 		opt_dff
@@ -75,6 +90,7 @@ yosys_pass(opt_intel
 		opt_muxtree
 		opt_reduce
 		opt_share
+		simplemap
 )
 
 yosys_pass(opt_mem

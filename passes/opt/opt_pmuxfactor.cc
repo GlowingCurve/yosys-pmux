@@ -1403,6 +1403,8 @@ struct PmuxFactorWorker {
 			if (found) candidates.push_back(candidate);
 		}
 		if (candidates.empty()) return;
+		decltype(choices)().swap(choices);
+		decltype(plans)().swap(plans);
 		auto order = check_candidates(candidates);
 		pool<int> all_nodes;
 		pool<SigBit> initial_roots;

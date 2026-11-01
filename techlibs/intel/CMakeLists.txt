@@ -19,7 +19,7 @@ yosys_pass(synth_intel
 		opt
 		opt_clean
 		opt_expr
-		opt_intel
+		opt_pmuxprep
 		peepopt
 		proc
 		read_verilog

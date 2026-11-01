@@ -239,7 +239,6 @@ struct PmuxSelectWorker {
 	size_t recovered_nodes = 0, recovered_roots = 0;
 	bool cost_boundaries_frozen = false, cost_operators_built = false;
 	dict<Cell *, dict<IdString, SigSpec>> cost_ports;
-	dict<Cell *, dict<IdString, RTLIL::PortDir>> cost_directions;
 	pool<SigBit> cost_live, cost_boundaries, cost_preserved;
 	pool<SigBit> emission_inputs, removed_outputs;
 	pool<Cell *> cost_legacy_cells;
@@ -299,12 +298,6 @@ struct PmuxSelectWorker {
 		if (found != ports.end()) return found->second;
 		return ports[name] = sigmap(cell->getPort(name));
 	}
-	RTLIL::PortDir port_direction(Cell *cell, IdString name) {
-		auto &directions = cost_directions[cell];
-		auto found = directions.find(name);
-		if (found != directions.end()) return found->second;
-		return directions[name] = types.cell_port_dir(cell->type, name);
-	}
 	static bool candidate_shape(Cell *cell) {
 		if (cell->type != ID($pmux) || cell->get_bool_attribute(ID::keep) || !cell->hasParam(ID::WIDTH) ||
 			!cell->hasParam(ID::S_WIDTH) || !cell->hasPort(ID::A) || !cell->hasPort(ID::B) ||
@@ -335,12 +328,11 @@ struct PmuxSelectWorker {
 		for (auto cell : module->cells()) {
 			if (!cost_spend()) return false;
 			cost_ports[cell];
-			cost_directions[cell];
 			for (auto &port : cell->connections()) {
 				if (!cost_spend()) return false;
 				if (!cost_spend(GetSize(port.second))) return false;
 				auto signal = normalized_port(cell, port.first);
-				auto direction = port_direction(cell, port.first);
+				auto direction = types.cell_port_dir(cell->type, port.first);
 				bool input = direction == RTLIL::PD_INPUT || direction == RTLIL::PD_INOUT;
 				bool output = direction == RTLIL::PD_OUTPUT;
 				if (!input && output) continue;
@@ -519,7 +511,7 @@ struct PmuxSelectWorker {
 			context.cells[cell];
 			int inputs = 0;
 			for (auto &port : cell->connections()) {
-				auto direction = port_direction(cell, port.first);
+			auto direction = types.cell_port_dir(cell->type, port.first);
 				if (direction != RTLIL::PD_INPUT && direction != RTLIL::PD_INOUT) continue;
 				for (auto input : normalized_port(cell, port.first)) {
 					if (!upstream(input, outputs, context)) return false;
@@ -1127,7 +1119,7 @@ struct PmuxSelectWorker {
 				if (cost_shape(cell, remaining) != CostShape::Unsupported) inputs = cost_expression(bit, remaining).inputs;
 				else {
 					if (!expanded_full.insert(cell).second) continue;
-					for (auto &port : cost_ports.at(cell)) if (cost_directions.at(cell).at(port.first) != RTLIL::PD_OUTPUT) {
+					for (auto &port : cost_ports.at(cell)) if (types.cell_port_dir(cell->type, port.first) != RTLIL::PD_OUTPUT) {
 						if (!cost_read(remaining, GetSize(port.second))) return false;
 						inputs.append(port.second);
 					}
@@ -1506,7 +1498,7 @@ struct PmuxSelectWorker {
 			if (!cost_read(remaining)) return false;
 			auto cell = use.cell;
 			if (rewritten.count(cell) || cost_legacy_cells.count(cell)) continue;
-			auto direction = cost_directions.at(cell).at(use.port);
+			auto direction = types.cell_port_dir(cell->type, use.port);
 			if (direction == RTLIL::PD_UNKNOWN || direction == RTLIL::PD_INOUT || !design->selected(module, cell) || cell->get_bool_attribute(ID::keep)) return true;
 			CostShape shape = cost_shape(cell, remaining);
 			if ((shape == CostShape::Unary || shape == CostShape::Bitwise || shape == CostShape::Mux || shape == CostShape::Pmux) && use.port != ID::S) {
@@ -1533,7 +1525,7 @@ struct PmuxSelectWorker {
 				auto cached = generic.find(cell);
 				if (cached == generic.end()) {
 					std::vector<SigBit> outputs;
-					for (auto &port : cost_ports.at(cell)) if (cost_directions.at(cell).at(port.first) != RTLIL::PD_INPUT) for (auto output : port.second) {
+					for (auto &port : cost_ports.at(cell)) if (types.cell_port_dir(cell->type, port.first) != RTLIL::PD_INPUT) for (auto output : port.second) {
 						if (!cost_read(remaining)) return false;
 						if (cost_live.count(output)) outputs.push_back(output);
 					}
@@ -2061,6 +2053,7 @@ struct PmuxSelectWorker {
 			}
 		}
 		if (!accepted) log_debug("PMUX select %s.%s: selection cost rejected.\n", log_id(module), log_id(cell));
+		if (accepted && !best.fields) std::vector<std::vector<SigBit>>().swap(tables);
 		return accepted;
 	}
 	SigBit materialize(PmuxSelectGraph &graph, int ref, dict<int, SigBit> &cache) {

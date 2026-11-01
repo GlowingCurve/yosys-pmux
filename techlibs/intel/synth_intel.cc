@@ -21,6 +21,8 @@
 #include "kernel/log.h"
 #include "kernel/register.h"
 #include "kernel/rtlil.h"
+#include "kernel/newcelltypes.h"
+#include "passes/techmap/simplemap.h"
 #include <initializer_list>
 
 USING_YOSYS_NAMESPACE
@@ -92,10 +94,12 @@ struct SynthIntelPass : public ScriptPass {
 		if (help_mode)
 			return true;
 		for (auto module : active_design->selected_modules())
-			for (auto cell : module->selected_cells())
+			for (auto cell : module->cells()) {
+				if (!active_design->selected(module, cell)) continue;
 				for (auto type : types)
 					if (cell->type == type)
 						return true;
+			}
 		return false;
 	}
 
@@ -106,11 +110,65 @@ struct SynthIntelPass : public ScriptPass {
 		for (auto module : active_design->selected_modules()) {
 			if (!module->memories.empty())
 				return true;
-			for (auto cell : module->selected_cells())
-				if (cell->type.begins_with("$mem") || (include_bmux && cell->type == ID($bmux)))
+			for (auto cell : module->cells())
+				if (active_design->selected(module, cell) &&
+					(cell->type.begins_with("$mem") || (include_bmux && cell->type == ID($bmux))))
 					return true;
 		}
 		return false;
+	}
+
+	void map_gates()
+	{
+		if (help_mode) {
+			run("simplemap", "(if all coarse cells support direct mapping)");
+			run("techmap -map +/techmap.v", "(if coarse cells require templates)");
+			return;
+		}
+		dict<RTLIL::IdString, void(*)(RTLIL::Module *, RTLIL::Cell *)> mappers;
+		simplemap_get_mappers(mappers);
+		bool needs_templates = false;
+		for (auto module : active_design->selected_modules()) {
+			for (auto cell : module->cells()) {
+				if (!active_design->selected(module, cell)) continue;
+				if (cell->type.in(ID($lut), ID($sop)) || (cell->type.str()[0] == '$' && !mappers.count(cell->type) &&
+					!StaticCellTypes::categories.is_stdcell(cell->type))) {
+					needs_templates = true;
+					break;
+				}
+			}
+			if (needs_templates) break;
+		}
+		run(needs_templates ? "techmap -map +/techmap.v" : "simplemap");
+	}
+
+	void map_luts()
+	{
+		std::string command = "abc9 -lut 4 -W 300 -script +&scorr;&sweep;&dc2;&b;&syn2,-m;&b;&blut,-K,4;&if,-a";
+		if (dff || help_mode || active_design->scratchpad_get_bool("abc9.dff")) {
+			run(command + (dff ? " -dff" : ""));
+			return;
+		}
+		run(command + " -run check:check");
+		run("abc9_ops -prep_hier");
+		run("scc -specify -set_attr abc9_scc_id {}");
+		active_design->scratchpad_unset("abc9_ops.prep_bypass.did_something");
+		run("abc9_ops -prep_bypass");
+		// 空的旁路设计无需解析通用映射模板。
+		if (GetSize(saved_designs.at("$abc9_map")->modules()) != 0) {
+			run("design -stash $abc9");
+			run("design -load $abc9_map");
+			active_design->push_complete_selection();
+			run("wbflip");
+			run("techmap -autoproc -wb -map %$abc9 -map +/techmap.v A:abc9_flop");
+			run("opt -nodffe -nosdff");
+			run("design -stash $abc9_map");
+			run("design -load $abc9");
+			run("design -delete $abc9");
+		}
+		run("techmap -wb -max_iter 1 -map %$abc9_map -map +/abc9_map.v a:abc9_scc_id %n");
+		run("design -delete $abc9_map");
+		run(command + " -run pre:");
 	}
 
 	void clear_flags() override
@@ -228,9 +286,9 @@ struct SynthIntelPass : public ScriptPass {
 			}
 			run("opt_expr");
 			run("opt_clean");
-			run("opt_intel -nodffe -nosdff");
+			run("opt_pmuxprep -nodffe -nosdff");
 			run("fsm");
-			run("opt_intel");
+			run("opt_pmuxprep");
 			run("wreduce");
 			run("peepopt");
 			run("opt_clean");
@@ -261,7 +319,7 @@ struct SynthIntelPass : public ScriptPass {
 			} else {
 				run("alumacc");
 			}
-			run("opt_intel");
+			run("opt_pmuxprep");
 			if (has_memories(true)) {
 				run("memory -nomap");
 			} else {
@@ -287,15 +345,15 @@ struct SynthIntelPass : public ScriptPass {
 		}
 
 		if (check_label("map_ffram")) {
-			run("opt_intel -fast -mux_undef -undriven -fine -full");
+			run("opt_pmuxprep -fast -mux_undef -undriven -fine -full");
 			if (has_memories())
 				run("memory_map");
-			run("opt_intel -undriven -fine");
+			run("opt_pmuxprep -undriven -fine");
 			std::string pmux_lut = family_opt == "max10" ? "fiftyfivenm_lcell_comb" : family_opt + "_lcell_comb";
 			run("opt_pmuxrel -tables -lut4 " + pmux_lut);
 			run("opt_pmuxselect -recovered-only");
-			run("techmap -map +/techmap.v");
-			run("opt_intel -full");
+			map_gates();
+			run("opt_pmuxprep -full");
 			run("clean -purge");
 			run("setundef -undriven -zero");
 		}
@@ -303,13 +361,13 @@ struct SynthIntelPass : public ScriptPass {
 		if (check_label("map_ffs")) {
 			run("dfflegalize -cell $_DFFE_PN0P_ 01");
 			if (has_cells({ID($_DFFE_PN0P_)}))
-				run("techmap -map +/intel/common/ff_map.v");
+				run("opt_pmuxmap -ff");
 		}
 
 		if (check_label("map_luts")) {
-			run("abc9 -lut 4 -W 300" + string(dff ? " -dff" : ""));
+			map_luts();
 			run("clean");
-			run("opt_intel -fast");
+			run("opt_pmuxprep -fast");
 			run("autoname");
 			run("clean");
 		}
@@ -317,7 +375,7 @@ struct SynthIntelPass : public ScriptPass {
 		if (check_label("map_cells")) {
 			if (iopads || help_mode)
 				run("iopadmap -bits -outpad $__outpad I:O -inpad $__inpad O:I", "(if -iopads)");
-			run(stringf("techmap -map +/intel/%s/cells_map.v", family_opt));
+			run("opt_pmuxmap -family " + family_opt);
 			run("clean -purge");
 		}
 

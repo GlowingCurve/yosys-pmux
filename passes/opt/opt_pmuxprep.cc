@@ -20,7 +20,37 @@
 #include "kernel/register.h"
 #include "kernel/log.h"
 #include "kernel/rtlil.h"
+#include "passes/opt/pmux_celltypes.h"
 #include <initializer_list>
+
+YOSYS_NAMESPACE_BEGIN
+
+PmuxCellTypes::PmuxCellTypes(RTLIL::Module *module, RTLIL::Design *design)
+{
+	setup();
+	for (auto cell : module->cells())
+		if (!cell_known(cell->type))
+			if (auto definition = design->module(cell->type))
+				setup_module(definition);
+}
+
+// 端口查询集中编译，全部 PMUX Pass 共用同一份内部端口表。
+bool PmuxCellTypes::cell_input(const RTLIL::IdString &type, const RTLIL::IdString &port) const
+{
+	return NewCellTypes::cell_input(type, port);
+}
+
+bool PmuxCellTypes::cell_output(const RTLIL::IdString &type, const RTLIL::IdString &port) const
+{
+	return NewCellTypes::cell_output(type, port);
+}
+
+RTLIL::PortDir PmuxCellTypes::cell_port_dir(RTLIL::IdString type, RTLIL::IdString port) const
+{
+	return NewCellTypes::cell_port_dir(type, port);
+}
+
+YOSYS_NAMESPACE_END
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
@@ -28,10 +58,12 @@ PRIVATE_NAMESPACE_BEGIN
 bool has_cells(RTLIL::Design *design, std::initializer_list<RTLIL::IdString> types)
 {
 	for (auto module : design->selected_modules())
-		for (auto cell : module->selected_cells())
+		for (auto cell : module->cells()) {
+			if (!design->selected(module, cell)) continue;
 			for (auto type : types)
 				if (cell->type == type)
 					return true;
+		}
 	return false;
 }
 
@@ -40,7 +72,8 @@ bool has_share_cells(RTLIL::Design *design)
 	for (auto module : design->selected_modules()) {
 		bool has_mux = false;
 		int operators = 0;
-		for (auto cell : module->selected_cells()) {
+		for (auto cell : module->cells()) {
+			if (!design->selected(module, cell)) continue;
 			has_mux |= cell->type.in(ID($mux), ID($pmux), ID($_MUX_));
 			if (operators < 2 && cell->type.in(
 					ID($_AND_), ID($_NAND_), ID($_OR_), ID($_NOR_),
@@ -62,8 +95,8 @@ bool has_share_cells(RTLIL::Design *design)
 bool has_dff_cells_or_init(RTLIL::Design *design)
 {
 	for (auto module : design->selected_modules()) {
-		for (auto cell : module->selected_cells())
-			if (cell->is_builtin_ff())
+		for (auto cell : module->cells())
+			if (design->selected(module, cell) && cell->is_builtin_ff())
 				return true;
 		// opt_dff 会检查模块内全部 init 属性的冲突。
 		for (auto wire : module->wires())
@@ -73,13 +106,13 @@ bool has_dff_cells_or_init(RTLIL::Design *design)
 	return false;
 }
 
-struct OptIntelPass : public Pass {
-	OptIntelPass() : Pass("opt_intel", "perform candidate-aware simple optimizations for Intel synthesis") { }
+struct OptPmuxPrepPass : public Pass {
+	OptPmuxPrepPass() : Pass("opt_pmuxprep", "perform candidate-aware simple optimizations for Intel synthesis") { }
 
 	void help() override
 	{
 		log("\n");
-		log("    opt_intel [options] [selection]\n");
+		log("    opt_pmuxprep [options] [selection]\n");
 		log("\n");
 		log("This pass uses the opt pass ordering and options. Calls to opt_muxtree,\n");
 		log("opt_reduce, opt_share and opt_dff are skipped when the selected design\n");
@@ -128,7 +161,7 @@ struct OptIntelPass : public Pass {
 		bool keepdc_mode = false;
 		bool sat_mode = false;
 
-		log_header(design, "Executing OPT_INTEL pass (performing simple optimizations).\n");
+		log_header(design, "Executing OPT_PMUXPREP pass (performing simple optimizations).\n");
 		log_push();
 
 		size_t argidx;
@@ -217,7 +250,7 @@ struct OptIntelPass : public Pass {
 				if (hier_mode)
 					Pass::call(design, "opt_hier");
 				Pass::call(design, "opt_clean" + opt_clean_args);
-				log_header(design, "Rerunning OPT_INTEL passes. (Removed registers in this run.)\n");
+				log_header(design, "Rerunning OPT_PMUXPREP passes. (Removed registers in this run.)\n");
 			}
 			Pass::call(design, "opt_clean" + opt_clean_args);
 		}
@@ -243,16 +276,16 @@ struct OptIntelPass : public Pass {
 				Pass::call(design, "opt_expr" + opt_expr_args);
 				if (design->scratchpad_get_bool("opt.did_something") == false)
 					break;
-				log_header(design, "Rerunning OPT_INTEL passes. (Maybe there is more to do..)\n");
+				log_header(design, "Rerunning OPT_PMUXPREP passes. (Maybe there is more to do..)\n");
 			}
 		}
 
 		design->optimize();
 		design->check();
 
-		log_header(design, "Finished OPT_INTEL passes.%s\n", fast_mode ? "" : " (There is nothing left to do.)");
+		log_header(design, "Finished OPT_PMUXPREP passes.%s\n", fast_mode ? "" : " (There is nothing left to do.)");
 		log_pop();
 	}
-} OptIntelPass;
+} OptPmuxPrepPass;
 
 PRIVATE_NAMESPACE_END
