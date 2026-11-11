@@ -1,86 +1,24 @@
-// opt_pmuxstate 按控制条件化简触发器输入，并将独热寄存器组转换为编码状态和共享数据寄存器。
-// 共享状态选择和数据存储，减少重复的触发器与组合选择逻辑。
+// opt_pmuxstate 根据分支条件传播常量，压缩同步捕获寄存器组，并化简独热状态比较。
 #include "kernel/yosys.h"
-#include "kernel/sigtools.h"
 #include "kernel/ff.h"
-#include "passes/opt/pmux_celltypes.h"
+#include "passes/opt/pmux_decoder.h"
+#include "passes/opt/pmux_netlist.h"
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
 
 struct PmuxStateWorker {
 	Module *module;
-	Design *design;
-	SigMap sigmap;
+	PmuxNetlist netlist;
+	PmuxDecoder decoder;
 	FfInitVals initvals;
-	PmuxCellTypes types;
-	dict<SigBit, Cell *> drivers;
-	dict<SigBit, std::vector<Cell *>> users;
-	bool users_ready = false;
-	pool<SigBit> protected_bits, kept_bits, conflicted, input_bits;
-	pool<Cell *> removed;
 	pool<Cell *> onehot_states;
 	int proved_states = 0, reused_states = 0, proved_muxes = 0, proved_permutations = 0;
-	int compressed_groups = 0;
-	int &budget;
+	int compressed_groups = 0, compressed_cells = 0;
+	int budget = 262144;
 
-	PmuxStateWorker(Module *module, Design *design, int &budget) : module(module), design(design), sigmap(module), initvals(&sigmap, module), types(module, design), budget(budget)
-	{
-		for (auto wire : module->wires()) {
-			bool keep = wire->get_bool_attribute(ID::keep);
-			if (!wire->port_input && !wire->port_output && !keep) continue;
-			for (auto bit : sigmap(wire)) {
-				if (wire->port_input) {
-					drivers[bit] = nullptr;
-					input_bits.insert(bit);
-				}
-				if (wire->port_output || keep) protected_bits.insert(bit);
-				if (keep) kept_bits.insert(bit);
-			}
-		}
-		for (auto cell : module->cells()) {
-			bool keep = cell->get_bool_attribute(ID::keep);
-			for (auto &port : cell->connections()) {
-				auto direction = types.cell_port_dir(cell->type, port.first);
-				bool input = direction == RTLIL::PD_INPUT || direction == RTLIL::PD_INOUT;
-				bool output = direction == RTLIL::PD_OUTPUT || direction == RTLIL::PD_INOUT;
-				for (auto bit : sigmap(port.second)) {
-					if (output) {
-						if (drivers.count(bit)) {
-							drivers[bit] = nullptr;
-							conflicted.insert(bit);
-						} else {
-							drivers[bit] = cell;
-						}
-					}
-					if ((!input && !output) || keep) {
-						protected_bits.insert(bit);
-						kept_bits.insert(bit);
-						if (!input && !output) {
-							drivers[bit] = nullptr;
-							conflicted.insert(bit);
-						}
-					}
-				}
-			}
-		}
-	}
-
-	Cell *driver(SigBit bit)
-	{
-		if (!bit.wire) return nullptr;
-		auto found = drivers.find(bit);
-		if (found == drivers.end()) return nullptr;
-		auto cell = found->second;
-		return removed.count(cell) ? nullptr : cell;
-	}
-
-	bool editable(Cell *cell, IdString port = ID::Y)
-	{
-		if (!cell || removed.count(cell) || !design->selected(module, cell) || cell->get_bool_attribute(ID::keep) || !cell->hasPort(port)) return false;
-		for (auto bit : sigmap(cell->getPort(port))) if (!bit.wire || kept_bits.count(bit) || driver(bit) != cell) return false;
-		return true;
-	}
+	PmuxStateWorker(Module *module, Design *design) :
+		module(module), netlist(module, design), decoder(netlist), initvals(&netlist.sigmap(), module) {}
 
 	bool spend(int amount)
 	{
@@ -88,67 +26,41 @@ struct PmuxStateWorker {
 		return budget >= 0;
 	}
 
-	bool fact(dict<SigBit, State> &facts, SigBit bit, State value)
-	{
-		if (!bit.wire) return bit.data == value;
-		if (kept_bits.count(bit) || conflicted.count(bit) || (!driver(bit) && !input_bits.count(bit))) return true;
-		auto found = facts.find(bit);
-		if (found != facts.end()) return found->second == value;
-		facts[bit] = value;
-		return true;
-	}
-
-	bool condition(SigBit bit, bool value, dict<SigBit, State> &facts, int depth = 0)
-	{
-		if (depth > 8 || !spend(1)) return false;
-		if (!bit.wire) return bit.data == (value ? State::S1 : State::S0);
-		auto cell = driver(bit);
-		if (!cell || !cell->hasPort(ID::Y) || sigmap(cell->getPort(ID::Y)) != SigSpec(bit)) return true;
-		if (!cell->type.in(ID($eq), ID($ne), ID($logic_not), ID($not), ID($reduce_or), ID($reduce_bool), ID($reduce_and), ID($logic_and), ID($logic_or))) return true;
-		auto a = sigmap(cell->getPort(ID::A));
-		if (GetSize(a) > 256 || !spend(GetSize(a))) return false;
-		if ((cell->type == ID($logic_not) && value) || (cell->type.in(ID($reduce_or), ID($reduce_bool)) && !value) || (cell->type == ID($reduce_and) && value)) {
-			State constant = cell->type == ID($reduce_and) ? State::S1 : State::S0;
-			for (auto input : a) if (!fact(facts, input, constant)) return false;
-		} else if (cell->type.in(ID($logic_not), ID($not)) && GetSize(a) == 1) {
-			return condition(a[0], !value, facts, depth + 1);
-		} else if ((cell->type == ID($eq) && value) || (cell->type == ID($ne) && !value)) {
-			if (cell->getParam(ID::A_SIGNED).as_bool() || cell->getParam(ID::B_SIGNED).as_bool()) return true;
-			auto b = sigmap(cell->getPort(ID::B));
-			if (GetSize(b) > 256 || !spend(GetSize(b))) return false;
-			if (a.is_fully_const()) std::swap(a, b);
-			if (!b.is_fully_def()) return true;
-			int width = std::max(GetSize(a), GetSize(b));
-			a.extend_u0(width);
-			b.extend_u0(width);
-			for (int i = 0; i < width; i++) if (!fact(facts, a[i], b[i].data)) return false;
-		} else if ((cell->type == ID($logic_and) && value) || (cell->type == ID($logic_or) && !value)) {
-			auto b = sigmap(cell->getPort(ID::B));
-			if (GetSize(a) == 1 && GetSize(b) == 1) return condition(a[0], value, facts, depth + 1) && condition(b[0], value, facts, depth + 1);
-		}
-		return true;
-	}
-
 	void specialize(Cell *cell)
 	{
-		if (!editable(cell) || !cell->type.in(ID($mux), ID($pmux))) return;
-		auto s = sigmap(cell->getPort(ID::S));
-		int width = GetSize(cell->getPort(ID::A));
+		if (!cell->type.in(ID($mux), ID($pmux)) || !netlist.editable(cell)) return;
+		const auto &s = netlist.port(cell, ID::S);
+		auto a = cell->getPort(ID::A), b = cell->getPort(ID::B);
+		int width = GetSize(a);
 		if (width > 4096 || GetSize(s) > 16 || !spend(width * GetSize(s))) return;
-		int branches = cell->type == ID($mux) ? 2 : GetSize(s);
-		for (int index = 0; index < branches; index++) {
-			IdString port = cell->type == ID($mux) && index == 0 ? ID::A : ID::B;
-			int offset = cell->type == ID($pmux) ? index * width : 0;
+		bool parallel = cell->type == ID($pmux);
+		int branches = parallel ? GetSize(s) : 2;
+		for (int index = 0; index < branches && budget > 0; index++) {
+			bool selected = parallel || index != 0;
+			IdString port = selected ? ID::B : ID::A;
+			int offset = parallel ? index * width : 0;
 			dict<SigBit, State> facts;
-			if (!condition(cell->type == ID($mux) ? s[0] : s[index], cell->type == ID($pmux) || index != 0, facts)) continue;
-			auto signal = cell->getPort(port);
-			for (int i = offset; i < offset + width; i++) {
-				auto bit = sigmap(signal[i]);
-				if (facts.count(bit)) signal[i] = facts.at(bit);
+			if (!decoder.condition(s[parallel ? index : 0], selected, facts, budget)) continue;
+			auto &signal = selected ? b : a;
+			auto replacement = signal.extract(offset, width);
+			const auto &mapped = netlist.port(cell, port);
+			for (int i = 0; i < width; i++) {
+				auto fact = facts.find(mapped[offset + i]);
+				if (fact != facts.end()) replacement[i] = fact->second;
 			}
-			if (!sigmap(signal.extract(offset, width)).is_fully_def()) continue;
-			cell->setPort(port, signal);
+			if (netlist.sigmap()(replacement).is_fully_def())
+				signal.replace(offset, replacement);
 		}
+		bool changed_a = a != cell->getPort(ID::A), changed_b = b != cell->getPort(ID::B);
+		if (!parallel && width == 1 && changed_a != changed_b) {
+			auto input = netlist.port(cell, changed_a ? ID::A : ID::B)[0];
+			auto other = netlist.port(cell, changed_a ? ID::B : ID::A)[0];
+			// 单比特选择仍占用一个 LUT，保留继续被使用的数据输入。
+			if (other.wire && (netlist.protected_bit(input) || GetSize(netlist.users(input)) > 1))
+				return;
+		}
+		if (changed_a) netlist.set_port(cell, ID::A, a);
+		if (changed_b) netlist.set_port(cell, ID::B, b);
 	}
 
 	bool onehot(const Const &value)
@@ -159,9 +71,9 @@ struct PmuxStateWorker {
 		return count == 1;
 	}
 
-	bool ff_type(Cell *cell)
+	bool ff_type(IdString type)
 	{
-		return cell && cell->type.in(ID($dff), ID($dffe), ID($adff), ID($adffe), ID($sdff), ID($sdffe), ID($sdffce));
+		return type.in(ID($dff), ID($dffe), ID($adff), ID($adffe), ID($sdff), ID($sdffe), ID($sdffce));
 	}
 
 	bool permutation(const SigSpec &d, const SigSpec &q)
@@ -180,7 +92,7 @@ struct PmuxStateWorker {
 	bool onehot_update(SigSpec value, const SigSpec &q, OnehotUpdate &proof, int &height, int depth = 0)
 	{
 		if (depth > 8 || GetSize(value) != GetSize(q) || !spend(GetSize(value))) return false;
-		value = sigmap(value);
+		value = netlist.sigmap()(value);
 		auto found = proof.heights.find(value);
 		if (found != proof.heights.end()) {
 			height = found->second;
@@ -197,8 +109,8 @@ struct PmuxStateWorker {
 			height = 0;
 			return true;
 		}
-		auto cell = driver(value[0]);
-		if (!editable(cell) || cell->type != ID($mux) || sigmap(cell->getPort(ID::Y)) != value) return false;
+		auto cell = netlist.driver(value[0]);
+		if (!cell || cell->type != ID($mux) || !netlist.editable(cell) || netlist.port(cell, ID::Y) != value) return false;
 		if (GetSize(cell->getPort(ID::A)) != GetSize(q) || GetSize(cell->getPort(ID::B)) != GetSize(q) ||
 			GetSize(cell->getPort(ID::S)) != 1) return false;
 		if (proof.active.count(cell) || (!proof.muxes.count(cell) && GetSize(proof.muxes) >= 16)) return false;
@@ -222,9 +134,10 @@ struct PmuxStateWorker {
 			reused_states++;
 			return true;
 		}
-		if (!ff_type(state) || !editable(state, ID::Q)) return false;
+		log_assert(ff_type(state->type));
+		if (!netlist.editable(state, ID::Q)) return false;
 		FfData ff(&initvals, state);
-		auto q = sigmap(ff.sig_q);
+		auto q = netlist.sigmap()(ff.sig_q);
 		int width = GetSize(q);
 		if (!ff.has_clk || ff.has_aload || ff.has_sr || width < 2 || width > 64 || !spend(width)) return false;
 		pool<SigBit> unique(q.begin(), q.end());
@@ -248,152 +161,134 @@ struct PmuxStateWorker {
 
 	void collect_onehot_decode(Cell *cell, std::vector<OnehotDecode> &replacements)
 	{
-		if (!editable(cell) || !cell->type.in(ID($eq), ID($logic_not)) || GetSize(cell->getPort(ID::Y)) != 1) return;
-		auto q = sigmap(cell->getPort(ID::A));
-		SigSpec constant = cell->type == ID($logic_not) ? SigSpec(State::S0, GetSize(q)) : sigmap(cell->getPort(ID::B));
-		if (q.is_fully_const()) std::swap(q, constant);
-		if (GetSize(q) < 2 || GetSize(q) > 64 || !constant.is_fully_def() || GetSize(constant) > GetSize(q) || !spend(GetSize(q))) return;
-		if (cell->type == ID($eq) && (cell->getParam(ID::A_SIGNED).as_bool() || cell->getParam(ID::B_SIGNED).as_bool())) return;
-		constant.extend_u0(GetSize(q));
-		if (!onehot(constant.as_const())) return;
-		auto state = driver(q[0]);
-		if (!ff_type(state) || sigmap(state->getPort(ID::Q)) != q || !prove_onehot_state(state)) return;
-		int index = 0;
-		while (constant[index] != State::S1) index++;
-		replacements.push_back({cell, q[index]});
+		if (!cell->type.in(ID($eq), ID($logic_not)) || GetSize(cell->getPort(ID::Y)) != 1 || !netlist.editable(cell)) return;
+		PmuxDecoder::Cube cube;
+		if (!decoder.decode(netlist.port(cell, ID::Y)[0], cube) || cube.dead) return;
+		int width = GetSize(cube.bits);
+		if (width < 2 || width > 64 || !spend(width)) return;
+		log_assert(cube.cell == cell);
+		auto state = netlist.driver(cube.bits.begin()->first);
+		if (!state || !ff_type(state->type)) return;
+		const auto &q = netlist.port(state, ID::Q);
+		if (GetSize(q) != width) return;
+		SigBit selected;
+		for (auto bit : q) {
+			auto binding = cube.bits.find(bit);
+			if (binding == cube.bits.end()) return;
+			if (!binding->second) continue;
+			if (selected.wire) return;
+			selected = bit;
+		}
+		if (selected.wire && prove_onehot_state(state))
+			replacements.push_back({cell, selected});
 	}
 
-	bool rewrite_onehot_decodes()
+	void rewrite_onehot_decodes()
 	{
 		std::vector<OnehotDecode> replacements;
 		for (auto cell : module->selected_cells()) {
 			if (budget <= 0) break;
 			collect_onehot_decode(cell, replacements);
 		}
-		onehot_states.clear();
-		for (auto &item : replacements) {
-			log_assert(editable(item.cell));
-			module->connect(item.cell->getPort(ID::Y), item.replacement);
+		for (const auto &item : replacements) {
+			log_assert(netlist.editable(item.cell));
+			auto output = item.cell->getPort(ID::Y);
+			netlist.forget_cell(item.cell);
+			module->remove(item.cell);
+			netlist.connect(output, item.replacement);
 		}
-		for (auto &item : replacements) module->remove(item.cell);
 		if (!replacements.empty())
 			log("opt_pmuxstate %s: onehot_states=%d reuses=%d update_muxes=%d permutations=%d decodes=%d.\n",
 				log_id(module), proved_states, reused_states, proved_muxes, proved_permutations, GetSize(replacements));
-		return !replacements.empty();
 	}
 
-	struct Decode {
-		Cell *cell = nullptr;
-		SigSpec signal;
-		int value = -1;
-	};
-
-	Decode decode(SigBit bit)
+	bool capture_matches(SigBit enable, const PmuxDecoder::Cube &select, const SigSpec &q, const SigSpec &d) const
 	{
-		Decode result;
-		auto cell = driver(bit);
-		if (!cell || !cell->hasPort(ID::Y) || sigmap(cell->getPort(ID::Y)) != SigSpec(bit)) return result;
-		if (!cell->type.in(ID($eq), ID($logic_not))) return result;
-		auto signal = sigmap(cell->getPort(ID::A));
-		SigSpec constant = cell->type == ID($logic_not) ? SigSpec(State::S0, GetSize(signal)) : sigmap(cell->getPort(ID::B));
-		if (signal.is_fully_const()) std::swap(signal, constant);
-		if (signal.empty() || GetSize(signal) > 4 || !constant.is_fully_def() || GetSize(constant) > GetSize(signal)) return result;
-		if (cell->type == ID($eq) && (cell->getParam(ID::A_SIGNED).as_bool() || cell->getParam(ID::B_SIGNED).as_bool())) return result;
-		constant.extend_u0(GetSize(signal));
-		result.cell = cell;
-		result.signal = signal;
-		result.value = constant.as_int();
-		return result;
-	}
-
-	bool private_to(const SigSpec &signal, const pool<Cell *> &allowed)
-	{
-		for (auto bit : signal) {
-			if (!bit.wire || protected_bits.count(bit) || conflicted.count(bit)) return false;
-			// 压缩检查实际需要用户关系时才建立索引。
-			if (!users_ready) {
-				for (auto cell : module->cells()) index_inputs(cell);
-				users_ready = true;
-			}
-			for (auto user : users[bit]) if (!removed.count(user) && !allowed.count(user)) return false;
-		}
-		return true;
-	}
-
-	void index_inputs(Cell *cell)
-	{
-		for (auto &port : cell->connections()) {
-			auto direction = types.cell_port_dir(cell->type, port.first);
-			bool input = direction == RTLIL::PD_INPUT || direction == RTLIL::PD_INOUT;
-			bool output = direction == RTLIL::PD_OUTPUT || direction == RTLIL::PD_INOUT;
-			if (input || !output) for (auto bit : sigmap(port.second)) {
-				auto &list = users[bit];
-				if (list.empty() || list.back() != cell) list.push_back(cell);
+		PmuxDecoder::Cube capture;
+		if (!decoder.decode(enable, capture) || !capture.cell) return false;
+		log_assert(GetSize(q) == GetSize(d));
+		dict<SigBit, bool> expected;
+		bool dead = false;
+		for (int i = 0; i < GetSize(q); i++) {
+			bool value = select.bits.at(q[i]);
+			auto bit = d[i];
+			if (!bit.wire) {
+				if (bit != State::S0 && bit != State::S1) return false;
+				dead |= (bit == State::S1) != value;
+			} else {
+				auto binding = expected.emplace(bit, value);
+				dead |= !binding.second && binding.first->second != value;
 			}
 		}
+		return capture.dead == dead && (dead || capture.bits == expected);
 	}
 
 	void compress(Cell *cell)
 	{
-		if (!editable(cell) || cell->type != ID($pmux)) return;
-		auto s = sigmap(cell->getPort(ID::S)), b = sigmap(cell->getPort(ID::B));
-		int count = GetSize(s), width = GetSize(cell->getPort(ID::A));
-		if (count < 2 || count > 16 || width > 4096 || !sigmap(cell->getPort(ID::A)).is_fully_undef() || !spend(count * width)) return;
-		std::vector<Decode> selects;
-		pool<Cell *> old_cells = {cell};
-		pool<int> values;
-		SigSpec state_q;
-		for (auto bit : s) {
-			auto item = decode(bit);
-			if (!item.cell || !editable(item.cell) || (state_q.size() && item.signal != state_q) || !values.insert(item.value).second) return;
-			state_q = item.signal;
-			selects.push_back(item);
-			old_cells.insert(item.cell);
-		}
-		if (count != (1 << GetSize(state_q))) return;
-		auto state = driver(state_q[0]);
-		if (!ff_type(state) || !editable(state, ID::Q)) return;
+		if (!netlist.editable(cell)) return;
+		const auto &b = netlist.port(cell, ID::B);
+		int count = GetSize(netlist.port(cell, ID::S)), width = GetSize(netlist.port(cell, ID::A));
+		if (count < 2 || count > 16 || width > 4096 || !netlist.port(cell, ID::A).is_fully_undef() || !spend(count * width)) return;
+		log_assert(width > 0);
+		PmuxDecoder::Table table;
+		if (!decoder.table(cell, table) || !table.prefix.empty() || count != GetSize(table.branch_for_code)) return;
+		auto state = netlist.driver(table.control[0]);
+		if (!state || !ff_type(state->type) || !netlist.editable(state, ID::Q)) return;
 		FfData ff(&initvals, state);
-		if (!ff.has_clk || ff.has_ce || ff.has_arst || ff.has_srst || ff.has_sr || ff.has_aload || sigmap(ff.sig_q) != state_q || !ff.val_init.is_fully_def()) return;
+		const auto &state_q = netlist.port(state, ID::Q);
+		if (!ff.has_clk || ff.has_ce || ff.has_arst || ff.has_srst || ff.has_sr || ff.has_aload ||
+			GetSize(state_q) != GetSize(table.control) || !ff.val_init.is_fully_def()) return;
+		dict<SigBit, int> offsets;
+		for (int i = 0; i < GetSize(state_q); i++) offsets.emplace(state_q[i], i);
+		int initial_code = 0;
+		for (int i = 0; i < GetSize(table.control); i++) {
+			auto offset = offsets.find(table.control[i]);
+			if (offset == offsets.end()) return;
+			if (ff.val_init[offset->second] == State::S1)
+				initial_code |= 1 << i;
+		}
+		int initial_branch = table.branch_for_code[initial_code];
+		log_assert(initial_branch >= 0 && initial_branch < count);
+		auto old_cells = table.region;
 		old_cells.insert(state);
-		auto select_d = sigmap(ff.sig_d);
+		auto select_d = netlist.sigmap()(ff.sig_d);
+		auto clock = netlist.sigmap()(ff.sig_clk);
 		pool<Cell *> banks;
 		SigSpec new_b, new_s;
 		Const output_init;
 		for (int i = 0; i < count; i++) {
 			auto q = b.extract(i * width, width);
-			auto bank = driver(q[0]);
-			if (!ff_type(bank) || !editable(bank, ID::Q) || !banks.insert(bank).second || bank == state) return;
+			auto bank = netlist.driver(q[0]);
+			if (!bank || !ff_type(bank->type) || !netlist.editable(bank, ID::Q) || !banks.insert(bank).second || bank == state) return;
 			FfData data(&initvals, bank);
-			if (!data.has_clk || data.has_arst || data.has_srst || data.has_sr || data.has_aload || data.pol_clk != ff.pol_clk || sigmap(data.sig_clk) != sigmap(ff.sig_clk) || sigmap(data.sig_q) != q) return;
-			SigSpec input = sigmap(data.sig_d), enable;
-			Cell *feedback = nullptr;
+			if (!data.has_clk || data.has_arst || data.has_srst || data.has_sr || data.has_aload || data.pol_clk != ff.pol_clk ||
+				netlist.sigmap()(data.sig_clk) != clock || netlist.port(bank, ID::Q) != q) return;
+			SigSpec input = netlist.sigmap()(data.sig_d), enable;
 			if (data.has_ce) {
 				if (!data.pol_ce) return;
-				enable = sigmap(data.sig_ce);
+				enable = netlist.sigmap()(data.sig_ce);
 			} else {
-				feedback = driver(input[0]);
-				if (!editable(feedback) || feedback->type != ID($mux) || sigmap(feedback->getPort(ID::Y)) != input || sigmap(feedback->getPort(ID::A)) != q) return;
-				enable = sigmap(feedback->getPort(ID::S));
-				input = sigmap(feedback->getPort(ID::B));
+				auto feedback = netlist.driver(input[0]);
+				if (!feedback || feedback->type != ID($mux) || !netlist.editable(feedback) ||
+					netlist.port(feedback, ID::Y) != input || netlist.port(feedback, ID::A) != q) return;
+				enable = netlist.port(feedback, ID::S);
+				input = netlist.port(feedback, ID::B);
 				old_cells.insert(feedback);
 			}
-			if (GetSize(enable) != 1) return;
-			auto capture = decode(enable[0]);
-			if (!capture.cell || capture.signal != select_d || capture.value != selects[i].value) return;
+			if (GetSize(enable) != 1 || !capture_matches(enable[0], table.cubes[i], state_q, select_d)) return;
 			old_cells.insert(bank);
 			new_b.append(input);
 			new_s.append(enable);
-			if (selects[i].value == ff.val_init.as_int()) output_init = data.val_init;
+			if (i == initial_branch) output_init = data.val_init;
 		}
 		if (GetSize(output_init) != width || !output_init.is_fully_def()) return;
-		if (!private_to(state_q, old_cells)) return;
-		for (auto item : selects) if (!private_to(sigmap(item.cell->getPort(ID::Y)), old_cells)) return;
-		for (auto bank : banks) if (!private_to(sigmap(bank->getPort(ID::Q)), old_cells)) return;
-		for (auto item : old_cells) if (item != cell && item != state && !banks.count(item) && item->type == ID($mux))
-			if (!private_to(sigmap(item->getPort(ID::Y)), old_cells)) return;
-		for (auto signal : {new_b, new_s, sigmap(ff.sig_clk)}) for (auto bit : signal)
-			if (old_cells.count(driver(bit))) return;
+		pool<SigBit> retained;
+		for (const auto *signal : {&new_b, &new_s, &clock})
+			retained.insert(signal->begin(), signal->end());
+		const auto &y = netlist.port(cell, ID::Y);
+		pool<SigBit> targets(y.begin(), y.end());
+		auto removed = netlist.private_cells(old_cells, {cell}, targets, retained);
+		if (removed != old_cells) return;
 		if (!spend(2 * width + GetSize(new_b) + GetSize(new_s) + 1)) return;
 		// 关系 y=M(sr,bank) 在初始条件成立；每个时钟边沿所选 bank 捕获对应输入，因此关系经一步保持。
 		auto input = module->addWire(NEW_ID, width);
@@ -408,25 +303,29 @@ struct PmuxStateWorker {
 		output.val_init = output_init;
 		auto shared_ff = output.emit();
 		log_assert(shared_ff);
-		index_inputs(shared_mux);
-		index_inputs(shared_ff);
-		for (auto old : old_cells) {
-			if (ff_type(old)) initvals.remove_init(sigmap(old->getPort(ID::Q)));
-			removed.insert(old);
+		for (auto old : removed) {
+			if (ff_type(old->type)) initvals.remove_init(netlist.port(old, ID::Q));
+			netlist.forget_cell(old);
+			module->remove(old);
 		}
+		netlist.register_cell(shared_mux);
+		netlist.register_cell(shared_ff);
 		compressed_groups++;
+		compressed_cells += GetSize(removed);
 	}
 
-	bool compress_banks()
+	void compress_banks()
 	{
-		auto cells = module->selected_cells();
-		for (auto cell : cells) if (cell->type == ID($pmux) && budget > 0) compress(cell);
-		if (removed.empty()) return false;
-		int count = GetSize(removed);
-		for (auto cell : removed) module->remove(cell);
-		removed.clear();
-		log("opt_pmuxstate %s: compressed_bank_groups=%d removed_cells=%d.\n", log_id(module), compressed_groups, count);
-		return true;
+		std::vector<Cell *> candidates;
+		for (auto cell : module->selected_cells())
+			if (cell->type == ID($pmux))
+				candidates.push_back(cell);
+		for (auto cell : candidates) {
+			if (budget <= 0) break;
+			compress(cell);
+		}
+		if (compressed_groups != 0)
+			log("opt_pmuxstate %s: compressed_bank_groups=%d removed_cells=%d.\n", log_id(module), compressed_groups, compressed_cells);
 	}
 
 	void specialize_branches()
@@ -457,17 +356,10 @@ struct OptPmuxStatePass : Pass {
 				break;
 			}
 			if (!candidate) continue;
-			int budget = 262144;
-			auto worker = std::make_unique<PmuxStateWorker>(module, design, budget);
-			if (worker->compress_banks()) {
-				worker.reset();
-				worker = std::make_unique<PmuxStateWorker>(module, design, budget);
-			}
-			if (worker->rewrite_onehot_decodes()) {
-				worker.reset();
-				worker = std::make_unique<PmuxStateWorker>(module, design, budget);
-			}
-			worker->specialize_branches();
+			PmuxStateWorker worker(module, design);
+			worker.compress_banks();
+			worker.rewrite_onehot_decodes();
+			worker.specialize_branches();
 		}
 	}
 } OptPmuxStatePass;

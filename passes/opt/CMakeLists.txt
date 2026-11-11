@@ -79,6 +79,10 @@ yosys_pass(opt
 yosys_pass(opt_pmuxprep
 	opt_pmuxprep.cc
 	opt_pmuxmap.cc
+	pmux_netlist.cc
+	pmux_decoder.cc
+	pmux_lut_graph.cc
+	pmux_lut_cost.cc
 	PROVIDES
 		opt_pmuxmap
 	REQUIRES

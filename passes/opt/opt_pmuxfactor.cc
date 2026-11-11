@@ -1,41 +1,21 @@
 // opt_pmuxfactor 提取 PMUX 分支的公共运算并前移归约运算；复用分支表达式与端口映射，减少选择逻辑和重复运算。
 #include "kernel/yosys.h"
-#include "kernel/sigtools.h"
-#include "kernel/celltypes.h"
 #include "kernel/utils.h"
-#include "passes/opt/pmux_celltypes.h"
 #include "passes/opt/pmux_lut_cost.h"
+#include "passes/opt/pmux_netlist.h"
 #include <deque>
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
-
-using LutCostGraph = PmuxLutCost::LutCostGraph;
 
 struct PmuxFactorWorker {
 	using OpBit = std::pair<Cell *, int>;
 	using Signature = std::tuple<IdString, SigSpec>;
 	Module *module;
-	SigMap sigmap;
-	PmuxCellTypes types;
-	dict<SigBit, OpBit> drivers;
-	dict<SigBit, std::vector<Cell *>> users;
-	bool users_built = false;
-	dict<std::pair<Cell *, IdString>, const SigSpec *> ports;
-	std::deque<SigSpec> port_signals;
+	PmuxNetlist netlist;
+	PmuxLutCost::ModuleCost module_cost;
 	dict<Cell *, bool> pmux_readable;
 	dict<Cell *, bool> supported_cells;
 	dict<OpBit, SigSpec> expression_cache;
-	dict<SigBit, std::pair<bool, SigSpec>> input_cache;
-	struct LutExpression {
-		SigSpec inputs;
-		uint16_t table;
-	};
-	dict<OpBit, LutExpression> lut_expressions;
-	pool<OpBit> lut_boundaries;
-	pool<SigBit> protected_bits, kept_bits, uncertain_bits;
-	pool<SigBit> live_bits;
-	bool live_built = false;
-	pool<Cell *> selected, uncertain_cells;
 	dict<Signature, std::vector<SigBit>> operators;
 	bool operators_built = false;
 	int changes = 0;
@@ -73,67 +53,16 @@ struct PmuxFactorWorker {
 		bool valid = true;
 	};
 	struct Estimate {
-		bool valid = true;
+		bool valid = false;
 		int removed = 0, added = 0, retained = 0;
 		pool<OpBit> erased;
 	};
 
-	PmuxFactorWorker(Module *module, Design *design) : module(module), sigmap(module), types(module, design)
-	{
-		for (auto wire : module->wires()) {
-			bool keep = wire->get_bool_attribute(ID::keep);
-			if (!wire->port_input && !wire->port_output && !keep) continue;
-			for (auto bit : sigmap(wire)) {
-				if (wire->port_input) drivers[bit] = {nullptr, 0};
-				if (wire->port_output || keep) {
-					protected_bits.insert(bit);
-					if (keep) kept_bits.insert(bit);
-				}
-			}
-		}
-		for (auto cell : module->cells()) {
-			if (design->selected(module, cell)) selected.insert(cell);
-			bool keep = cell->get_bool_attribute(ID::keep);
-			for (auto &port : cell->connections()) {
-				auto signal = sigmap(port.second);
-				auto direction = types.cell_port_dir(cell->type, port.first);
-				bool unknown = direction == RTLIL::PD_UNKNOWN || direction == RTLIL::PD_INOUT;
-				if (unknown) uncertain_cells.insert(cell);
-				bool output = unknown || direction == RTLIL::PD_OUTPUT;
-				for (int i = 0; i < GetSize(signal); i++) {
-					if (unknown) uncertain_bits.insert(signal[i]);
-					if (output) {
-						if (drivers.count(signal[i])) {
-							drivers[signal[i]] = {nullptr, 0};
-							uncertain_bits.insert(signal[i]);
-						} else drivers[signal[i]] = {cell, i};
-					}
-					if (keep) {
-						protected_bits.insert(signal[i]);
-						kept_bits.insert(signal[i]);
-					}
-				}
-			}
-		}
-	}
-
-	void ensure_users()
-	{
-		if (users_built) return;
-		for (auto cell : module->cells()) for (auto &port : cell->connections()) {
-			auto direction = types.cell_port_dir(cell->type, port.first);
-			if (direction != RTLIL::PD_UNKNOWN && direction != RTLIL::PD_INOUT && direction != RTLIL::PD_INPUT) continue;
-			for (auto bit : sigmap(port.second)) {
-				auto &list = users[bit];
-				if (list.empty() || list.back() != cell) list.push_back(cell);
-			}
-		}
-		users_built = true;
-	}
+	PmuxFactorWorker(Module *module, Design *design) : module(module), netlist(module, design), module_cost(netlist) {}
 
 	bool check_supported(Cell *cell)
 	{
-		if (!cell->type.in(ID($and), ID($or), ID($xor), ID($xnor), ID($mux)) || uncertain_cells.count(cell)) return false;
+		if (!cell->type.in(ID($and), ID($or), ID($xor), ID($xnor), ID($mux)) || netlist.uncertain_cell(cell)) return false;
 		if (!cell->hasPort(ID::A) || !cell->hasPort(ID::B) || !cell->hasPort(ID::Y)) return false;
 		int width = GetSize(cell->getPort(ID::Y));
 		if (cell->type == ID($mux))
@@ -159,52 +88,14 @@ struct PmuxFactorWorker {
 		if (operators_built) return;
 		log_assert(operators.empty());
 		for (auto cell : module->cells()) if (supported(cell)) {
-			const auto &y = port(cell, ID::Y);
-			for (int i = 0; i < GetSize(y); i++)
-				if (!uncertain_bits.count(y[i]) && drivers.count(y[i]) && drivers.at(y[i]) == OpBit(cell, i))
+			const auto &y = netlist.port(cell, ID::Y);
+			for (int i = 0; i < GetSize(y); i++) {
+				auto source = netlist.source(y[i]);
+				if (source && source->cell == cell && source->port == ID::Y && source->offset == i)
 					operators[signature(cell->type, expression_inputs(cell, i))].push_back(y[i]);
+			}
 		}
 		operators_built = true;
-	}
-
-	bool editable(Cell *cell)
-	{
-		if (!cell->hasPort(ID::Y) || !selected.count(cell) || cell->get_bool_attribute(ID::keep) || uncertain_cells.count(cell)) return false;
-		pool<SigBit> seen;
-		auto y = sigmap(cell->getPort(ID::Y));
-		for (int i = 0; i < GetSize(y); i++)
-			if (!y[i].wire || !seen.insert(y[i]).second || kept_bits.count(y[i]) || uncertain_bits.count(y[i]) ||
-				!drivers.count(y[i]) || drivers.at(y[i]) != OpBit(cell, i)) return false;
-		return true;
-	}
-
-	const SigSpec &port(Cell *cell, IdString name)
-	{
-		auto key = std::make_pair(cell, name);
-		auto found = ports.find(key);
-		if (found != ports.end()) return *found->second;
-		log_assert(cell->hasPort(name));
-		port_signals.push_back(sigmap(cell->getPort(name)));
-		ports[key] = &port_signals.back();
-		return port_signals.back();
-	}
-
-	bool can_remove(OpBit source)
-	{
-		auto cell = source.first;
-		log_assert(source.second >= 0 && source.second < GetSize(cell->getPort(ID::Y)));
-		auto bit = port(cell, ID::Y)[source.second];
-		return selected.count(cell) && !cell->get_bool_attribute(ID::keep) && !kept_bits.count(bit) &&
-			!uncertain_bits.count(bit) && bit.wire && drivers.count(bit) && drivers.at(bit) == source;
-	}
-
-	SigBit operand(Cell *cell, IdString port, int index)
-	{
-		const auto &signal = this->port(cell, port);
-		bool sign = cell->getParam(ID::A_SIGNED).as_bool();
-		if (cell->hasPort(ID::B)) sign &= cell->getParam(ID::B_SIGNED).as_bool();
-		if (index < GetSize(signal)) return signal[index];
-		return sign && !signal.empty() ? signal.back() : SigBit(State::S0);
 	}
 
 	const SigSpec &expression_inputs(Cell *cell, int offset)
@@ -215,12 +106,12 @@ struct PmuxFactorWorker {
 		log_assert(supported(cell) && offset >= 0 && offset < GetSize(cell->getPort(ID::Y)));
 		SigSpec result;
 		if (cell->type == ID($mux)) {
-			result.append(port(cell, ID::A)[offset]);
-			result.append(port(cell, ID::B)[offset]);
-			result.append(port(cell, ID::S));
+			result.append(netlist.port(cell, ID::A)[offset]);
+			result.append(netlist.port(cell, ID::B)[offset]);
+			result.append(netlist.port(cell, ID::S));
 		} else {
-			result.append(operand(cell, ID::A, offset));
-			result.append(operand(cell, ID::B, offset));
+			result.append(netlist.operand(cell, ID::A, offset));
+			result.append(netlist.operand(cell, ID::B, offset));
 		}
 		expression_cache[source] = result;
 		return expression_cache.at(source);
@@ -234,12 +125,10 @@ struct PmuxFactorWorker {
 
 	bool expression(SigBit bit, IdString &type, SigBit &a, SigBit &b)
 	{
-		auto found = drivers.find(bit);
-		if (found == drivers.end() || !found->second.first || uncertain_bits.count(bit)) return false;
-		auto source = found->second;
-		if (!supported(source.first)) return false;
-		auto inputs = expression_inputs(source.first, source.second);
-		type = source.first->type;
+		auto source = netlist.source(bit);
+		if (!source || !source->cell || source->port != ID::Y || !supported(source->cell)) return false;
+		auto inputs = expression_inputs(source->cell, source->offset);
+		type = source->cell->type;
 		a = inputs[0];
 		b = inputs[1];
 		return true;
@@ -247,14 +136,15 @@ struct PmuxFactorWorker {
 
 	bool check_pmux_shape(Cell *cell)
 	{
-		if (cell->type != ID($pmux) || uncertain_cells.count(cell) || !cell->hasPort(ID::A) || !cell->hasPort(ID::B) ||
+		if (cell->type != ID($pmux) || netlist.uncertain_cell(cell) || !cell->hasPort(ID::A) || !cell->hasPort(ID::B) ||
 			!cell->hasPort(ID::S) || !cell->hasPort(ID::Y) || !cell->hasParam(ID::WIDTH) || !cell->hasParam(ID::S_WIDTH)) return false;
-		const auto &a = port(cell, ID::A), &b = port(cell, ID::B), &s = port(cell, ID::S), &y = port(cell, ID::Y);
-		if (GetSize(a) != GetSize(y) || GetSize(b) != GetSize(y)*GetSize(s) ||
+		const auto &a = netlist.port(cell, ID::A), &b = netlist.port(cell, ID::B), &s = netlist.port(cell, ID::S), &y = netlist.port(cell, ID::Y);
+		if (GetSize(a) != GetSize(y) || GetSize(b) != int64_t(GetSize(y))*GetSize(s) ||
 			cell->getParam(ID::WIDTH).as_int() != GetSize(y) || cell->getParam(ID::S_WIDTH).as_int() != GetSize(s)) return false;
-		pool<SigBit> seen;
-		for (int i = 0; i < GetSize(y); i++) if (!y[i].wire || !seen.insert(y[i]).second || uncertain_bits.count(y[i]) ||
-			!drivers.count(y[i]) || drivers.at(y[i]) != OpBit(cell, i)) return false;
+		for (int i = 0; i < GetSize(y); i++) {
+			auto source = netlist.source(y[i]);
+			if (!source || source->cell != cell || source->port != ID::Y || source->offset != i) return false;
+		}
 		return true;
 	}
 
@@ -267,112 +157,13 @@ struct PmuxFactorWorker {
 		return valid;
 	}
 
-	bool read_original_inputs(SigBit bit, SigSpec &inputs)
-	{
-		if (!bit.wire) return true;
-		if (uncertain_bits.count(bit)) return false;
-		auto found = drivers.find(bit);
-		if (found == drivers.end() || !found->second.first) return true;
-		auto source = found->second;
-		auto cell = source.first;
-		if (uncertain_cells.count(cell)) return false;
-		if (StaticCellTypes::categories.is_ff(cell->type)) return true;
-		if (supported(cell)) {
-			inputs = expression_inputs(cell, source.second);
-			return true;
-		}
-		if (cell->type == ID($pmux)) {
-			if (!readable_pmux(cell)) return false;
-			const auto &a = port(cell, ID::A), &b = port(cell, ID::B), &s = port(cell, ID::S), &y = port(cell, ID::Y);
-			log_assert(source.second >= 0 && source.second < GetSize(y) && y[source.second] == bit);
-			inputs.append(a[source.second]);
-			inputs.append(s);
-			for (int i = 0; i < GetSize(s); i++) inputs.append(b[i*GetSize(y)+source.second]);
-			return true;
-		}
-		if (!types.cell_evaluable(cell->type)) return false;
-		for (auto &connection : cell->connections()) if (types.cell_input(cell->type, connection.first)) inputs.append(port(cell, connection.first));
-		return true;
-	}
-
-	bool original_inputs(SigBit bit, SigSpec &inputs)
-	{
-		auto found = input_cache.find(bit);
-		if (found == input_cache.end()) {
-			SigSpec result;
-			bool valid = read_original_inputs(bit, result);
-			input_cache[bit] = {valid, result};
-			found = input_cache.find(bit);
-		}
-		inputs = found->second.second;
-		return found->second.first;
-	}
-
-	bool build_live_bits()
-	{
-		if (live_built) return cost_work >= 0;
-		live_built = true;
-		std::vector<SigBit> pending(protected_bits.begin(), protected_bits.end());
-		for (auto cell : module->cells())
-			if (!selected.count(cell) || uncertain_cells.count(cell) ||
-				(!types.cell_evaluable(cell->type) && !StaticCellTypes::categories.is_ff(cell->type)))
-				for (auto &connection : cell->connections()) for (auto bit : port(cell, connection.first)) {
-					if (--cost_work < 0) return false;
-					pending.push_back(bit);
-				}
-		pool<Cell *> expanded_full;
-		for (int i = 0; i < GetSize(pending); i++) {
-			auto bit = pending[i];
-			if (!bit.wire || !live_bits.insert(bit).second) continue;
-			if (--cost_work < 0) return false;
-			auto found = drivers.find(bit);
-			if (found == drivers.end() || !found->second.first) continue;
-			auto cell = found->second.first;
-			SigSpec inputs;
-			if (!supported(cell) && !(cell->type == ID($pmux) && readable_pmux(cell))) {
-				if (!expanded_full.insert(cell).second) continue;
-				for (auto &connection : cell->connections()) if (types.cell_input(cell->type, connection.first))
-					inputs.append(port(cell, connection.first));
-			} else if (supported(cell)) inputs = expression_inputs(cell, found->second.second);
-			else {
-				const auto &a = port(cell, ID::A), &b = port(cell, ID::B), &s = port(cell, ID::S), &y = port(cell, ID::Y);
-				inputs.append(a[found->second.second]);
-				inputs.append(s);
-				for (int j = 0; j < GetSize(s); j++) inputs.append(b[j*GetSize(y)+found->second.second]);
-			}
-			for (auto input : inputs) {
-				if (--cost_work < 0) return false;
-				pending.push_back(input);
-			}
-		}
-		return true;
-	}
-
-	bool dependencies(SigBit bit, const pool<SigBit> &stops, pool<SigBit> &references, pool<SigBit> &seen,
-		pool<SigBit> &active, int &budget, int &work)
-	{
-		if (!bit.wire) return true;
-		if (stops.count(bit)) {
-			references.insert(bit);
-			return true;
-		}
-		if (active.count(bit)) return false;
-		if (!seen.insert(bit).second) return true;
-		if (--budget < 0 || --work < 0) return false;
-		SigSpec inputs;
-		if (!original_inputs(bit, inputs)) return false;
-		active.insert(bit);
-		for (auto input : inputs) if (!dependencies(input, stops, references, seen, active, budget, work)) return false;
-		active.erase(bit);
-		return true;
-	}
-
 	bool independent(SigBit bit, SigBit target)
 	{
-		pool<SigBit> stops, references, seen, active;
-		stops.insert(target);
-		int budget = 512;
-		return dependencies(bit, stops, references, seen, active, budget, analysis_work) && references.empty();
+		int budget = std::min(512, analysis_work), initial = budget;
+		PmuxNetlist::Dependencies dependency(netlist, {target}, budget);
+		bool valid = dependency.visit(bit);
+		analysis_work -= initial - budget;
+		return valid;
 	}
 
 	PlanPtr make_plan(Plan::Kind kind, IdString type, SigSpec values, SigSpec select, std::vector<PlanPtr> args)
@@ -495,8 +286,9 @@ struct PmuxFactorWorker {
 					match = false;
 					break;
 				}
-				auto source = drivers.at(values[i]);
-				sources.insert(source);
+				auto source = netlist.source(values[i]);
+				log_assert(source && source->cell && source->port == ID::Y);
+				sources.insert({source->cell, source->offset});
 				if (common.empty()) {
 					common = type;
 					first_a = a;
@@ -505,7 +297,7 @@ struct PmuxFactorWorker {
 				if (type != ID($mux) && a == first_b && b != first_b) std::swap(a, b);
 				aa.append(a);
 				bb.append(b);
-				if (type == ID($mux)) ss.append(port(source.first, ID::S));
+				if (type == ID($mux)) ss.append(netlist.port(source->cell, ID::S));
 			}
 			if (match && !common.empty()) {
 				if (common == ID($mux)) {
@@ -563,9 +355,7 @@ struct PmuxFactorWorker {
 	{
 		IdString type;
 		SigBit a, b;
-		auto found = drivers.find(bit);
-		if (depth && found != drivers.end() && found->second.first && found->second.first->type == ID($xor) &&
-			expression(bit, type, a, b)) {
+		if (depth && expression(bit, type, a, b) && type == ID($xor)) {
 			xor_terms(a, terms, depth-1);
 			xor_terms(b, terms, depth-1);
 		} else if (bit != State::S0) {
@@ -578,19 +368,19 @@ struct PmuxFactorWorker {
 		std::vector<Cell *> removed;
 		std::vector<Edit> edits;
 		for (auto cell : module->cells().to_vector()) {
-			if (cell->type != ID($xor) || !editable(cell)) continue;
-			auto y = sigmap(cell->getPort(ID::Y));
+			if (cell->type != ID($xor) || !netlist.editable(cell)) continue;
+			const auto &y = netlist.port(cell, ID::Y);
 			SigSpec a, b, remaining;
 			for (int i = 0; i < GetSize(y); i++) {
 				pool<SigBit> terms;
-				xor_terms(operand(cell, ID::A, i), terms, 3);
-				xor_terms(operand(cell, ID::B, i), terms, 3);
+				xor_terms(netlist.operand(cell, ID::A, i), terms, 3);
+				xor_terms(netlist.operand(cell, ID::B, i), terms, 3);
 				if (GetSize(terms) <= 1) {
 					module->connect(y[i], terms.empty() ? SigBit(State::S0) : *terms.begin());
 					changes++;
 				} else {
-					a.append(operand(cell, ID::A, i));
-					b.append(operand(cell, ID::B, i));
+					a.append(netlist.operand(cell, ID::A, i));
+					b.append(netlist.operand(cell, ID::B, i));
 					remaining.append(y[i]);
 				}
 			}
@@ -632,13 +422,15 @@ struct PmuxFactorWorker {
 		for (auto &candidate : candidates) {
 			for (int j = 0; j < GetSize(candidate.y); j++) if (candidate.outputs[j]) {
 				pool<int> plan_ids;
-				pool<SigBit> inputs, references, seen, active;
+				pool<SigBit> inputs, references;
 				collect_plans(candidate.outputs[j], plan_ids, inputs);
 				SigSpec original;
-				if (!original_inputs(candidate.y[j], original)) candidate.valid = false;
+				if (!netlist.combinational_inputs(candidate.y[j], original)) candidate.valid = false;
 				for (auto bit : original) inputs.insert(bit);
-				int budget = 512;
-				for (auto bit : inputs) if (!dependencies(bit, stops, references, seen, active, budget, analysis_work)) candidate.valid = false;
+				int budget = std::min(512, analysis_work), initial = budget;
+				PmuxNetlist::Dependencies dependency(netlist, stops, budget, false, &references);
+				for (auto bit : inputs) if (!dependency.visit(bit)) candidate.valid = false;
+				analysis_work -= initial - budget;
 				degree[candidate.y[j]] = GetSize(references);
 				for (auto reference : references) {
 					consumers[reference].push_back(candidate.y[j]);
@@ -665,7 +457,9 @@ struct PmuxFactorWorker {
 			IdString type;
 			SigBit a, b;
 			if (!expression(pending[i], type, a, b)) continue;
-			auto source = drivers.at(pending[i]);
+			auto driver = netlist.source(pending[i]);
+			log_assert(driver && driver->cell && driver->port == ID::Y);
+			OpBit source(driver->cell, driver->offset);
 			if (!region.insert(source).second) continue;
 			if (--cost_work < 0 || GetSize(region) > 65536) return false;
 			for (auto input : expression_inputs(source.first, source.second)) pending.push_back(input);
@@ -674,55 +468,49 @@ struct PmuxFactorWorker {
 	}
 
 	bool retained(const pool<OpBit> &region, const dict<Cell *, pool<int>> &rewritten, const pool<SigBit> &plan_roots,
-		pool<OpBit> &kept, pool<SigBit> *external_roots = nullptr)
+		pool<OpBit> &kept, pool<SigBit> &external_roots)
 	{
 		pool<Cell *> source_cells;
 		dict<SigBit, OpBit> source_bits;
-		pool<SigBit> roots;
 		for (auto source : region) {
 			if (--cost_work < 0) return false;
-			auto bit = port(source.first, ID::Y)[source.second];
+			auto bit = netlist.port(source.first, ID::Y)[source.second];
 			source_cells.insert(source.first);
 			source_bits[bit] = source;
-			if (protected_bits.count(bit) || !can_remove(source)) roots.insert(bit);
+			if (netlist.protected_bit(bit) || !netlist.editable_bit(source.first, ID::Y, source.second)) external_roots.insert(bit);
 		}
-		if (!region.empty()) ensure_users();
 		for (auto source : region) {
-			auto bit = port(source.first, ID::Y)[source.second];
-			if (users.count(bit)) for (auto user : reversed(users.at(bit))) {
+			auto bit = netlist.port(source.first, ID::Y)[source.second];
+			for (const auto &user : netlist.users(bit)) {
 				if (--cost_work < 0) return false;
-				if (!source_cells.count(user) && !rewritten.count(user)) roots.insert(bit);
+				if (!source_cells.count(user.cell) && !rewritten.count(user.cell)) external_roots.insert(bit);
 			}
 		}
 		for (auto cell : source_cells) {
-			const auto &y = port(cell, ID::Y);
+			const auto &y = netlist.port(cell, ID::Y);
 			for (int i = 0; i < GetSize(y); i++) if (!region.count({cell, i}))
 				for (auto bit : expression_inputs(cell, i)) {
 					if (--cost_work < 0) return false;
-					if (source_bits.count(bit)) roots.insert(bit);
+					if (source_bits.count(bit)) external_roots.insert(bit);
 				}
 		}
 		for (auto &entry : rewritten) {
 			auto cell = entry.first;
-			const auto &a = port(cell, ID::A), &b = port(cell, ID::B), &s = port(cell, ID::S), &y = port(cell, ID::Y);
+			const auto &a = netlist.port(cell, ID::A), &b = netlist.port(cell, ID::B), &s = netlist.port(cell, ID::S), &y = netlist.port(cell, ID::Y);
 			if (GetSize(entry.second) == GetSize(y)) continue;
-			for (auto bit : s) if (source_bits.count(bit)) roots.insert(bit);
+			for (auto bit : s) if (source_bits.count(bit)) external_roots.insert(bit);
 			for (int j = 0; j < GetSize(y); j++) if (!entry.second.count(j)) {
-				if (source_bits.count(a[j])) roots.insert(a[j]);
+				if (source_bits.count(a[j])) external_roots.insert(a[j]);
 				for (int i = 0; i < GetSize(s); i++) {
 					if (--cost_work < 0) return false;
 					auto bit = b[i*GetSize(y)+j];
-					if (source_bits.count(bit)) roots.insert(bit);
+					if (source_bits.count(bit)) external_roots.insert(bit);
 				}
 			}
 		}
-		if (external_roots) *external_roots = roots;
-		for (auto source : region) {
-			auto bit = port(source.first, ID::Y)[source.second];
-			if (plan_roots.count(bit)) roots.insert(bit);
-		}
 		std::vector<OpBit> pending;
-		for (auto bit : roots) if (source_bits.count(bit)) pending.push_back(source_bits.at(bit));
+		for (auto bit : external_roots) if (source_bits.count(bit)) pending.push_back(source_bits.at(bit));
+		for (auto bit : plan_roots) if (source_bits.count(bit)) pending.push_back(source_bits.at(bit));
 		for (int i = 0; i < GetSize(pending); i++) {
 			auto source = pending[i];
 			if (!kept.insert(source).second) continue;
@@ -742,370 +530,76 @@ struct PmuxFactorWorker {
 		return 9;
 	}
 
-	bool lut_expression(OpBit source, LutExpression &result)
+	using PlanCost = dict<std::pair<int, int>, PmuxLutCost::Signal>;
+	PmuxLutCost::Signal cost_plan(PlanPtr node, PmuxLutCost::Builder &builder, int depth, PlanCost &memo)
 	{
-		auto found = lut_expressions.find(source);
-		if (found != lut_expressions.end()) {
-			result = found->second;
-			return true;
-		}
-		if (lut_boundaries.count(source)) return false;
-		auto cell = source.first;
-		if (supported(cell)) {
-			result.inputs = expression_inputs(cell, source.second);
-			result.table = operation_table(cell->type);
+		log_assert(node);
+		if (depth <= 0) return builder.fail(PmuxLutCost::CostStatus::DepthLimit);
+		if (!builder.spend()) return builder.fail(PmuxLutCost::CostStatus::BudgetExhausted);
+		auto key = std::make_pair(node->id, depth);
+		auto cached = memo.find(key);
+		if (cached != memo.end()) return cached->second;
+		PmuxLutCost::Signal result;
+		if (node->kind == Plan::Existing) result = builder.bit(node->result, depth);
+		else if (node->kind == Plan::Selector) {
+			log_assert(GetSize(node->values) == GetSize(node->select) + 1);
+			auto fallback = builder.bit(node->values[0], depth - 1);
+			std::vector<PmuxLutCost::Signal> data, controls;
+			for (int i = 0; i < GetSize(node->select); i++) {
+				data.push_back(builder.bit(node->values[i + 1], depth - 1));
+				controls.push_back(builder.bit(node->select[i], depth - 1));
+			}
+			result = builder.pmux(fallback, data, controls);
 		} else {
-			pool<SigBit> inputs;
-			int connections = 0;
-			bool usable = types.cell_evaluable(cell->type) && cell->hasPort(ID::Y) && GetSize(cell->getPort(ID::Y)) == 1;
-			for (auto &connection : cell->connections()) {
-				connections += GetSize(connection.second);
-				if (connections > 64) {
-					lut_boundaries.insert(source);
-					return false;
-				}
-				if (connection.first == ID::Y) continue;
-				if (!connection.first.in(ID::A, ID::B)) usable = false;
-				for (auto bit : port(cell, connection.first)) {
-					if (--cost_work < 0) return false;
-					if (bit.wire) inputs.insert(bit);
-					else if (bit != State::S0 && bit != State::S1) usable = false;
-				}
-			}
-			if (!usable || connections > 64 || GetSize(inputs) > 4) {
-				lut_boundaries.insert(source);
-				return false;
-			}
-			result.inputs = SigSpec(std::vector<SigBit>(inputs.begin(), inputs.end()));
-			result.inputs.sort();
-			dict<SigBit, int> positions;
-			for (int i = 0; i < GetSize(result.inputs); i++) positions[result.inputs[i]] = i;
-			result.table = 0;
-			for (int assignment = 0; assignment < (1 << GetSize(result.inputs)); assignment++) {
-				Const a, b;
-				for (auto name : {ID::A, ID::B}) if (cell->hasPort(name)) for (auto bit : port(cell, name)) {
-					if (--cost_work < 0) return false;
-					State value = bit.wire ? ((assignment >> positions.at(bit)) & 1 ? State::S1 : State::S0) : bit.data;
-					(name == ID::A ? a : b).append(Const(value, 1));
-				}
-				if (--cost_work < 0) return false;
-				bool error = false;
-				auto value = CellTypes::eval(cell, a, b, &error);
-				if (error || source.second >= GetSize(value) || (value[source.second] != State::S0 && value[source.second] != State::S1)) {
-					lut_boundaries.insert(source);
-					return false;
-				}
-				if (value[source.second] == State::S1) result.table |= 1 << assignment;
-			}
+			std::vector<PmuxLutCost::Signal> args;
+			for (auto arg : node->args) args.push_back(cost_plan(arg, builder, depth - 1, memo));
+			result = builder.operation(operation_table(node->type), args);
 		}
-		lut_expressions[source] = result;
-		return true;
-	}
-
-	struct CostSignal {
-		int value, care;
-	};
-
-	struct CostBuilder {
-		PmuxFactorWorker &worker;
-		LutCostGraph &graph;
-		const dict<SigBit, PlanPtr> &replacements;
-		bool changed;
-		dict<SigBit, CostSignal> bits;
-		dict<int, CostSignal> plans;
-		pool<SigBit> active;
-		pool<OpBit> expanded;
-
-		CostBuilder(PmuxFactorWorker &worker, LutCostGraph &graph, const dict<SigBit, PlanPtr> &replacements, bool changed) :
-			worker(worker), graph(graph), replacements(replacements), changed(changed) {}
-
-		CostSignal operation(uint16_t table, const std::vector<CostSignal> &args)
-		{
-			std::vector<int> values, care;
-			for (auto arg : args) {
-				values.push_back(arg.value);
-				care.push_back(arg.care);
-			}
-			return {graph.gate(table, values), graph.reduce(8, care, 1)};
-		}
-
-		CostSignal choice(const SigSpec &values, const SigSpec &select)
-		{
-			log_assert(GetSize(values) == GetSize(select)+1);
-			auto fallback = bit(values[0]);
-			int enabled = 0, collision = 0;
-			std::vector<int> terms, care;
-			for (int i = 0; i < GetSize(select); i++) {
-				auto control = bit(select[i]), data = bit(values[i+1]);
-				terms.push_back(graph.gate(8, {data.value, control.value}));
-				care.push_back(data.care);
-				care.push_back(control.care);
-				collision = graph.gate(14, {collision, graph.gate(8, {enabled, control.value})});
-				enabled = graph.gate(14, {enabled, control.value});
-			}
-			int selected = graph.reduce(14, terms, 0);
-			int value = fallback.value == 0 ? selected : graph.gate(0xca, {fallback.value, selected, enabled});
-			care.push_back(graph.gate(1, {collision}));
-			care.push_back(graph.gate(14, {enabled, fallback.care}));
-			return {value, graph.reduce(8, care, 1)};
-		}
-
-		CostSignal bit(SigBit value)
-		{
-			if (!graph.spend()) return {0, 0};
-			if (!value.wire) return {value == State::S1 ? 1 : 0, value == State::S0 || value == State::S1 ? 1 : 0};
-			auto found = bits.find(value);
-			if (found != bits.end()) return found->second;
-			if (!active.insert(value).second) {
-				graph.valid = false;
-				return {0, 0};
-			}
-			CostSignal result;
-			if (changed && replacements.count(value)) result = plan(replacements.at(value));
-			else {
-				auto driver = worker.drivers.find(value);
-				if (driver == worker.drivers.end() || !driver->second.first || worker.uncertain_bits.count(value) ||
-					StaticCellTypes::categories.is_ff(driver->second.first->type)) result = {graph.leaf(value), 1};
-				else {
-					auto source = driver->second;
-					auto cell = source.first;
-					bool fixed = !worker.selected.count(cell) || cell->get_bool_attribute(ID::keep) || worker.kept_bits.count(value);
-					if (cell->type == ID($pmux) && fixed) result = {graph.leaf(value), 1};
-					else if (cell->type == ID($pmux) && worker.readable_pmux(cell)) {
-						expanded.insert(source);
-						const auto &y = worker.port(cell, ID::Y), &s = worker.port(cell, ID::S), &b = worker.port(cell, ID::B);
-						SigSpec values(worker.port(cell, ID::A)[source.second]);
-						for (int i = 0; i < GetSize(s); i++) values.append(b[i*GetSize(y)+source.second]);
-						result = choice(values, s);
-					} else {
-						LutExpression expression;
-						if (worker.lut_expression(source, expression)) {
-							if (fixed) {
-								graph.fixed_bits.insert(value);
-								result = {graph.leaf(value), 1};
-							} else {
-								expanded.insert(source);
-								std::vector<CostSignal> args;
-								for (auto input : expression.inputs) args.push_back(bit(input));
-								result = operation(expression.table, args);
-							}
-						} else result = {graph.leaf(value), 1};
-					}
-				}
-			}
-			active.erase(value);
-			bits[value] = result;
-			return result;
-		}
-
-		CostSignal plan(PlanPtr node)
-		{
-			auto found = plans.find(node->id);
-			if (found != plans.end()) return found->second;
-			CostSignal result;
-			if (node->kind == Plan::Existing) result = bit(node->result);
-			else if (node->kind == Plan::Selector) result = choice(node->values, node->select);
-			else {
-				std::vector<CostSignal> args;
-				for (auto arg : node->args) args.push_back(plan(arg));
-				result = operation(operation_table(node->type), args);
-			}
-			plans[node->id] = result;
-			return result;
-		}
-	};
-
-	bool observed_outside(OpBit source, const pool<OpBit> &modeled, dict<Cell *, bool> &generic_observers)
-	{
-		auto bit = port(source.first, ID::Y)[source.second];
-		if (!live_bits.count(bit)) return false;
-		if (protected_bits.count(bit)) return true;
-		ensure_users();
-		if (!users.count(bit)) return false;
-		for (auto user : reversed(users.at(bit))) {
-			if (!supported(user) && !(user->type == ID($pmux) && readable_pmux(user))) {
-				auto found = generic_observers.find(user);
-				if (found == generic_observers.end()) {
-					bool observed = !selected.count(user) || user->get_bool_attribute(ID::keep) || uncertain_cells.count(user) ||
-						(!types.cell_evaluable(user->type) && !StaticCellTypes::categories.is_ff(user->type));
-					for (auto &connection : user->connections()) if (types.cell_output(user->type, connection.first)) {
-						const auto &output = port(user, connection.first);
-						for (int i = 0; i < GetSize(output); i++) {
-							if (--cost_work < 0) return false;
-							if (live_bits.count(output[i]) && (connection.first != ID::Y || !modeled.count({user, i}))) observed = true;
-						}
-					}
-					generic_observers[user] = observed;
-					found = generic_observers.find(user);
-				}
-				if (found->second) return true;
-				continue;
-			}
-			const auto &y = port(user, ID::Y);
-			for (int i = 0; i < GetSize(y); i++) if (live_bits.count(y[i]) && !modeled.count({user, i})) {
-				if (--cost_work < 0) return false;
-				SigSpec inputs;
-				if (!original_inputs(y[i], inputs)) return true;
-				for (auto input : inputs) {
-					if (--cost_work < 0) return false;
-					if (input == bit) return true;
-				}
-			}
-		}
-		return false;
+		return memo[key] = result;
 	}
 
 	Estimate estimate(const std::vector<Candidate> &candidates, const std::vector<int> &accepted, const pool<SigBit> &extra_roots)
 	{
 		Estimate result;
-		if (!build_live_bits()) {
-			result.valid = false;
-			return result;
-		}
+		PmuxLutCost::Request request;
+		PlanCost memo;
 		pool<OpBit> region, after_kept;
 		pool<int> nodes;
-		pool<SigBit> roots, external_roots, extra_kept;
+		pool<SigBit> roots;
 		dict<Cell *, pool<int>> rewritten;
-		dict<SigBit, PlanPtr> replacements;
 		for (int index : accepted) {
 			const auto &candidate = candidates[index];
-			for (auto source : candidate.sources) if (!add_region(port(source.first, ID::Y)[source.second], region)) result.valid = false;
-			for (int j = 0; j < GetSize(candidate.y); j++) if (candidate.outputs[j]) {
-				collect_plans(candidate.outputs[j], nodes, roots);
+			for (auto source : candidate.sources)
+				if (!add_region(netlist.port(source.first, ID::Y)[source.second], region)) return result;
+			for (int j = 0; j < GetSize(candidate.y); j++) if (auto plan = candidate.outputs[j]) {
+				collect_plans(plan, nodes, roots);
 				rewritten[candidate.cell].insert(j);
-				replacements[candidate.y[j]] = candidate.outputs[j];
+				request.replacements[candidate.y[j]] = [this, plan, &memo](PmuxLutCost::Builder &builder, int depth) {
+					return cost_plan(plan, builder, depth, memo);
+				};
 			}
 		}
-		for (auto bit : roots) if (!add_region(bit, region)) result.valid = false;
+		for (auto bit : roots) if (!add_region(bit, region)) return result;
 		for (auto source : region) {
-			if (--cost_work < 0) result.valid = false;
-			auto bit = port(source.first, ID::Y)[source.second];
-			if (extra_roots.count(bit) && !roots.count(bit)) {
-				roots.insert(bit);
-				extra_kept.insert(bit);
-			}
+			if (--cost_work < 0) return result;
+			auto bit = netlist.port(source.first, ID::Y)[source.second];
+			if (extra_roots.count(bit) && !roots.count(bit)) request.roots.insert(bit);
 		}
-		if (!result.valid || !retained(region, rewritten, roots, after_kept, &external_roots)) {
-			result.valid = false;
-			return result;
+		if (!retained(region, rewritten, roots, after_kept, request.roots)) return result;
+		for (auto source : region) if (!after_kept.count(source)) {
+			log_assert(netlist.editable_bit(source.first, ID::Y, source.second));
+			result.erased.insert(source);
+			request.removed.insert(netlist.port(source.first, ID::Y)[source.second]);
 		}
-		for (auto bit : extra_kept) external_roots.insert(bit);
-		for (auto source : region) if (!after_kept.count(source) && can_remove(source)) result.erased.insert(source);
-		pool<Signature> checked;
-		pool<OpBit> shared, extended = region;
-		for (auto source : region) {
-			if (--cost_work < 0) {
-				result.valid = false;
-				return result;
-			}
-			auto cell = source.first;
-			auto inputs = expression_inputs(cell, source.second);
-			auto original_key = signature(cell->type, inputs);
-			if (!checked.insert(original_key).second) continue;
-			ensure_operators();
-			auto found = operators.find(original_key);
-			log_assert(found != operators.end());
-			for (auto other : found->second) {
-				if (--cost_work < 0) {
-					result.valid = false;
-					return result;
-				}
-				auto outside = drivers.at(other);
-				if (!region.count(outside) && live_bits.count(other)) {
-					shared.insert(outside);
-					extended.insert(outside);
-				}
-			}
-		}
-		if (!shared.empty()) {
-			pool<OpBit> live_shared;
-			if (!retained(extended, rewritten, roots, live_shared)) {
-				result.valid = false;
-				return result;
-			}
-			for (auto source : shared) if (live_shared.count(source)) external_roots.insert(port(source.first, ID::Y)[source.second]);
-		}
-		LutCostGraph graph(cost_work);
-		CostBuilder before(*this, graph, replacements, false), after(*this, graph, replacements, true);
-		std::vector<CostSignal> old_signals, new_signals;
-		for (auto bit : external_roots) {
-			auto old_signal = before.bit(bit), new_signal = after.bit(bit);
-			old_signals.push_back(old_signal);
-			new_signals.push_back(new_signal);
-		}
-		for (auto &entry : replacements) {
-			old_signals.push_back(before.bit(entry.first));
-			new_signals.push_back(after.bit(entry.first));
-		}
-		pool<OpBit> modeled = before.expanded;
-		for (auto source : after.expanded) modeled.insert(source);
-		dict<Cell *, bool> generic_observers;
-		for (auto source : modeled) if (observed_outside(source, modeled, generic_observers)) {
-			auto bit = port(source.first, ID::Y)[source.second];
-			if (!external_roots.insert(bit).second) continue;
-			old_signals.push_back(before.bit(bit));
-			new_signals.push_back(after.bit(bit));
-		}
-		std::vector<int> old_roots, new_roots;
-		for (auto signal : old_signals) {
-			graph.prepare_certificate(signal.value, signal.care);
-			old_roots.push_back(signal.value);
-		}
-		for (auto signal : new_signals) {
-			graph.prepare_certificate(signal.value, signal.care);
-			new_roots.push_back(signal.value);
-		}
-		auto old_cover = graph.cover(old_roots);
-		dict<int, PmuxLutCost::Cut> old_cuts;
-		if (ys_debug(1)) for (int id : old_cover) old_cuts[id] = graph.nodes[id].best_cut();
-		auto new_cover = graph.cover(new_roots);
-		result.valid = graph.valid && cost_work >= 0;
-		if (!result.valid) return result;
-		for (int id : old_cover) {
-			if (new_cover.count(id)) result.retained++;
-			else result.removed++;
-		}
-		for (int id : new_cover) if (!old_cover.count(id)) result.added++;
-		result.retained += GetSize(graph.fixed_bits);
-		log_debug("LUT4 cover in %s: %d -> %d, %d graph nodes, certificates 5/6/7=%d/%d/%d, partial functions %d, work remaining %d.\n",
-			log_id(module), result.retained+result.removed, result.retained+result.added, GetSize(graph.nodes),
-			graph.certificate_widths[5], graph.certificate_widths[6], graph.certificate_widths[7], graph.partial_functions, cost_work);
-		if (ys_debug(1)) {
-			int diagnostic_work = 16384;
-			for (int index : accepted) log_debug("Cost target %s.\n", log_id(candidates[index].cell));
-			for (auto &entry : replacements) log_debug("Cost replacement %s plan %d.\n", log_signal(entry.first), entry.second->id);
-			for (auto bit : external_roots) log_debug("Cost mandatory %s.\n", log_signal(bit));
-			for (auto source : region) {
-				if (--diagnostic_work < 0) break;
-				log_debug("Cost source %s offset %d erased %d.\n", log_id(source.first), source.second, result.erased.count(source));
-			}
-			for (int id : nodes) {
-				if (--diagnostic_work < 0) break;
-				const auto *plan = &plan_nodes[id];
-				log_debug("Cost plan %d kind %d type %s values %s select %s.", id, plan->kind, log_id(plan->type), log_signal(plan->values), log_signal(plan->select));
-				for (auto arg : plan->args) log_debug(" arg %d", arg->id);
-				log_debug("\n");
-			}
-			for (auto &entry : before.bits) log_debug("Cost before bit %s value %d care %d.\n", log_signal(entry.first), entry.second.value, entry.second.care);
-			for (auto &entry : after.bits) log_debug("Cost after bit %s value %d care %d.\n", log_signal(entry.first), entry.second.value, entry.second.care);
-			for (auto signal : old_signals) log_debug("Cost before root %d care %d.\n", signal.value, signal.care);
-			for (auto signal : new_signals) log_debug("Cost after root %d care %d.\n", signal.value, signal.care);
-			for (int id = 0; id < GetSize(graph.nodes); id++) {
-				if (--diagnostic_work < 0) break;
-				const auto &node = graph.nodes[id];
-				log_debug("Cost node %d table %u leaf %d before %d after %d inputs", id, unsigned(node.table), node.leaf, old_cover.count(id), new_cover.count(id));
-				for (int input : node.inputs) log_debug(" %d", input);
-				log_debug(" old_cut");
-				if (old_cuts.count(id)) for (int input : old_cuts.at(id)) log_debug(" %d", input);
-				log_debug(" new_cut");
-				if (new_cover.count(id)) for (int input : node.best_cut()) log_debug(" %d", input);
-				log_debug("\n");
-			}
-		}
+		auto cost = module_cost.estimate(request, cost_work);
+		result.valid = cost.status == PmuxLutCost::CostStatus::Profitable || cost.status == PmuxLutCost::CostStatus::NoGain;
+		result.removed = cost.removed;
+		result.added = cost.added;
+		result.retained = cost.retained;
 		return result;
 	}
 
-	bool collect_sources(const pool<SigBit> &roots, const pool<SigBit> &stops, pool<OpBit> &sources)
+	bool collect_sources(const pool<SigBit> &roots, const pool<SigBit> &stops, pool<SigBit> &sources)
 	{
 		std::vector<SigBit> pending(roots.begin(), roots.end());
 		pool<SigBit> seen;
@@ -1113,24 +607,14 @@ struct PmuxFactorWorker {
 			if (--cost_work < 0) return false;
 			auto bit = pending[i];
 			if (!bit.wire || stops.count(bit) || !seen.insert(bit).second) continue;
-			auto found = drivers.find(bit);
-			if (found == drivers.end() || !found->second.first || uncertain_bits.count(bit)) continue;
-			auto source = found->second;
-			auto cell = source.first;
-			if (!selected.count(cell) || cell->get_bool_attribute(ID::keep) || kept_bits.count(bit) ||
-				StaticCellTypes::categories.is_ff(cell->type)) continue;
+			auto source = netlist.source(bit);
+			if (!source || !source->cell || !netlist.editable_bit(source->cell, source->port, source->offset)) continue;
 			SigSpec inputs;
-			if (cell->type == ID($pmux) && readable_pmux(cell)) {
-				if (!original_inputs(bit, inputs)) return false;
-			} else {
-				LutExpression expression;
-				if (!lut_expression(source, expression)) {
-					if (cost_work < 0) return false;
-					continue;
-				}
-				inputs = expression.inputs;
+			if (!module_cost.modeled_inputs(bit, inputs, cost_work)) {
+				if (cost_work < 0) return false;
+				continue;
 			}
-			if (sources.insert(source).second && GetSize(sources) > 65536) return false;
+			if (sources.insert(bit).second && GetSize(sources) > 65536) return false;
 			for (auto input : inputs) {
 				if (--cost_work < 0) return false;
 				pending.push_back(input);
@@ -1174,10 +658,9 @@ struct PmuxFactorWorker {
 			sizes[a] += sizes[b];
 			components--;
 		};
-		dict<OpBit, Ownership> ownership;
+		dict<SigBit, Ownership> ownership;
 		dict<int, int> plan_owner;
-		pool<OpBit> modeled;
-		pool<SigBit> replaced;
+		pool<SigBit> modeled, replaced;
 		for (int i = 0; i < GetSize(candidates); i++) {
 			const auto &candidate = candidates[i];
 			if (!candidate.valid) continue;
@@ -1203,7 +686,7 @@ struct PmuxFactorWorker {
 				if (found == plan_owner.end()) plan_owner[id] = i;
 				else join(i, found->second);
 			}
-			pool<OpBit> before, after;
+			pool<SigBit> before, after;
 			if (!collect_sources(outputs, {}, before) || !collect_sources(roots, outputs, after)) return {};
 			for (auto source : before) {
 				if (--cost_work < 0) return {};
@@ -1228,17 +711,18 @@ struct PmuxFactorWorker {
 			dict<Signature, int> equivalent;
 			for (auto &entry : ownership) {
 				if (--cost_work < 0) return {};
-				auto source = entry.first;
+				auto bit = entry.first;
 				const auto &owner = entry.second;
-				auto bit = port(source.first, ID::Y)[source.second];
-				if (owner.retained || protected_bits.count(bit) || !can_remove(source)) continue;
+				if (owner.retained || netlist.protected_bit(bit)) continue;
+				auto source = netlist.source(bit);
+				log_assert(source && source->cell);
 				for (int reader : owner.readers) {
 					if (--cost_work < 0) return {};
 					if (find(reader) != find(owner.readers.front())) possible = true;
 				}
 				if (possible) break;
-				if (supported(source.first)) {
-					auto key = signature(source.first->type, expression_inputs(source.first, source.second));
+				if (supported(source->cell)) {
+					auto key = signature(source->cell->type, expression_inputs(source->cell, source->offset));
 					auto found = equivalent.find(key);
 					if (found == equivalent.end()) equivalent[key] = owner.readers.front();
 					else if (find(found->second) != find(owner.readers.front())) {
@@ -1248,29 +732,28 @@ struct PmuxFactorWorker {
 				}
 			}
 			if (possible) {
-				pool<SigBit> external_roots;
-				pool<OpBit> external_kept;
-				dict<Cell *, bool> generic_observers;
-				for (auto source : modeled) {
+				pool<SigBit> external_roots, external_kept;
+				for (auto bit : modeled) {
 					if (--cost_work < 0) return {};
-					if (observed_outside(source, modeled, generic_observers)) external_roots.insert(port(source.first, ID::Y)[source.second]);
+					if (module_cost.observed_outside(bit, modeled, replaced, cost_work)) external_roots.insert(bit);
+					if (cost_work < 0) return {};
 				}
 				if (!collect_sources(external_roots, replaced, external_kept)) return {};
 				equivalent.clear();
 				for (auto &entry : ownership) {
 					if (--cost_work < 0) return {};
-					auto source = entry.first;
+					auto bit = entry.first;
 					const auto &owner = entry.second;
-					auto bit = port(source.first, ID::Y)[source.second];
-					if (owner.retained || external_kept.count(source) ||
-						protected_bits.count(bit) || !can_remove(source)) continue;
+					if (owner.retained || external_kept.count(bit) || netlist.protected_bit(bit)) continue;
+					auto source = netlist.source(bit);
+					log_assert(source && source->cell);
 					int first = owner.readers.front();
 					for (int reader : owner.readers) {
 						if (--cost_work < 0) return {};
 						join(first, reader);
 					}
-					if (supported(source.first)) {
-						auto key = signature(source.first->type, expression_inputs(source.first, source.second));
+					if (supported(source->cell)) {
+						auto key = signature(source->cell->type, expression_inputs(source->cell, source->offset));
 						auto found = equivalent.find(key);
 						if (found == equivalent.end()) equivalent[key] = first;
 						else join(first, found->second);
@@ -1301,8 +784,8 @@ struct PmuxFactorWorker {
 		pool<SigBit> roots;
 		for (int index : accepted) {
 			const auto &candidate = candidates[index];
-			log_assert(sigmap(candidate.cell->getPort(ID::A)) == candidate.a && sigmap(candidate.cell->getPort(ID::B)) == candidate.b &&
-				sigmap(candidate.cell->getPort(ID::S)) == candidate.s && sigmap(candidate.cell->getPort(ID::Y)) == candidate.y);
+			log_assert(netlist.port(candidate.cell, ID::A) == candidate.a && netlist.port(candidate.cell, ID::B) == candidate.b &&
+				netlist.port(candidate.cell, ID::S) == candidate.s && netlist.port(candidate.cell, ID::Y) == candidate.y);
 			SigSpec a, b, y;
 			std::vector<int> remaining;
 			for (int j = 0; j < GetSize(candidate.y); j++) {
@@ -1319,14 +802,17 @@ struct PmuxFactorWorker {
 			if (y.empty()) removed.insert(candidate.cell);
 			else edits.push_back({candidate.cell, a, b, y});
 		}
-		for (auto bit : roots) if (drivers.count(bit)) log_assert(!cost.erased.count(drivers.at(bit)));
+		for (auto bit : roots) {
+			auto source = netlist.source(bit);
+			if (source && source->cell && source->port == ID::Y) log_assert(!cost.erased.count({source->cell, source->offset}));
+		}
 		for (auto source : cost.erased) {
-			log_assert(can_remove(source));
+			log_assert(netlist.editable_bit(source.first, ID::Y, source.second));
 			source_cells.insert(source.first);
 		}
 		for (auto cell : source_cells) {
 			SigSpec a, b, y;
-			const auto &original_y = port(cell, ID::Y);
+			const auto &original_y = netlist.port(cell, ID::Y);
 			for (int i = 0; i < GetSize(original_y); i++) if (!cost.erased.count({cell, i})) {
 				auto inputs = expression_inputs(cell, i);
 				a.append(inputs[0]);
@@ -1367,8 +853,8 @@ struct PmuxFactorWorker {
 	void factor()
 	{
 		std::vector<Cell *> pmuxes;
-		for (auto cell : module->cells()) if (cell->type == ID($pmux) && readable_pmux(cell) && GetSize(port(cell, ID::S)) >= 3) {
-			const auto &a = port(cell, ID::A), &b = port(cell, ID::B), &s = port(cell, ID::S), &y = port(cell, ID::Y);
+		for (auto cell : module->cells()) if (cell->type == ID($pmux) && readable_pmux(cell) && GetSize(netlist.port(cell, ID::S)) >= 3) {
+			const auto &a = netlist.port(cell, ID::A), &b = netlist.port(cell, ID::B), &s = netlist.port(cell, ID::S), &y = netlist.port(cell, ID::Y);
 			auto &choice = choices[s];
 			choice.select = s;
 			for (int j = 0; j < GetSize(y); j++) {
@@ -1377,7 +863,7 @@ struct PmuxFactorWorker {
 				choice.exact[values].push_back(y[j]);
 				choice.undefined_default[values.extract(1, GetSize(s))].push_back(y[j]);
 			}
-			if (editable(cell)) pmuxes.push_back(cell);
+			if (netlist.editable(cell)) pmuxes.push_back(cell);
 		}
 		if (pmuxes.empty()) return;
 		std::vector<Candidate> candidates;
@@ -1385,10 +871,10 @@ struct PmuxFactorWorker {
 		for (auto cell : pmuxes) {
 			Candidate candidate;
 			candidate.cell = cell;
-			candidate.a = port(cell, ID::A);
-			candidate.b = port(cell, ID::B);
-			candidate.s = port(cell, ID::S);
-			candidate.y = port(cell, ID::Y);
+			candidate.a = netlist.port(cell, ID::A);
+			candidate.b = netlist.port(cell, ID::B);
+			candidate.s = netlist.port(cell, ID::S);
+			candidate.y = netlist.port(cell, ID::Y);
 			bool found = false;
 			for (int j = 0; j < GetSize(candidate.y); j++) {
 				PlanPtr plan = nullptr;
@@ -1455,19 +941,14 @@ struct PmuxFactorWorker {
 	{
 		std::vector<Cell *> removed;
 		for (auto reduce : module->cells().to_vector()) {
-			if (!reduce->type.in(ID($reduce_or), ID($reduce_bool), ID($reduce_and), ID($reduce_xor), ID($reduce_xnor)) || !editable(reduce) || GetSize(reduce->getPort(ID::Y)) != 1) continue;
-			auto input = sigmap(reduce->getPort(ID::A));
-			if (GetSize(input) < 4 || !drivers.count(input[0]) || !drivers.at(input[0]).first) continue;
-			auto pmux = drivers.at(input[0]).first;
-			if (pmux->type != ID($pmux) || !editable(pmux) || input != sigmap(pmux->getPort(ID::Y))) continue;
-			ensure_users();
-			bool private_output = true;
-			for (auto bit : input) {
-				if (protected_bits.count(bit)) private_output = false;
-				for (auto user : reversed(users[bit])) if (user != reduce) private_output = false;
-			}
-			if (!private_output) continue;
-			auto a = sigmap(pmux->getPort(ID::A)), b = sigmap(pmux->getPort(ID::B)), s = sigmap(pmux->getPort(ID::S));
+			if (!reduce->type.in(ID($reduce_or), ID($reduce_bool), ID($reduce_and), ID($reduce_xor), ID($reduce_xnor)) ||
+				!netlist.editable(reduce) || GetSize(reduce->getPort(ID::Y)) != 1) continue;
+			const auto &input = netlist.port(reduce, ID::A);
+			if (GetSize(input) < 4) continue;
+			auto pmux = netlist.driver(input[0]);
+			if (!pmux || pmux->type != ID($pmux) || !netlist.editable(pmux) || input != netlist.port(pmux, ID::Y) ||
+				!netlist.private_signal(input, {reduce})) continue;
+			const auto &a = netlist.port(pmux, ID::A), &b = netlist.port(pmux, ID::B), &s = netlist.port(pmux, ID::S);
 			if (s.empty()) continue;
 			std::vector<SigSpec> branches;
 			branches.push_back(a);

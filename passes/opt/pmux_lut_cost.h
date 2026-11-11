@@ -2,8 +2,12 @@
 #define PMUX_LUT_COST_H
 
 #include "kernel/yosys.h"
+#include <functional>
+#include <memory>
 
 YOSYS_NAMESPACE_BEGIN
+class PmuxNetlist;
+
 namespace PmuxLutCost {
 
 struct Cut {
@@ -147,6 +151,7 @@ public:
 
 	bool spend(int amount = 1)
 	{
+		if (!valid) return false;
 		if (work < amount) { work = -1; valid = false; }
 		else work -= amount;
 		return valid;
@@ -458,6 +463,69 @@ public:
 		}
 		return covered;
 	}
+};
+
+enum class CostStatus { Profitable, NoGain, UnsupportedSource, UnsupportedActivatedBoundary, DepthLimit, NodeLimit, BudgetExhausted };
+
+const char *status_name(CostStatus status);
+
+struct CostResult {
+	CostStatus status = CostStatus::NoGain;
+	int before = 0, after = 0;
+	int removed = 0, added = 0, retained = 0;
+};
+
+struct Signal {
+	int value, care;
+};
+
+class Builder {
+	struct State;
+	State &state;
+	explicit Builder(State &state) : state(state) {}
+	friend class ModuleCost;
+
+public:
+	Signal bit(SigBit bit, int depth = 64);
+	Signal operation(uint16_t table, const std::vector<Signal> &args);
+	Signal pmux(Signal fallback, const std::vector<Signal> &data, const std::vector<Signal> &controls);
+	Signal fail(CostStatus reason);
+	bool spend(int amount = 1);
+};
+
+using Replacement = std::function<Signal(Builder &, int)>;
+
+struct Request {
+	// 替换输出和保留根参与两次覆盖。断连的旧输出只允许出现在改写前的逻辑锥中。
+	dict<SigBit, Replacement> replacements;
+	pool<SigBit> removed, roots;
+};
+
+class Snapshot {
+	struct State;
+	std::unique_ptr<State> state;
+	friend class ModuleCost;
+	friend class Builder;
+
+public:
+	Snapshot();
+	~Snapshot();
+};
+
+class ModuleCost {
+	struct Model;
+	std::unique_ptr<Model> model;
+	friend class Builder;
+
+public:
+	explicit ModuleCost(PmuxNetlist &netlist);
+	~ModuleCost();
+	// 已另行规划的输出作为边界，其方案仍需读取的信号作为保留根。
+	void preserve(const SigSpec &boundary_outputs, const pool<SigBit> &roots);
+	bool modeled_inputs(SigBit bit, SigSpec &inputs, int &work);
+	bool observed_outside(SigBit bit, const pool<SigBit> &modeled, const pool<SigBit> &replaced, int &work);
+	CostStatus checkpoint(const Request &request, int &work, Snapshot &snapshot);
+	CostResult estimate(const Request &request, int &work, const Snapshot *snapshot = nullptr);
 };
 
 }

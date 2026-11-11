@@ -2,7 +2,8 @@
 // 复用端口分类，在局部化简后按结构成本提交变换。
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
-#include "passes/opt/pmux_celltypes.h"
+#include "passes/opt/pmux_decoder.h"
+#include "passes/opt/pmux_netlist.h"
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
 
@@ -47,106 +48,30 @@ struct ContextPlan {
 
 struct PmuxContextWorker {
 	Module *module;
-	SigMap sigmap;
-	PmuxCellTypes types;
-	dict<SigBit, Cell *> drivers;
-	dict<SigBit, pool<Cell *>> users;
-	bool users_built = false;
-	pool<SigBit> protected_bits, kept_bits;
-	pool<Cell *> selected, removed;
-	dict<std::pair<SigBit, bool>, dict<SigBit, State>> condition_cache;
+	PmuxNetlist netlist;
+	PmuxDecoder decoder;
+	pool<Cell *> removed;
 	struct ConeSummary {
 		std::vector<SigBit> dependencies;
 		int work = 0;
 	};
 	dict<SigSpec, ConeSummary> cone_cache;
 	int cached_cone_bits = 0;
-	int cached_facts = 0, cache_hits = 0, cache_insertions = 0, cache_clears = 0;
 	int changes = 0, copies = 0, total_budget = 262144;
 	static constexpr int max_bits = 4096, max_cells = 64, max_depth = 16;
 
-	PmuxContextWorker(Module *module, Design *design) : module(module), sigmap(module), types(module, design)
-	{
-		for (auto wire : module->wires()) {
-			bool keep = wire->get_bool_attribute(ID::keep);
-			if (!wire->port_input && !wire->port_output && !keep) continue;
-			for (auto bit : sigmap(wire)) {
-				if (wire->port_input) drivers[bit] = nullptr;
-				if (wire->port_output || keep) protected_bits.insert(bit);
-				if (keep) kept_bits.insert(bit);
-			}
-		}
-		for (auto cell : module->cells()) {
-			if (design->selected(module, cell)) selected.insert(cell);
-			bool keep = cell->get_bool_attribute(ID::keep);
-			for (auto &port : cell->connections()) {
-				auto direction = types.cell_port_dir(cell->type, port.first);
-				bool input = direction == RTLIL::PD_INPUT || direction == RTLIL::PD_INOUT;
-				bool output = direction == RTLIL::PD_OUTPUT || direction == RTLIL::PD_INOUT;
-				for (auto bit : sigmap(port.second)) {
-					if (output) {
-						if (drivers.count(bit)) drivers[bit] = nullptr;
-						else drivers[bit] = cell;
-					}
-					if ((!input && !output) || keep) {
-						protected_bits.insert(bit);
-						kept_bits.insert(bit);
-						if (!input && !output) drivers[bit] = nullptr;
-					}
-				}
-			}
-		}
-	}
+	PmuxContextWorker(Module *module, Design *design) : module(module), netlist(module, design), decoder(netlist) {}
 
-	void ensure_users()
+	bool supported(Cell *cell, dict<Cell *, bool> &eligibility)
 	{
-		if (users_built) return;
-		for (auto cell : module->cells()) for (auto &port : cell->connections()) {
-			auto direction = types.cell_port_dir(cell->type, port.first);
-			bool input = direction == RTLIL::PD_INPUT || direction == RTLIL::PD_INOUT;
-			bool output = direction == RTLIL::PD_OUTPUT || direction == RTLIL::PD_INOUT;
-			if (input || !output)
-				for (auto bit : sigmap(port.second)) users[bit].insert(cell);
-		}
-		users_built = true;
-	}
-
-	Cell *driver(SigBit bit)
-	{
-		if (!bit.wire) return nullptr;
-		auto found = drivers.find(bit);
-		if (found == drivers.end()) return nullptr;
-		auto cell = found->second;
-		return removed.count(cell) ? nullptr : cell;
-	}
-
-	struct Eligibility { dict<Cell *, bool> editable, supported; };
-	bool editable(Cell *cell, Eligibility *eligibility = nullptr)
-	{
-		if (!cell) return false;
-		if (eligibility && eligibility->editable.count(cell)) return eligibility->editable.at(cell);
-		auto check = [&]() {
-			if (removed.count(cell) || !selected.count(cell) || cell->get_bool_attribute(ID::keep) || !cell->hasPort(ID::Y)) return false;
-			for (auto original : cell->getPort(ID::Y)) {
-				auto bit = sigmap(original);
-				if (kept_bits.count(bit) || driver(bit) != cell) return false;
-			}
-			return true;
-		};
-		bool result = check();
-		if (eligibility) eligibility->editable[cell] = result;
-		return result;
-	}
-
-	bool supported(Cell *cell, Eligibility &eligibility)
-	{
-		if (!cell) return false;
-		if (eligibility.supported.count(cell)) return eligibility.supported.at(cell);
+		log_assert(cell);
+		auto cached = eligibility.find(cell);
+		if (cached != eligibility.end()) return cached->second;
 		bool result = cell->hasPort(ID::Y) && GetSize(cell->getPort(ID::Y)) <= max_bits &&
-			editable(cell, &eligibility) && cell->type.in(ID($mux), ID($pmux), ID($add), ID($sub), ID($and), ID($or), ID($xor), ID($xnor),
+			netlist.editable(cell) && cell->type.in(ID($mux), ID($pmux), ID($add), ID($sub), ID($and), ID($or), ID($xor), ID($xnor),
 			ID($not), ID($pos), ID($eq), ID($ne), ID($lt), ID($le), ID($gt), ID($ge), ID($logic_not), ID($logic_and),
 			ID($logic_or), ID($reduce_and), ID($reduce_or), ID($reduce_bool), ID($reduce_xor), ID($reduce_xnor));
-		eligibility.supported[cell] = result;
+		eligibility[cell] = result;
 		return result;
 	}
 
@@ -178,115 +103,6 @@ struct PmuxContextWorker {
 		return true;
 	}
 
-	bool fact(dict<SigBit, State> &facts, SigBit bit, State value)
-	{
-		if (!bit.wire) return bit.data == value;
-		auto found = facts.find(bit);
-		if (found != facts.end()) return found->second == value;
-		facts[bit] = value;
-		return true;
-	}
-
-	bool condition(SigBit bit, bool value, dict<SigBit, State> &facts, int &budget, int depth = 0)
-	{
-		if (depth > 8 || !spend(budget)) return false;
-		if (!fact(facts, bit, value ? State::S1 : State::S0)) return false;
-		if (!bit.wire) return true;
-		auto cell = driver(bit);
-		if (!cell || !cell->hasPort(ID::Y) || sigmap(cell->getPort(ID::Y)) != SigSpec(bit)) return true;
-		if (!cell->type.in(ID($logic_not), ID($not), ID($reduce_or), ID($reduce_bool), ID($reduce_and),
-			ID($eq), ID($ne), ID($logic_and), ID($logic_or), ID($and), ID($or), ID($xor), ID($xnor))) return true;
-		if (!spend(budget, GetSize(cell->getPort(ID::A)))) return false;
-		auto a = sigmap(cell->getPort(ID::A));
-		if (GetSize(a) == 1) {
-			if (cell->type.in(ID($not), ID($logic_not)))
-				return condition(a[0], !value, facts, budget, depth + 1);
-			if (cell->type.in(ID($reduce_or), ID($reduce_bool), ID($reduce_and)))
-				return condition(a[0], value, facts, budget, depth + 1);
-		}
-		if ((cell->type == ID($logic_not) && value) || (cell->type.in(ID($reduce_or), ID($reduce_bool)) && !value) ||
-			(cell->type == ID($reduce_and) && value)) {
-			State v = cell->type == ID($reduce_and) ? State::S1 : State::S0;
-			for (auto input : a) if (!fact(facts, input, v)) return false;
-			return true;
-		}
-		if (cell->type.in(ID($eq), ID($ne))) {
-			if (!spend(budget, GetSize(cell->getPort(ID::B)))) return false;
-			auto b = sigmap(cell->getPort(ID::B));
-			if (a.is_fully_const()) std::swap(a, b);
-			if (GetSize(a) == 1 && GetSize(b) == 1 && b.is_fully_def()) {
-				bool equal = cell->type == ID($eq) ? value : !value;
-				bool expected = equal ? b[0] == State::S1 : b[0] == State::S0;
-				return condition(a[0], expected, facts, budget, depth + 1);
-			}
-			if (!((cell->type == ID($eq) && value) || (cell->type == ID($ne) && !value))) return true;
-			if (cell->getParam(ID::A_SIGNED).as_bool() || cell->getParam(ID::B_SIGNED).as_bool()) return true;
-			if (!b.is_fully_def()) return true;
-			int width = std::max(GetSize(a), GetSize(b));
-			a.extend_u0(width);
-			b.extend_u0(width);
-			for (int i = 0; i < width; i++) if (!fact(facts, a[i], b[i].data)) return false;
-			return true;
-		}
-		if (cell->type.in(ID($logic_and), ID($logic_or), ID($and), ID($or), ID($xor), ID($xnor))) {
-			if (!spend(budget, GetSize(cell->getPort(ID::B)))) return false;
-			auto b = sigmap(cell->getPort(ID::B));
-			if (GetSize(a) != 1 || GetSize(b) != 1) return true;
-			if (a.is_fully_const()) std::swap(a, b);
-			if (b.is_fully_def()) {
-				bool fixed = b[0] == State::S1;
-				if (cell->type.in(ID($and), ID($logic_and))) {
-					if (!fixed) return !value;
-				} else if (cell->type.in(ID($or), ID($logic_or))) {
-					if (fixed) return value;
-				} else if (cell->type == ID($xor)) {
-					value ^= fixed;
-				} else {
-				log_assert(cell->type == ID($xnor));
-					value ^= !fixed;
-				}
-				return condition(a[0], value, facts, budget, depth + 1);
-			}
-			if ((cell->type.in(ID($and), ID($logic_and)) && value) ||
-				(cell->type.in(ID($or), ID($logic_or)) && !value))
-				return condition(a[0], value, facts, budget, depth + 1) && condition(b[0], value, facts, budget, depth + 1);
-		}
-		return true;
-	}
-
-	bool condition_facts(SigBit bit, bool value, dict<SigBit, State> &facts, int &budget)
-	{
-		log_assert(facts.empty());
-		bit = sigmap(bit);
-		auto key = std::make_pair(bit, value);
-		auto found = condition_cache.find(key);
-		if (found != condition_cache.end()) {
-			if (!spend(budget, 1 + GetSize(found->second))) return false;
-			facts = found->second;
-			cache_hits++;
-			return true;
-		}
-		if (!condition(bit, value, facts, budget)) return false;
-		int count = GetSize(facts);
-		if (GetSize(condition_cache) < 64 && cached_facts + count <= 4096 && count <= budget && count <= total_budget) {
-			bool available = spend(budget, count);
-			log_assert(available);
-			condition_cache[key] = facts;
-			cached_facts += count;
-			cache_insertions++;
-		}
-		return true;
-	}
-
-	void invalidate_caches()
-	{
-		condition_cache.clear();
-		cached_facts = 0;
-		cone_cache.clear();
-		cached_cone_bits = 0;
-		cache_clears++;
-	}
-
 	struct ConeTrace {
 		pool<SigBit> dependencies;
 		int limit;
@@ -305,7 +121,7 @@ struct PmuxContextWorker {
 	};
 
 	bool cone(SigBit bit, const dict<SigBit, State> &facts, pool<Cell *> &cells, pool<Cell *> &active,
-		pool<SigBit> &leaves, bool &affected, int &budget, Eligibility &eligibility, ConeTrace *trace = nullptr, int depth = 0)
+		pool<SigBit> &leaves, bool &affected, int &budget, dict<Cell *, bool> &eligibility, ConeTrace *trace, int depth = 0)
 	{
 		if (!spend(budget) || depth > max_depth) return false;
 		if (!bit.wire) return true;
@@ -314,8 +130,8 @@ struct PmuxContextWorker {
 			affected = true;
 			return true;
 		}
-		auto cell = driver(bit);
-		if (!supported(cell, eligibility)) {
+		auto cell = netlist.driver(bit);
+		if (!cell || !supported(cell, eligibility)) {
 			leaves.insert(bit);
 			return true;
 		}
@@ -324,54 +140,12 @@ struct PmuxContextWorker {
 		if (GetSize(cells) >= max_cells) return false;
 		if (!spend(budget, GetSize(cell->getPort(ID::Y)))) return false;
 		active.insert(cell);
-		for (auto &port : cell->connections()) if (types.cell_input(cell->type, port.first))
-			for (auto input : port.second) if (!cone(sigmap(input), facts, cells, active, leaves, affected, budget, eligibility, trace, depth+1)) return false;
+		for (auto &port : cell->connections()) if (netlist.cell_input(cell->type, port.first))
+			for (auto input : netlist.port(cell, port.first))
+				if (!cone(input, facts, cells, active, leaves, affected, budget, eligibility, trace, depth+1)) return false;
 		active.erase(cell);
 		cells.insert(cell);
 		return true;
-	}
-
-	pool<Cell *> deletable(const pool<Cell *> &cells, Cell *consumer, IdString port, int offset, int width,
-		const pool<SigBit> &retained, int &budget, Eligibility *eligibility = nullptr)
-	{
-		auto result = cells;
-		if (!result.empty()) ensure_users();
-		bool changed;
-		do {
-			changed = false;
-			for (auto cell : std::vector<Cell *>(result.begin(), result.end())) {
-				bool keep = !editable(cell, eligibility);
-				for (auto original : cell->getPort(ID::Y)) {
-					auto bit = sigmap(original);
-					if (!spend(budget)) return {};
-					if (protected_bits.count(bit) || retained.count(bit)) keep = true;
-					auto found = users.find(bit);
-					if (found == users.end()) continue;
-					for (auto user : found->second) {
-						if (!spend(budget)) return {};
-						if (removed.count(user) || result.count(user)) continue;
-						for (auto &use : user->connections()) if (!types.cell_output(user->type, use.first)) {
-							auto &signal = use.second;
-							if (!spend(budget, GetSize(signal))) return {};
-							for (int i = 0; i < GetSize(signal); i++) if (sigmap(signal[i]) == bit &&
-								!(user == consumer && use.first == port && i >= offset && i < offset+width)) keep = true;
-						}
-					}
-				}
-				if (keep) {
-					result.erase(cell);
-					changed = true;
-				}
-			}
-		} while (changed);
-		return result;
-	}
-
-	void index_inputs(Cell *cell)
-	{
-		log_assert(users_built);
-		for (auto &port : cell->connections()) if (types.cell_input(cell->type, port.first))
-			for (auto bit : sigmap(port.second)) users[bit].insert(cell);
 	}
 
 	std::unique_ptr<ContextPlan> analyze(const SigSpec &original, const pool<Cell *> &cells,
@@ -399,8 +173,8 @@ struct PmuxContextWorker {
 			copy->attributes.clear();
 			for (auto &port : cell->connections()) {
 				SigSpec signal;
-				for (auto bit : sigmap(port.second)) {
-					if (types.cell_output(cell->type, port.first) && facts.count(bit)) signal.append(local->addWire(NEW_ID));
+				for (auto bit : netlist.port(cell, port.first)) {
+					if (netlist.cell_output(cell->type, port.first) && facts.count(bit)) signal.append(local->addWire(NEW_ID));
 					else signal.append(mapbit(bit));
 				}
 				copy->setPort(port.first, signal);
@@ -455,11 +229,11 @@ struct PmuxContextWorker {
 		return plan;
 	}
 
-	void specialize(Cell *consumer, IdString port, int offset, int width, dict<SigBit, State> &facts)
+	void specialize(Cell *consumer, IdString port, int offset, int width, const dict<SigBit, State> &facts)
 	{
 		if (facts.empty() || copies >= 64 || total_budget <= 0) return;
 		int budget = max_bits;
-		auto original = sigmap(consumer->getPort(port).extract(offset, width));
+		auto original = netlist.port(consumer, port).extract(offset, width);
 		auto cached = cone_cache.find(original);
 		// 完整遍历的消耗必须同时满足两个预算，才能省略逐次扣费。
 		if (cached != cone_cache.end() && cached->second.work <= budget && cached->second.work <= total_budget) {
@@ -480,7 +254,7 @@ struct PmuxContextWorker {
 		pool<Cell *> cells, active, deleted;
 		pool<SigBit> leaves;
 		{
-			Eligibility eligibility;
+			dict<Cell *, bool> eligibility;
 			bool affected = false, has_pmux = false;
 			for (auto bit : original) if (!cone(bit, facts, cells, active, leaves, affected, budget, eligibility, record ? &trace : nullptr)) return;
 			if (!affected) {
@@ -496,7 +270,9 @@ struct PmuxContextWorker {
 			}
 			for (auto cell : cells) if (cell->type == ID($pmux)) has_pmux = true;
 			if (!has_pmux) return;
-			deleted = deletable(cells, consumer, port, offset, width, leaves, budget, &eligibility);
+			int pruning_budget = std::min(budget, total_budget), initial_budget = pruning_budget;
+			deleted = netlist.private_cells(cells, {}, {}, leaves, &pruning_budget, {consumer, port, offset, width});
+			spend(budget, initial_budget - pruning_budget);
 		}
 		int old_cost = 0;
 		for (auto cell : deleted) old_cost += cost(cell);
@@ -524,18 +300,21 @@ struct PmuxContextWorker {
 				for (auto &bit : p.second) signal.append(importbit(bit));
 				copy->setPort(p.first, signal);
 			}
-			index_inputs(copy);
+			netlist.register_cell(copy);
 		}
 		SigSpec replacement;
 		for (auto &bit : plan->outputs) replacement.append(importbit(bit));
 		log_assert(GetSize(replacement) == width);
 		auto signal = consumer->getPort(port);
 		signal.replace(offset, replacement);
-		consumer->setPort(port, signal);
-		index_inputs(consumer);
-		for (auto cell : deleted) removed.insert(cell);
+		netlist.set_port(consumer, port, signal);
+		for (auto cell : deleted) {
+			netlist.forget_cell(cell);
+			removed.insert(cell);
+		}
 		changes++;
-		invalidate_caches();
+		cone_cache.clear();
+		cached_cone_bits = 0;
 	}
 
 	struct Relation {
@@ -564,12 +343,12 @@ struct PmuxContextWorker {
 	{
 		Relation result;
 		if (depth > max_depth || !spend(budget, GetSize(signal)) || signal.empty()) return result;
-		signal = trim(sigmap(signal));
-		auto cell = driver(signal[0]);
+		signal = trim(signal);
+		auto cell = netlist.driver(signal[0]);
 		if (cell && cell->hasPort(ID::Y) && GetSize(cell->getPort(ID::Y)) > max_bits) return result;
 		bool supported_type = cell && cell->type.in(ID($add), ID($pos), ID($mux), ID($pmux));
 		if (supported_type && !spend_ports(cell, budget)) return result;
-		if (!supported_type || !editable(cell) || sigmap(cell->getPort(ID::Y)) != signal) {
+		if (!supported_type || !netlist.editable(cell) || netlist.port(cell, ID::Y) != signal) {
 			if (!signal.is_fully_def() && signal.is_fully_const()) return result;
 			result.valid = true;
 			result.base = signal;
@@ -583,8 +362,8 @@ struct PmuxContextWorker {
 				active.erase(cell);
 				return result;
 			}
-			auto a = sigmap(cell->getPort(ID::A));
-			SigSpec b = cell->hasPort(ID::B) ? sigmap(cell->getPort(ID::B)) : SigSpec(State::S0);
+			auto a = netlist.port(cell, ID::A);
+			SigSpec b = cell->hasPort(ID::B) ? netlist.port(cell, ID::B) : SigSpec(State::S0);
 			if (a.is_fully_const()) std::swap(a, b);
 			if (!b.is_fully_def()) {
 				active.erase(cell);
@@ -605,7 +384,7 @@ struct PmuxContextWorker {
 				}
 			}
 		} else {
-			auto s = sigmap(cell->getPort(ID::S)), a = sigmap(cell->getPort(ID::A)), b = sigmap(cell->getPort(ID::B));
+			const auto &s = netlist.port(cell, ID::S), &a = netlist.port(cell, ID::A), &b = netlist.port(cell, ID::B);
 			int count = cell->type == ID($mux) ? 1 : GetSize(s);
 			if (count > 16) {
 				active.erase(cell);
@@ -645,25 +424,30 @@ struct PmuxContextWorker {
 	{
 		if (cell->getParam(ID::A_SIGNED).as_bool() || cell->getParam(ID::B_SIGNED).as_bool()) return;
 		int budget = max_bits;
-		if (!spend_ports(cell, budget) || !editable(cell)) return;
-		auto modulus = sigmap(cell->getPort(ID::B));
+		if (!spend_ports(cell, budget) || !netlist.editable(cell)) return;
+		const auto &modulus = netlist.port(cell, ID::B);
 		if (!modulus.is_fully_def() || modulus.empty() || modulus.is_fully_zero() || GetSize(modulus) > max_bits) return;
 		pool<Cell *> active;
-		auto old = sigmap(cell->getPort(ID::A));
+		auto old = netlist.port(cell, ID::A);
 		auto result = relation(old, modulus.as_const(), active, budget);
 		if (!result.valid || !result.selection || !zero(result.residue) || result.base == old) return;
 		pool<SigBit> retained;
 		for (auto bit : result.base) retained.insert(bit);
-		auto deleted = deletable(result.cells, cell, ID::A, 0, GetSize(old), retained, budget);
+		int pruning_budget = std::min(budget, total_budget), initial_budget = pruning_budget;
+		auto deleted = netlist.private_cells(result.cells, {}, {}, retained, &pruning_budget, {cell, ID::A, 0, GetSize(old)});
+		spend(budget, initial_budget - pruning_budget);
 		int old_cost = 0;
 		for (auto old_cell : deleted) old_cost += cost(old_cell);
 		if (!old_cost || budget < 0 || GetSize(result.base) > GetSize(old)) return;
-		cell->setPort(ID::A, result.base);
+		netlist.set_port(cell, ID::A, result.base);
 		cell->setParam(ID::A_WIDTH, GetSize(result.base));
-		index_inputs(cell);
-		for (auto old_cell : deleted) removed.insert(old_cell);
+		for (auto old_cell : deleted) {
+			netlist.forget_cell(old_cell);
+			removed.insert(old_cell);
+		}
 		changes++;
-		invalidate_caches();
+		cone_cache.clear();
+		cached_cone_bits = 0;
 	}
 
 	void run()
@@ -673,12 +457,13 @@ struct PmuxContextWorker {
 			if (cell->type.in(ID($mux), ID($pmux), ID($mod), ID($modfloor))) candidates.push_back(cell);
 		for (auto cell : candidates) {
 			if (total_budget <= 0) break;
+			if (removed.count(cell)) continue;
 			if (cell->type.in(ID($mod), ID($modfloor))) {
 				modulo(cell);
 				continue;
 			}
-			if (!editable(cell)) continue;
-			auto s = sigmap(cell->getPort(ID::S));
+			if (!netlist.editable(cell)) continue;
+			auto s = netlist.port(cell, ID::S);
 			int width = GetSize(cell->getPort(ID::A));
 			if (GetSize(s) > 16 || width > max_bits) continue;
 			bool mux = cell->type == ID($mux);
@@ -687,15 +472,16 @@ struct PmuxContextWorker {
 				bool value = !mux || index != 0;
 				auto bit = s[mux ? 0 : index];
 				dict<SigBit, State> facts;
-				int budget = max_bits;
-				if (condition_facts(bit, value, facts, budget))
+				int budget = std::min(max_bits, total_budget), initial_budget = budget;
+				bool valid = decoder.condition(bit, value, facts, budget);
+				total_budget -= initial_budget - budget;
+				if (valid)
 					specialize(cell, value ? ID::B : ID::A, mux ? 0 : index*width, width, facts);
 			}
 		}
 		for (auto cell : removed) module->remove(cell);
-		if (cache_hits || cache_insertions || cache_clears)
-			log("opt_pmuxcontext %s: condition_cache_hits=%d insertions=%d clears=%d commits=%d.\n",
-				log_id(module), cache_hits, cache_insertions, cache_clears, changes);
+		if (changes)
+			log("opt_pmuxcontext %s: specialized %d cones.\n", log_id(module), changes);
 	}
 };
 

@@ -1,252 +1,23 @@
 // opt_pmuxarith 共享 PMUX 分支中的加减、比较及常量除模运算，并生成四输入 LUT 网络。
 // 在操作数选择、进位和余数计算之间共享节点，减少重复算术与选择逻辑。
 #include "kernel/yosys.h"
-#include "kernel/sigtools.h"
+#include "kernel/celltypes.h"
 #include "kernel/utils.h"
-#include "passes/opt/pmux_celltypes.h"
+#include "passes/opt/pmux_lut_graph.h"
+#include "passes/opt/pmux_netlist.h"
 #include <array>
 #include <functional>
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
 
-struct ArithNetwork {
-	struct Node {
-		SigBit bit;
-		std::vector<int> inputs;
-		unsigned table = 0;
-		bool leaf = false;
-	};
-	std::vector<Node> nodes;
-	dict<SigBit, int> leaves;
-	std::map<std::pair<std::vector<int>, unsigned>, int> cache;
-	ArithNetwork() {
-		leaf(State::S0);
-		leaf(State::S1);
-	}
-	int leaf(SigBit bit) {
-		auto found = leaves.find(bit);
-		if (found != leaves.end())
-			return found->second;
-		int id = GetSize(nodes);
-		nodes.push_back({bit, {}, 0, true});
-		leaves[bit] = id;
-		return id;
-	}
-	int lut(const std::vector<int> &args, unsigned table) {
-		log_assert(GetSize(args) <= 4);
-		std::vector<int> inputs;
-		for (int arg : args) {
-			log_assert(arg >= 0 && arg < GetSize(nodes));
-			if (arg > 1 && std::find(inputs.begin(), inputs.end(), arg) == inputs.end())
-				inputs.push_back(arg);
-		}
-		std::sort(inputs.begin(), inputs.end());
-		unsigned reduced = 0;
-		for (int value = 0; value < (1 << GetSize(inputs)); value++) {
-			int old = 0;
-			for (int i = 0; i < GetSize(args); i++) {
-				int v = args[i] == 1;
-				if (args[i] > 1) v = (value >> (std::lower_bound(inputs.begin(), inputs.end(), args[i]) - inputs.begin())) & 1;
-				old |= v << i;
-			}
-			reduced |= ((table >> old) & 1) << value;
-		}
-		for (int i = GetSize(inputs)-1; i >= 0; i--) {
-			bool depends = false;
-			for (int j = 0; j < (1 << GetSize(inputs)); j++) if (((reduced >> j) & 1) != ((reduced >> (j ^ (1 << i))) & 1)) depends = true;
-			if (!depends) {
-				unsigned smaller = 0;
-				for (int j = 0; j < (1 << (GetSize(inputs)-1)); j++) smaller |= ((reduced >> ((j & ((1 << i)-1)) | ((j >> i) << (i+1)))) & 1) << j;
-				inputs.erase(inputs.begin()+i);
-				reduced = smaller;
-			}
-		}
-		if (inputs.empty()) return reduced & 1;
-		if (GetSize(inputs) == 1 && reduced == 2) return inputs[0];
-		log_assert(GetSize(inputs) <= 4);
-		auto key = std::make_pair(inputs, reduced);
-		auto found = cache.find(key);
-		if (found != cache.end())
-			return found->second;
-		int id = GetSize(nodes);
-		nodes.push_back({{}, inputs, reduced, false});
-		cache[key] = id;
-		return id;
-	}
-	int gate(const std::vector<int> &args, unsigned table) {
-		log_assert(GetSize(args) <= 4);
-		std::vector<int> expanded;
-		for (int id : args) {
-			auto in = nodes[id].leaf ? std::vector<int>{id} : nodes[id].inputs;
-			for (int v : in) if (v > 1 && std::find(expanded.begin(), expanded.end(), v) == expanded.end()) expanded.push_back(v);
-		}
-		if (GetSize(expanded) > 4) return lut(args, table);
-		unsigned merged = 0;
-		for (int value = 0; value < (1 << GetSize(expanded)); value++) {
-			auto eval = [&](int id) {
-				if (id < 2) return id;
-				auto pos = std::find(expanded.begin(), expanded.end(), id);
-				if (nodes[id].leaf) return (value >> (pos-expanded.begin())) & 1;
-				int index = 0;
-				for (int i = 0; i < GetSize(nodes[id].inputs); i++) {
-					int arg = nodes[id].inputs[i];
-					index |= ((value >> (std::find(expanded.begin(), expanded.end(), arg)-expanded.begin())) & 1) << i;
-				}
-				return int((nodes[id].table >> index) & 1);
-			};
-			int index = 0;
-			for (int i = 0; i < GetSize(args); i++) index |= eval(args[i]) << i;
-			merged |= ((table >> index) & 1) << value;
-		}
-		return lut(expanded, merged);
-	}
-	int mux(int a, int b, int s) { return gate({a,b,s}, 0xca); }
-	std::vector<int> bits(const SigSpec &value) {
-		std::vector<int> result;
-		for (auto bit : value)
-			result.push_back(leaf(bit));
-		return result;
-	}
-	std::vector<int> add(const std::vector<int> &a, const std::vector<int> &b, int carry = 0) {
-		log_assert(a.size() == b.size());
-		std::vector<int> result;
-		for (int i = 0; i < GetSize(a); i++) {
-			result.push_back(gate({a[i],b[i],carry}, 0x96));
-			if (i+1 < GetSize(a)) carry = gate({a[i],b[i],carry}, 0xe8);
-		}
-		return result;
-	}
-	std::vector<int> sum3(const std::vector<int> &a, const std::vector<int> &b, const std::vector<int> &c) {
-		log_assert(a.size() == b.size() && a.size() == c.size());
-		std::vector<int> sum, carry(a.size(), 0);
-		for (int i = 0; i < GetSize(a); i++) {
-			sum.push_back(gate({a[i],b[i],c[i]}, 0x96));
-			if (i+1 < GetSize(a)) carry[i+1] = gate({a[i],b[i],c[i]}, 0xe8);
-		}
-		return add(sum, carry);
-	}
-	int select(const std::vector<int> &values, const std::vector<int> &control, int level = 0, int prefix = 0) {
-		if (level == GetSize(control)) return values[prefix];
-		return mux(select(values, control, level+1, prefix), select(values, control, level+1, prefix | (1 << level)), control[level]);
-	}
-	pool<int> live(const std::vector<int> &outputs) const {
-		pool<int> seen;
-		std::function<void(int)> visit = [&](int id) {
-			log_assert(id >= 0 && id < GetSize(nodes));
-			if (seen.insert(id).second)
-				for (int arg : nodes[id].inputs) visit(arg);
-		};
-		for (int id : outputs) visit(id);
-		return seen;
-	}
-	int cost(const std::vector<int> &outputs) const {
-		int count = 0;
-		for (int id : live(outputs))
-			count += !nodes[id].leaf;
-		return count;
-	}
-	SigSpec emit(Module *module, IdString celltype, const std::vector<int> &outputs) const {
-		auto used = live(outputs);
-		std::vector<SigBit> signals(nodes.size());
-		for (int id = 0; id < GetSize(nodes); id++) if (used.count(id)) {
-			auto &node = nodes[id];
-			if (node.leaf) {
-				signals[id] = node.bit;
-				continue;
-			}
-			auto wire = module->addWire(NEW_ID);
-			signals[id] = SigBit(wire);
-			auto cell = module->addCell(NEW_ID, celltype.empty() ? ID($lut) : celltype);
-			SigSpec inputs;
-			for (int arg : node.inputs)
-				inputs.append(signals[arg]);
-			unsigned mask = 0;
-			for (int i = 0; i < 16; i++)
-				mask |= ((node.table >> (i & ((1 << inputs.size())-1))) & 1) << i;
-			inputs.extend_u0(4);
-			if (celltype.empty()) {
-				cell->setParam(ID::WIDTH, 4);
-				cell->setParam(ID::LUT, Const(mask,16));
-				cell->setPort(ID::A, inputs);
-				cell->setPort(ID::Y, wire);
-			} else {
-				cell->setParam(ID(lut_mask), Const(mask,16));
-				cell->setParam(ID(sum_lutc_input), Const("datac"));
-				cell->setPort(ID(dataa), inputs[0]);
-				cell->setPort(ID(datab), inputs[1]);
-				cell->setPort(ID(datac), inputs[2]);
-				cell->setPort(ID(datad), inputs[3]);
-				cell->setPort(ID(combout), wire);
-				cell->setPort(ID(cin), State::S0);
-			}
-		}
-		SigSpec result;
-		for (int id : outputs)
-			result.append(signals[id]);
-		return result;
-	}
-};
-
 struct PmuxArithWorker {
 	Module *module;
-	SigMap sigmap;
-	PmuxCellTypes types;
+	PmuxNetlist netlist;
 	IdString luttype;
-	dict<SigBit, Cell *> drivers;
-	dict<SigBit, std::vector<Cell *>> users;
-	pool<SigBit> protected_bits, kept_bits, input_bits, multiple_drivers;
-	pool<Cell *> selected;
 	int budget = 20000;
-	PmuxArithWorker(Module *m, Design *d, IdString luttype) : module(m), sigmap(m), types(m,d), luttype(luttype) {
-		for (auto wire : m->wires()) {
-			bool keep = wire->get_bool_attribute(ID::keep);
-			if (!wire->port_input && !wire->port_output && !keep) continue;
-			for (auto bit : sigmap(wire)) {
-				if (wire->port_input) {
-					drivers[bit] = nullptr;
-					input_bits.insert(bit);
-				}
-				if (wire->port_output || keep) protected_bits.insert(bit);
-				if (keep) kept_bits.insert(bit);
-			}
-		}
-		for (auto cell : m->cells()) {
-			if (d->selected(m,cell)) selected.insert(cell);
-			bool keep = cell->get_bool_attribute(ID::keep);
-			for (auto &port : cell->connections()) {
-				auto direction = types.cell_port_dir(cell->type, port.first);
-				bool output = direction == RTLIL::PD_OUTPUT || direction == RTLIL::PD_INOUT;
-				bool input = direction == RTLIL::PD_INPUT || direction == RTLIL::PD_INOUT;
-				for (auto bit : sigmap(port.second)) {
-					if (output) {
-						if (drivers.count(bit)) {
-							drivers[bit] = nullptr;
-							multiple_drivers.insert(bit);
-						} else {
-							drivers[bit] = cell;
-						}
-					}
-					if (input || !output) {
-						auto &list = users[bit];
-						if (list.empty() || list.back() != cell) list.push_back(cell);
-					}
-					if (keep || (!input && !output)) kept_bits.insert(bit);
-				}
-			}
-		}
-	}
-	bool editable(Cell *cell) const {
-		if (!selected.count(cell) || cell->get_bool_attribute(ID::keep) || !cell->hasPort(ID::Y)) return false;
-		for (auto bit : sigmap(cell->getPort(ID::Y))) if (kept_bits.count(bit) || !drivers.count(bit) || drivers.at(bit) != cell) return false;
-		return true;
-	}
-	SigSpec extended(Cell *cell, IdString port, int width) const {
-		auto s = sigmap(cell->getPort(port));
-		bool sign = cell->getParam(ID::A_SIGNED).as_bool() && (!cell->hasParam(ID::B_SIGNED) || cell->getParam(ID::B_SIGNED).as_bool());
-		s.extend_u0(width, sign);
-		return s;
-	}
+	PmuxArithWorker(Module *module, Design *design, IdString luttype) :
+		module(module), netlist(module, design), luttype(luttype) {}
 	SigSpec without_zero_extension(SigSpec value) const
 	{
 		while (!value.empty() && value.back() == State::S0)
@@ -254,37 +25,14 @@ struct PmuxArithWorker {
 		return value;
 	}
 	Cell *root(const SigSpec &value) const {
-		if (value.empty() || !drivers.count(value[0])) return nullptr;
-		auto cell = drivers.at(value[0]);
-		if (!cell || !editable(cell)) return nullptr;
-		auto y = sigmap(cell->getPort(ID::Y));
+		if (value.empty()) return nullptr;
+		auto cell = netlist.driver(value[0]);
+		if (!cell || !netlist.editable(cell)) return nullptr;
+		const auto &y = netlist.port(cell, ID::Y);
 		int n = std::min(GetSize(y),GetSize(value));
 		if (value.extract(0,n) != y.extract(0,n)) return nullptr;
 		for (int i = n; i < GetSize(value); i++) if (value[i] != State::S0) return nullptr;
 		return cell;
-	}
-	bool independent(const pool<SigBit> &leaves, const SigSpec &output) {
-		pool<SigBit> target(output.begin(),output.end()), done, active;
-		std::function<bool(SigBit)> visit = [&](SigBit bit) {
-			if (!bit.wire) return true;
-			if (target.count(bit) || active.count(bit) || multiple_drivers.count(bit) || --budget <= 0) return false;
-			if (done.count(bit)) return true;
-			if (!drivers.count(bit)) return false;
-			auto cell = drivers.at(bit);
-			if (!cell) {
-				// 输入端口作为组合分析的边界。
-				return input_bits.count(bit) != 0;
-			}
-			active.insert(bit);
-			if (!types.cell_known(cell->type)) return false;
-			for (auto &port : cell->connections()) if (types.cell_input(cell->type,port.first))
-				for (auto in : sigmap(port.second)) if (!visit(in)) return false;
-			active.erase(bit);
-			done.insert(bit);
-			return true;
-		};
-		for (auto bit : leaves) if (!visit(bit)) return false;
-		return true;
 	}
 	int old_cost(Cell *cell) const {
 		int width = GetSize(cell->getPort(ID::Y));
@@ -294,38 +42,32 @@ struct PmuxArithWorker {
 		if (cell->type.in(ID($eq),ID($ne),ID($lt),ID($gt))) return std::max(GetSize(cell->getPort(ID::A)),GetSize(cell->getPort(ID::B)));
 		return width;
 	}
-	bool commit_outputs(const std::vector<Cell *> &roots, pool<Cell *> region, ArithNetwork &network, const std::vector<int> &outputs) {
+	bool commit_outputs(const std::vector<Cell *> &roots, const pool<Cell *> &region,
+			const PmuxLutGraph &network, const std::vector<int> &outputs)
+	{
 		pool<SigBit> leaves;
-		for (int id : network.live(outputs)) if (network.nodes[id].leaf && network.nodes[id].bit.wire) leaves.insert(network.nodes[id].bit);
-		SigSpec y;
-		pool<Cell *> replaced;
+		int cost = network.cost(outputs, leaves);
+		pool<SigBit> targets;
+		int width = 0;
 		for (auto cell : roots) {
-			y.append(sigmap(cell->getPort(ID::Y)));
-			region.insert(cell);
-			replaced.insert(cell);
+			log_assert(netlist.editable(cell));
+			const auto &y = netlist.port(cell, ID::Y);
+			targets.insert(y.begin(), y.end());
+			width += GetSize(y);
 		}
-		log_assert(GetSize(y) == GetSize(outputs));
-		if (!independent(leaves,y)) return false;
-		bool changed;
-		do {
-			changed = false;
-			for (auto cell : std::vector<Cell *>(region.begin(),region.end())) if (!replaced.count(cell)) {
-				bool retain = !editable(cell);
-				for (auto bit : sigmap(cell->getPort(ID::Y))) {
-					if (protected_bits.count(bit) || leaves.count(bit)) retain = true;
-					for (auto user : reversed(users[bit])) if (!region.count(user)) retain = true;
-				}
-				if (retain) {
-					region.erase(cell);
-					changed = true;
-				}
-			}
-		} while (changed);
-		int old = 0;
+		log_assert(width == GetSize(outputs) && width == GetSize(targets));
+		if (!netlist.independent(leaves, targets, budget)) return false;
+		auto removed = netlist.private_cells(region, {roots.begin(), roots.end()}, targets, leaves);
+		for (auto cell : roots)
+			log_assert(removed.count(cell));
+		int old = 0, operators = 0;
 		dict<SigSpec, int> divcost;
-		for (auto cell : region) {
+		for (auto cell : removed) {
+			if (cell->type.in(ID($add), ID($sub), ID($div), ID($mod), ID($lt), ID($gt)) ||
+				(cell->type == ID($eq) && !netlist.port(cell, ID::A).is_fully_const() && !netlist.port(cell, ID::B).is_fully_const()))
+				operators++;
 			if (cell->type.in(ID($div), ID($mod))) {
-				auto input = without_zero_extension(sigmap(cell->getPort(ID::A)));
+				auto input = without_zero_extension(netlist.port(cell, ID::A));
 				auto &cost = divcost[input];
 				cost = std::max(cost, GetSize(input)*GetSize(input));
 			} else {
@@ -334,35 +76,35 @@ struct PmuxArithWorker {
 		}
 		for (auto &item : divcost)
 			old += item.second;
-		int cost = network.cost(outputs);
-		if (cost >= old) return false;
+		if (operators < 2 || cost >= old) return false;
 		int before = module->cells_size();
 		auto emitted = network.emit(module, luttype, outputs);
 		int emitted_cells = module->cells_size() - before;
 		log_assert(emitted_cells == cost);
 		log_debug("PMUX arithmetic commit: reference=%d candidate=%d removed=%d emitted=%d.\n",
-			old, cost, GetSize(region), emitted_cells);
+			old, cost, GetSize(removed), emitted_cells);
 		int offset = 0;
 		for (auto cell : roots) {
 			auto port = cell->getPort(ID::Y);
 			module->connect(port, emitted.extract(offset, GetSize(port)));
 			offset += GetSize(port);
 		}
-		for (auto cell : region) module->remove(cell);
+		for (auto cell : removed) module->remove(cell);
 		return true;
 	}
-	bool commit(Cell *pmux, const pool<Cell *> &region, ArithNetwork &network, const std::vector<int> &outputs) {
-		return commit_outputs({pmux}, region, network, outputs);
+	bool control_operator(IdString type) const
+	{
+		return type.in(ID($eq), ID($logic_not), ID($not), ID($and), ID($or), ID($xor), ID($reduce_or), ID($reduce_bool));
 	}
 	bool control_support(SigBit bit, pool<SigBit> &support, pool<Cell *> &region, int depth = 0) {
 		if (!bit.wire) return bit == State::S0 || bit == State::S1;
 		if (--budget <= 0 || depth > 8) return false;
-		auto cell = drivers.count(bit) ? drivers.at(bit) : nullptr;
-		if (cell && editable(cell) && cell->type.in(ID($eq),ID($logic_not),ID($not),ID($and),ID($or),ID($xor),ID($reduce_or),ID($reduce_bool))) {
+		auto cell = netlist.driver(bit);
+		if (cell && control_operator(cell->type) && netlist.editable(cell)) {
 			region.insert(cell);
-			for (auto &port : cell->connections()) if (types.cell_input(cell->type,port.first)) {
+			for (auto &port : cell->connections()) if (netlist.cell_input(cell->type, port.first)) {
 				if (GetSize(port.second)>4) return false;
-				for (auto in : sigmap(port.second)) if (!control_support(in,support,region,depth+1)) return false;
+				for (auto in : netlist.port(cell, port.first)) if (!control_support(in,support,region,depth+1)) return false;
 			}
 			return true;
 		}
@@ -380,37 +122,25 @@ struct PmuxArithWorker {
 			result = found->second;
 			return true;
 		}
-		if (depth>8 || --budget<=0 || !drivers.count(bit) || !drivers.at(bit)) return false;
-		auto cell = drivers.at(bit);
+		if (depth > 8 || --budget <= 0) return false;
+		auto source = netlist.source(bit);
+		if (!source || !source->cell || source->port != ID::Y || !control_operator(source->cell->type)) return false;
+		auto cell = source->cell;
 		Const a, b;
-		for (auto in : sigmap(cell->getPort(ID::A))) {
+		for (auto in : netlist.port(cell, ID::A)) {
 			bool value;
 			if (!eval(in, values, value, depth+1)) return false;
 			a.append(value ? State::S1 : State::S0);
 		}
-		if (cell->hasPort(ID::B)) for (auto in : sigmap(cell->getPort(ID::B))) {
+		if (cell->hasPort(ID::B)) for (auto in : netlist.port(cell, ID::B)) {
 			bool value;
 			if (!eval(in, values, value, depth+1)) return false;
 			b.append(value ? State::S1 : State::S0);
 		}
-		Const y;
-		int yw = GetSize(cell->getPort(ID::Y));
-		bool sa = cell->hasParam(ID::A_SIGNED) && cell->getParam(ID::A_SIGNED).as_bool();
-		bool sb = cell->hasParam(ID::B_SIGNED) && cell->getParam(ID::B_SIGNED).as_bool();
-		if (cell->type == ID($eq)) y=const_eq(a,b,sa,sb,yw);
-		else if (cell->type == ID($logic_not)) y=const_logic_not(a,{},sa,false,yw);
-		else if (cell->type == ID($not)) y=const_not(a,{},sa,false,yw);
-		else if (cell->type == ID($and)) y=const_and(a,b,sa,sb,yw);
-		else if (cell->type == ID($or)) y=const_or(a,b,sa,sb,yw);
-		else if (cell->type == ID($xor)) y=const_xor(a,b,sa,sb,yw);
-		else if (cell->type.in(ID($reduce_or),ID($reduce_bool))) y=const_reduce_or(a,{},false,false,yw);
-		else return false;
-		auto signal = sigmap(cell->getPort(ID::Y));
-		for (int i = 0; i < GetSize(signal); i++) if (signal[i] == bit) {
-			result = y[i] == State::S1;
-			return true;
-		}
-		return false;
+		auto y = CellTypes::eval(cell, a, b);
+		log_assert(source->offset >= 0 && source->offset < GetSize(y));
+		result = y[source->offset] == State::S1;
+		return true;
 	}
 	bool selected_branch(const SigSpec &s, const SigSpec &a, const SigSpec &b, int width,
 			const dict<SigBit, bool> &values, SigSpec &branch)
@@ -436,14 +166,14 @@ struct PmuxArithWorker {
 	};
 	bool choice(Cell *pmux, std::vector<SigSpec> &branches, SigSpec &control, pool<Cell *> &region) {
 		pool<SigBit> support;
-		auto s = sigmap(pmux->getPort(ID::S));
+		const auto &s = netlist.port(pmux, ID::S);
 		if (s.empty() || GetSize(s)>4) return false;
 		for (auto bit:s) if (!control_support(bit,support,region)) return false;
 		if (support.empty() || GetSize(support)>2) return false;
 		std::vector<SigBit> sorted(support.begin(), support.end());
 		std::sort(sorted.begin(), sorted.end());
 		control = SigSpec(sorted);
-		auto a = sigmap(pmux->getPort(ID::A)), b = sigmap(pmux->getPort(ID::B));
+		const auto &a = netlist.port(pmux, ID::A), &b = netlist.port(pmux, ID::B);
 		for (int code = 0; code < (1 << GetSize(control)); code++) {
 			dict<SigBit, bool> values;
 			for (int j = 0; j < GetSize(control); j++)
@@ -474,17 +204,17 @@ struct PmuxArithWorker {
 	using Polynomial = dict<SigSpec,Const>;
 	bool comparisons(SigBit bit, pool<Cell *> &predicates, pool<Cell *> &region, int depth=0) {
 		if (!bit.wire) return bit==State::S0 || bit==State::S1;
-		if (--budget<=0 || depth>6 || !drivers.count(bit) || !drivers.at(bit)) return false;
-		auto cell = drivers.at(bit);
-		if (!editable(cell)) return false;
+		if (--budget <= 0 || depth > 6) return false;
+		auto cell = netlist.driver(bit);
+		if (!cell || !netlist.editable(cell)) return false;
 		region.insert(cell);
 		if (cell->type.in(ID($lt), ID($gt), ID($eq)) && !cell->getPort(ID::A).is_fully_const() && !cell->getPort(ID::B).is_fully_const()) {
 			predicates.insert(cell);
 			return GetSize(predicates) <= 3;
 		}
 		if(!cell->type.in(ID($eq),ID($not),ID($logic_not),ID($and),ID($or),ID($xor)))return false;
-		for (auto &port : cell->connections()) if (types.cell_input(cell->type, port.first))
-			for (auto in : sigmap(port.second))
+		for (auto &port : cell->connections()) if (netlist.cell_input(cell->type, port.first))
+			for (auto in : netlist.port(cell, port.first))
 				if (!comparisons(in, predicates, region, depth+1)) return false;
 		return true;
 	}
@@ -492,7 +222,7 @@ struct PmuxArithWorker {
 		if(value==a || value==b)return true;
 		auto cell = root(value);
 		if (!cell || !cell->type.in(ID($or), ID($and))) return false;
-		auto x=extended(cell,ID::A,GetSize(value)),y=extended(cell,ID::B,GetSize(value));
+		auto x = netlist.extended(cell, ID::A, GetSize(value)), y = netlist.extended(cell, ID::B, GetSize(value));
 		// 外部零扩展必须保留相等操作数的全部有效位。
 		for(int i=GetSize(cell->getPort(ID::Y));i<GetSize(value);i++)
 			if(x[i]!=State::S0||y[i]!=State::S0)return false;
@@ -506,7 +236,7 @@ struct PmuxArithWorker {
 		int width = GetSize(pmux->getPort(ID::Y));
 		if (width < 2 || width > 32) return false;
 		pool<Cell *> predicates, region;
-		auto s = sigmap(pmux->getPort(ID::S));
+		const auto &s = netlist.port(pmux, ID::S);
 		if (GetSize(s) > 4) return false;
 		for (auto bit : s)
 			if (!comparisons(bit, predicates, region)) return false;
@@ -517,7 +247,7 @@ struct PmuxArithWorker {
 		for (auto cell : predicates) {
 			if (GetSize(cell->getPort(ID::Y)) != 1) return false;
 			int w = std::max(GetSize(cell->getPort(ID::A)), GetSize(cell->getPort(ID::B)));
-			auto x = extended(cell, ID::A, w), y = extended(cell, ID::B, w);
+			auto x = netlist.extended(cell, ID::A, w), y = netlist.extended(cell, ID::B, w);
 			bool signed_order = cell->getParam(ID::A_SIGNED).as_bool() && cell->getParam(ID::B_SIGNED).as_bool();
 			if (w != width) return false;
 			if (first) {
@@ -545,11 +275,11 @@ struct PmuxArithWorker {
 			kinds.insert(entry.second);
 		if (GetSize(kinds) != 3) return false;
 		std::vector<SigSpec> branch;
-		auto av = sigmap(pmux->getPort(ID::A)), bv = sigmap(pmux->getPort(ID::B));
+		const auto &av = netlist.port(pmux, ID::A), &bv = netlist.port(pmux, ID::B);
 		for (int state = 0; state < 3; state++) {
 			dict<SigBit, bool> values;
 			for (auto &entry : relation)
-				values[sigmap(entry.first->getPort(ID::Y))[0]] = entry.second == state;
+				values[netlist.port(entry.first, ID::Y)[0]] = entry.second == state;
 			SigSpec selected;
 			if (!selected_branch(s, av, bv, width, values, selected)) return false;
 			branch.push_back(selected);
@@ -557,7 +287,7 @@ struct PmuxArithWorker {
 		bool minimum = branch[0] == a && branch[2] == b;
 		bool maximum = branch[0] == b && branch[2] == a;
 		if ((!minimum && !maximum) || !equal_branch(branch[1], a, b, region)) return false;
-		ArithNetwork net;
+		PmuxLutGraph net(PmuxLutGraph::Expansion::All);
 		auto ab = net.bits(a), bb = net.bits(b);
 		int less = 0;
 		for (int i = 0; i < width; i++) {
@@ -572,9 +302,9 @@ struct PmuxArithWorker {
 		std::vector<int> output;
 		for (int i = 0; i < width; i++)
 			output.push_back(net.mux(minimum ? bb[i] : ab[i], minimum ? ab[i] : bb[i], less));
-		return commit(pmux, region, net, output);
+		return commit_outputs({pmux}, region, net, output);
 	}
-	std::pair<std::vector<int>, std::vector<int>> divmod3(ArithNetwork &net, const SigSpec &input, int width) {
+	std::pair<std::vector<int>, std::vector<int>> divmod3(PmuxLutGraph &net, const SigSpec &input, int width) {
 		log_assert(width >= 2 && GetSize(input) >= width);
 		auto x = net.bits(input);
 		std::vector<int> quotient(width, 0), remainder(2, 0);
@@ -600,16 +330,16 @@ struct PmuxArithWorker {
 		return {quotient, remainder};
 	}
 	bool unsigned_div3(Cell *cell) const {
-		if(!cell->type.in(ID($div),ID($mod))||!editable(cell))return false;
+		if(!cell->type.in(ID($div),ID($mod))||!netlist.editable(cell))return false;
 		if(cell->getParam(ID::A_SIGNED).as_bool()||cell->getParam(ID::B_SIGNED).as_bool())return false;
-		for(auto bit:sigmap(cell->getPort(ID::A)))if(!bit.wire&&bit!=State::S0&&bit!=State::S1)return false;
-		auto divisor=sigmap(cell->getPort(ID::B));
+		for(auto bit:netlist.port(cell, ID::A))if(!bit.wire&&bit!=State::S0&&bit!=State::S1)return false;
+		const auto &divisor = netlist.port(cell, ID::B);
 		return GetSize(divisor)>=2&&divisor.is_fully_def()&&divisor.is_fully_const()&&divisor.as_const()==Const(3,GetSize(divisor));
 	}
 	bool shared_divisions() {
 		dict<SigSpec,std::vector<Cell *>> groups;
 		for(auto cell:module->cells())if(unsigned_div3(cell)&&GetSize(cell->getPort(ID::Y))<=32){
-			auto input = without_zero_extension(sigmap(cell->getPort(ID::A)));
+			auto input = without_zero_extension(netlist.port(cell, ID::A));
 			if(GetSize(input)>=2&&GetSize(input)<=16)groups[input].push_back(cell);
 		}
 		int attempts=0;
@@ -621,7 +351,7 @@ struct PmuxArithWorker {
 				have_mod |= cell->type == ID($mod);
 			}
 			if (!have_div || !have_mod) continue;
-			ArithNetwork net;
+			PmuxLutGraph net(PmuxLutGraph::Expansion::All);
 			auto qr = divmod3(net, group.first, GetSize(group.first));
 			std::vector<int> outputs;
 			for (auto cell : group.second) {
@@ -648,7 +378,7 @@ struct PmuxArithWorker {
 			roots.push_back(cell);
 			if (!cell || !cell->type.in(ID($div), ID($mod))) continue;
 			if(!unsigned_div3(cell))return false;
-			auto x = extended(cell, ID::A, width);
+			auto x = netlist.extended(cell, ID::A, width);
 			if (input.empty())
 				input = x;
 			else if (input != x)
@@ -664,7 +394,7 @@ struct PmuxArithWorker {
 			have_mod |= !item.second;
 		}
 		if (!have_div || !have_mod) return false;
-		ArithNetwork net;
+		PmuxLutGraph net(PmuxLutGraph::Expansion::All);
 		auto qr = divmod3(net, input, width);
 		auto cb = net.bits(control);
 		std::vector<std::vector<int>> values;
@@ -684,7 +414,7 @@ struct PmuxArithWorker {
 				column.push_back(value[i]);
 			output.push_back(net.select(column, cb));
 		}
-		return commit(pmux,region,net,output);
+		return commit_outputs({pmux}, region, net, output);
 	}
 	bool expression(SigSpec value, int width, Polynomial &terms, pool<Cell *> &region, bool negative = false, int depth = 0)
 	{
@@ -694,14 +424,14 @@ struct PmuxArithWorker {
 			int yw = GetSize(cell->getPort(ID::Y));
 			bool safe = yw >= width;
 			if (!safe && !cell->getParam(ID::A_SIGNED).as_bool() && !cell->getParam(ID::B_SIGNED).as_bool() && cell->type == ID($add)) {
-				auto a = without_zero_extension(sigmap(cell->getPort(ID::A)));
-				auto b = without_zero_extension(sigmap(cell->getPort(ID::B)));
+				auto a = without_zero_extension(netlist.port(cell, ID::A));
+				auto b = without_zero_extension(netlist.port(cell, ID::B));
 				safe = std::max(GetSize(a), GetSize(b))+1 <= yw;
 			}
 			if (safe) {
 				region.insert(cell);
-				return expression(extended(cell, ID::A, width), width, terms, region, negative, depth+1) &&
-					expression(extended(cell, ID::B, width), width, terms, region, negative ^ (cell->type == ID($sub)), depth+1);
+				return expression(netlist.extended(cell, ID::A, width), width, terms, region, negative, depth+1) &&
+					expression(netlist.extended(cell, ID::B, width), width, terms, region, negative ^ (cell->type == ID($sub)), depth+1);
 			}
 		}
 		int shift = 0;
@@ -810,7 +540,7 @@ struct PmuxArithWorker {
 					expected = const_add(expected, const_shl(Const(1, width), Const(shifts[j], 32), false, false, width), false, false, width);
 			if (expected != coefficients[code]) return false;
 		}
-		ArithNetwork net;
+		PmuxLutGraph net(PmuxLutGraph::Expansion::All);
 		auto cb = net.bits(control);
 		base.extend_u0(width);
 		auto x = net.bits(base);
@@ -823,7 +553,7 @@ struct PmuxArithWorker {
 				term[i] = net.gate({x[i-shifts[j]], cb[j]}, 8);
 			sum = net.add(sum, term);
 		}
-		return commit(pmux, region, net, sum);
+		return commit_outputs({pmux}, region, net, sum);
 	}
 	bool signed_bases(Cell *pmux, const std::vector<Polynomial> &polynomials, std::vector<SigSpec> bases,
 			const SigSpec &control, const pool<Cell *> &region, int width)
@@ -849,7 +579,7 @@ struct PmuxArithWorker {
 		}
 		log_debug("PMUX arithmetic two-base emitter %s: bases=%s, %s.\n",
 			log_id(pmux), log_signal(bases[0]), log_signal(bases[1]));
-		ArithNetwork net;
+		PmuxLutGraph net(PmuxLutGraph::Expansion::All);
 		auto cb = net.bits(control);
 		std::vector<int> operands[2];
 		for (int j = 0; j < 2; j++) {
@@ -869,7 +599,7 @@ struct PmuxArithWorker {
 		std::vector<int> carries;
 		for (auto &sign : signs)
 			carries.push_back((sign[0] < 0) + (sign[1] < 0));
-		return commit(pmux, region, net, net.add(operands[0], operands[1], net.select(carries, cb)));
+		return commit_outputs({pmux}, region, net, net.add(operands[0], operands[1], net.select(carries, cb)));
 	}
 	bool three_term_sums(Cell *pmux, const std::vector<Polynomial> &polynomials, std::vector<SigSpec> bases,
 			const SigSpec &control, const pool<Cell *> &region, int width)
@@ -893,7 +623,7 @@ struct PmuxArithWorker {
 		}
 		if (terms.size() > 4) return false;
 		for (auto &base : bases) base.extend_u0(width);
-		ArithNetwork best;
+		PmuxLutGraph best(PmuxLutGraph::Expansion::All);
 		std::vector<int> bestout;
 		int bestcost = INT_MAX;
 		auto ordered = terms;
@@ -908,7 +638,7 @@ struct PmuxArithWorker {
 				return;
 			}
 			budget -= 2*width;
-			ArithNetwork net;
+			PmuxLutGraph net(PmuxLutGraph::Expansion::All);
 			auto cb = net.bits(control);
 			std::vector<int> operands[3];
 			for (int column = 0; column < 3; column++) {
@@ -929,7 +659,7 @@ struct PmuxArithWorker {
 		};
 		// 三项整体换位不改变求和，固定第一个分支的排列。
 		enumerate(1);
-		return !bestout.empty() && commit(pmux, region, best, bestout);
+		return !bestout.empty() && commit_outputs({pmux}, region, best, bestout);
 	}
 	bool arithmetic(Cell *pmux, ChoiceInfo &info)
 	{
@@ -998,7 +728,7 @@ struct OptPmuxArithPass : Pass {
 				if (!cell) continue;
 				prepare();
 				bool changed = false;
-				if (worker->editable(cell)) {
+				if (worker->netlist.editable(cell)) {
 					PmuxArithWorker::ChoiceInfo choice;
 					changed = worker->minimum_maximum(cell) || worker->selected_divmod(cell, choice) || worker->arithmetic(cell, choice);
 				}

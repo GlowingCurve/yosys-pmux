@@ -20,37 +20,7 @@
 #include "kernel/register.h"
 #include "kernel/log.h"
 #include "kernel/rtlil.h"
-#include "passes/opt/pmux_celltypes.h"
 #include <initializer_list>
-
-YOSYS_NAMESPACE_BEGIN
-
-PmuxCellTypes::PmuxCellTypes(RTLIL::Module *module, RTLIL::Design *design)
-{
-	setup();
-	for (auto cell : module->cells())
-		if (!cell_known(cell->type))
-			if (auto definition = design->module(cell->type))
-				setup_module(definition);
-}
-
-// 端口查询集中编译，全部 PMUX Pass 共用同一份内部端口表。
-bool PmuxCellTypes::cell_input(const RTLIL::IdString &type, const RTLIL::IdString &port) const
-{
-	return NewCellTypes::cell_input(type, port);
-}
-
-bool PmuxCellTypes::cell_output(const RTLIL::IdString &type, const RTLIL::IdString &port) const
-{
-	return NewCellTypes::cell_output(type, port);
-}
-
-RTLIL::PortDir PmuxCellTypes::cell_port_dir(RTLIL::IdString type, RTLIL::IdString port) const
-{
-	return NewCellTypes::cell_port_dir(type, port);
-}
-
-YOSYS_NAMESPACE_END
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN

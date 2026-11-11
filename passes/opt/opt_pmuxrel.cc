@@ -1,277 +1,48 @@
 // opt_pmuxrel 共享互补字段、交换字段和关联布尔输出；合并重复的选择与四输入逻辑节点。
 // tables 模式用 32 位并行求值分解五位地址表，将输出使能并入共享 LUT 网络。
 #include "kernel/yosys.h"
-#include "kernel/sigtools.h"
 #include "kernel/utils.h"
-#include "passes/opt/pmux_celltypes.h"
+#include "passes/opt/pmux_decoder.h"
+#include "passes/opt/pmux_lut_graph.h"
+#include "passes/opt/pmux_netlist.h"
 #include <algorithm>
 #include <bitset>
 #include <cstdint>
-#include <functional>
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
 
-// 规划期间建立四输入网络，按节点成本选择生成的单元。
-struct RelationGraph {
-	struct Node {
-		SigBit bit;
-		std::vector<int> inputs;
-		unsigned mask;
-		bool leaf;
-	};
-	std::vector<Node> nodes;
-	dict<SigBit, int> leaves;
-	std::map<std::pair<std::vector<int>, unsigned>, int> cache;
-	bool overflow = false;
-	RelationGraph() {
-		leaf(State::S0);
-		leaf(State::S1);
-	}
-	int leaf(SigBit bit) {
-		auto found = leaves.find(bit);
-		if (found != leaves.end()) return found->second;
-		int id = GetSize(nodes);
-		nodes.push_back({bit, {}, 0, true});
-		leaves[bit] = id;
-		return id;
-	}
-	pool<int> live(const std::vector<int> &roots) const {
-		pool<int> seen;
-		std::function<void(int)> visit = [&](int id) {
-			if (seen.insert(id).second) for (int input : nodes[id].inputs) visit(input);
-		};
-		for (int id : roots) visit(id);
-		return seen;
-	}
-	int cost(const std::vector<int> &roots) const {
-		int result = 0;
-		for (int id : live(roots))
-			result += !nodes[id].leaf;
-		return result;
-	}
-	int lut(const std::vector<int> &args, unsigned mask) {
-		log_assert(GetSize(args) <= 4);
-		std::vector<int> inputs;
-		for (int id : args) {
-			log_assert(id >= 0 && id < GetSize(nodes));
-			if (id > 1 && std::find(inputs.begin(), inputs.end(), id) == inputs.end())
-				inputs.push_back(id);
-		}
-		std::sort(inputs.begin(), inputs.end());
-		unsigned table = 0;
-		for (int value = 0; value < (1 << GetSize(inputs)); value++) {
-			int old = 0;
-			for (int j = 0; j < GetSize(args); j++) {
-				int bit = args[j] == 1;
-				if (args[j] > 1) bit = (value >> (std::lower_bound(inputs.begin(), inputs.end(), args[j])-inputs.begin())) & 1;
-				old |= bit << j;
-			}
-			table |= ((mask >> old) & 1) << value;
-		}
-		for (int j = GetSize(inputs)-1; j >= 0; j--) {
-			bool depends = false;
-			for (int value = 0; value < (1 << GetSize(inputs)); value++)
-				if (((table >> value) & 1) != ((table >> (value ^ (1 << j))) & 1)) depends = true;
-			if (depends) continue;
-			unsigned smaller = 0;
-			for (int value = 0; value < (1 << (GetSize(inputs)-1)); value++) {
-				int old = (value & ((1 << j)-1)) | ((value >> j) << (j+1));
-				smaller |= ((table >> old) & 1) << value;
-			}
-			inputs.erase(inputs.begin()+j);
-			table = smaller;
-		}
-		if (inputs.empty()) return table & 1;
-		if (GetSize(inputs) == 1 && table == 2) return inputs[0];
-		auto key = std::make_pair(inputs, table);
-		auto found = cache.find(key);
-		if (found != cache.end()) return found->second;
-		if (nodes.size() >= 24000) {
-			overflow = true;
-			return 0;
-		}
-		int id = GetSize(nodes);
-		nodes.push_back({{}, inputs, table, false});
-		cache[key] = id;
-		return id;
-	}
-	int gate(const std::vector<int> &args, unsigned mask) {
-		int best = lut(args, mask), bestcost = cost({best});
-		// 枚举相邻节点的部分展开，允许只合并其中一个子节点。
-		for (int expand = 1; expand < (1 << GetSize(args)); expand++) {
-			std::vector<int> inputs;
-			bool valid = true;
-			for (int j = 0; j < GetSize(args); j++) {
-				if ((expand & (1 << j)) && nodes[args[j]].leaf) {
-					valid = false;
-					break;
-				}
-				auto source = (expand & (1 << j)) ? nodes[args[j]].inputs : std::vector<int>{args[j]};
-				for (int id : source) if (id > 1 && std::find(inputs.begin(), inputs.end(), id) == inputs.end()) inputs.push_back(id);
-			}
-			if (!valid || GetSize(inputs) > 4) continue;
-			unsigned table = 0;
-			for (int value = 0; value < (1 << GetSize(inputs)); value++) {
-				auto input_value = [&](int id) { return id < 2 ? id : (value >> (std::find(inputs.begin(), inputs.end(), id)-inputs.begin())) & 1; };
-				int index = 0;
-				for (int j = 0; j < GetSize(args); j++) {
-					int v;
-					if (expand & (1 << j)) {
-						int sub = 0;
-						for (int k = 0; k < GetSize(nodes[args[j]].inputs); k++)
-							sub |= input_value(nodes[args[j]].inputs[k]) << k;
-						v = (nodes[args[j]].mask >> sub) & 1;
-					} else v = input_value(args[j]);
-					index |= v << j;
-				}
-				table |= ((mask >> index) & 1) << value;
-			}
-			int candidate = lut(inputs, table), c = cost({candidate});
-			if (c < bestcost) {
-				best = candidate;
-				bestcost = c;
-			}
-		}
-		return best;
-	}
-	int mux(int a, int b, int s) { return gate({a,b,s}, 0xca); }
-	int select(const std::vector<int> &data, const std::vector<int> &control, int level = 0, int prefix = 0) {
-		if (level == GetSize(control)) return data[prefix];
-		return mux(select(data, control, level+1, prefix), select(data, control, level+1, prefix | (1 << level)), control[level]);
-	}
-	int reduce(std::vector<int> data) {
-		if (data.empty()) return 0;
-		while (GetSize(data) > 1) {
-			std::vector<int> next;
-			for (int j = 0; j < GetSize(data); j += 4) {
-				std::vector<int> args(data.begin()+j, data.begin()+std::min(j+4,GetSize(data)));
-				next.push_back(gate(args, 0xfffe));
-			}
-			data = std::move(next);
-		}
-		return data[0];
-	}
-	SigSpec emit(Module *module, IdString celltype, const std::vector<int> &roots) const {
-		auto used = live(roots);
-		int emitted = 0;
-		std::vector<SigBit> signals(nodes.size());
-		for (int id = 0; id < GetSize(nodes); id++) if (used.count(id)) {
-			auto &node = nodes[id];
-			if (node.leaf) {
-				signals[id] = node.bit;
-				continue;
-			}
-			auto wire = module->addWire(NEW_ID);
-			signals[id] = SigBit(wire);
-			auto cell = module->addCell(NEW_ID, celltype.empty() ? ID($lut) : celltype);
-			emitted++;
-			SigSpec input;
-			for (int arg : node.inputs)
-				input.append(signals[arg]);
-			unsigned mask = 0;
-			for (int code = 0; code < 16; code++)
-				mask |= ((node.mask >> (code & ((1 << GetSize(input))-1))) & 1) << code;
-			input.extend_u0(4);
-			if (celltype.empty()) {
-				cell->setParam(ID::WIDTH, 4);
-				cell->setParam(ID::LUT, Const(mask,16));
-				cell->setPort(ID::A, input);
-				cell->setPort(ID::Y, wire);
-			} else {
-				cell->setParam(ID(lut_mask), Const(mask,16));
-				cell->setParam(ID(sum_lutc_input), Const("datac"));
-				cell->setPort(ID(dataa), input[0]);
-				cell->setPort(ID(datab), input[1]);
-				cell->setPort(ID(datac), input[2]);
-				cell->setPort(ID(datad), input[3]);
-				cell->setPort(ID(cin), State::S0);
-				cell->setPort(ID(combout), wire);
-			}
-		}
-		log_assert(emitted == cost(roots));
-		SigSpec result;
-		for (int id : roots)
-			result.append(signals[id]);
-		return result;
-	}
-};
-
 struct RelationWorker {
 	Module *module;
-	Design *design;
-	SigMap sigmap;
-	PmuxCellTypes types;
+	PmuxNetlist netlist;
+	PmuxDecoder decoder;
 	IdString luttype;
-	struct Driver { Cell *cell = nullptr; int count = 0; };
-	dict<SigBit, Driver> drivers;
-	dict<SigBit, std::vector<Cell *>> users;
-	pool<SigBit> observed, kept, unknown, input_bits;
 	int budget = 60000;
-	RelationWorker(Module *m, Design *d, IdString t) : module(m), design(d), sigmap(m), types(m,d), luttype(t) {
-		for (auto wire : m->wires()) {
-			bool keep = wire->get_bool_attribute(ID::keep);
-			if (!wire->port_input && !wire->port_output && !keep) continue;
-			for (auto bit : sigmap(wire)) {
-				if (wire->port_input) {
-					drivers[bit].count++;
-					input_bits.insert(bit);
-				}
-				if (wire->port_output || keep) observed.insert(bit);
-				if (keep) kept.insert(bit);
-			}
+	RelationWorker(Module *m, Design *d, IdString t) : module(m), netlist(m, d), decoder(netlist), luttype(t) {}
+
+	using Cube = PmuxDecoder::Cube;
+	using Table = PmuxDecoder::Table;
+
+	bool table(Cell *cell, Table &result) {
+		if (cell->type != ID($pmux) || !netlist.editable(cell)) return false;
+		const auto &a = netlist.port(cell, ID::A), &b = netlist.port(cell, ID::B), &s = netlist.port(cell, ID::S);
+		int width = GetSize(a), branches = GetSize(s);
+		if (width < 1 || width > 128 || branches < 3 || branches > 16 || GetSize(b) != width*branches) return false;
+		std::vector<Cube> cubes(branches);
+		for (int j = 0; j < branches; j++) {
+			auto &cube = cubes[j];
+			if (--budget < 0 || !decoder.decode(s[j], cube) || !cube.cell || !netlist.editable(cube.cell) ||
+			    GetSize(netlist.port(cube.cell, ID::Y)) != 1) return false;
 		}
-		for (auto cell : m->cells()) {
-			bool keep = cell->get_bool_attribute(ID::keep);
-			for (auto &port : cell->connections()) {
-				auto direction = types.cell_port_dir(cell->type, port.first);
-				bool out = direction == RTLIL::PD_OUTPUT || direction == RTLIL::PD_INOUT;
-				bool in = direction == RTLIL::PD_INPUT || direction == RTLIL::PD_INOUT;
-				for (auto bit : sigmap(port.second)) {
-					if (out) {
-						auto &driver = drivers[bit];
-						driver.count++;
-						driver.cell = cell;
-					}
-					if (in || !out) {
-						auto &list = users[bit];
-						if (list.empty() || list.back() != cell) list.push_back(cell);
-					}
-					if (!in && !out) unknown.insert(bit);
-					if (keep) kept.insert(bit);
-				}
-			}
-		}
-	}
-	bool unique(SigBit bit) const { return bit.wire && !unknown.count(bit) && drivers.count(bit) && drivers.at(bit).count == 1; }
-	bool editable(Cell *cell) const {
-		if (!design->selected(module,cell) || cell->get_bool_attribute(ID::keep) || !cell->hasPort(ID::Y)) return false;
-		pool<SigBit> seen;
-		for (auto &port : cell->connections()) if (types.cell_output(cell->type,port.first))
-			for (auto bit : sigmap(port.second))
-				if (!unique(bit) || drivers.at(bit).cell != cell || kept.count(bit) || !seen.insert(bit).second) return false;
+		if (!decoder.table(cell, cubes, result) || !result.prefix.empty() || GetSize(result.control) < 2) return false;
+		for (const auto &branch : result.data)
+			for (auto bit : branch)
+				if (!bit.wire && bit.data > State::S1) return false;
 		return true;
 	}
-	bool combinational(Cell *cell) const {
-		return cell && !StaticCellTypes::categories.is_ff(cell->type) && types.cell_evaluable(cell->type) && cell->hasPort(ID::Y);
-	}
-	bool upstream(SigBit bit, const pool<SigBit> &targets, dict<SigBit,int> &state, int depth = 0) {
-		if (--budget < 0 || depth > 96 || targets.count(bit) || unknown.count(bit)) return false;
-		if (!bit.wire) return bit == State::S0 || bit == State::S1;
-		if (!unique(bit)) return false;
-		if (state.count(bit)) return state.at(bit) == 2;
-		auto cell = drivers.at(bit).cell;
-		if (!cell) return input_bits.count(bit);
-		if (StaticCellTypes::categories.is_ff(cell->type)) return true;
-		if (!combinational(cell)) return false;
-		state[bit] = 1;
-		for (auto &port : cell->connections()) if (types.cell_input(cell->type,port.first))
-			for (auto in : sigmap(port.second)) if (!upstream(in,targets,state,depth+1)) return false;
-		state[bit] = 2;
-		return true;
-	}
+
 	struct Plan {
-		RelationGraph graph;
+		PmuxLutGraph graph{PmuxLutGraph::Expansion::Subsets, 24000};
 		SigSpec targets;
 		std::vector<int> roots;
 		pool<Cell *> region, remove;
@@ -293,31 +64,13 @@ struct RelationWorker {
 	}
 	bool prepare_rewrite(Plan &plan)
 	{
-		if (plan.targets.empty() || plan.graph.overflow) return false;
+		if (plan.targets.empty() || plan.graph.overflowed()) return false;
 		log_assert(GetSize(plan.targets) == GetSize(plan.roots));
-		pool<SigBit> target(plan.targets.begin(),plan.targets.end()), leaves;
+		pool<SigBit> target(plan.targets.begin(),plan.targets.end());
 		if (GetSize(target) != GetSize(plan.targets)) return false;
-		for (int id : plan.graph.live(plan.roots)) if (plan.graph.nodes[id].leaf && plan.graph.nodes[id].bit.wire) leaves.insert(plan.graph.nodes[id].bit);
-		dict<SigBit,int> state;
-		for (auto bit : leaves) if (!upstream(bit,target,state)) return false;
-		plan.remove = plan.region;
-		bool changed;
-		do {
-			changed = false;
-			for (auto cell : std::vector<Cell *>(plan.remove.begin(),plan.remove.end())) {
-				bool preserve = !editable(cell);
-				for (auto &port : cell->connections()) if (types.cell_output(cell->type,port.first)) for (auto bit : sigmap(port.second)) {
-					if (leaves.count(bit) || kept.count(bit) || unknown.count(bit)) preserve = true;
-					if (target.count(bit)) continue;
-					if (observed.count(bit)) preserve = true;
-					for (auto user : reversed(users[bit])) if (!plan.remove.count(user)) preserve = true;
-				}
-				if (preserve) {
-					plan.remove.erase(cell);
-					changed = true;
-				}
-			}
-		} while (changed);
+		auto leaves = plan.graph.referenced(plan.roots);
+		if (!netlist.independent(leaves, target, budget)) return false;
+		plan.remove = netlist.private_cells(plan.region, {}, target, leaves);
 		return true;
 	}
 	bool profitable_relations(const Plan &plan)
@@ -326,141 +79,52 @@ struct RelationWorker {
 		int retained = 0;
 		for (auto cell : plan.region) if (!plan.remove.count(cell)) {
 			bool root = false;
-			for (auto bit : sigmap(cell->getPort(ID::Y)))
+			for (auto bit : netlist.port(cell, ID::Y))
 				if (target.count(bit)) root = true;
 			if (!root) retained += cell_cost(cell);
 		}
 		return plan.graph.cost(plan.roots) + retained < plan.reference;
 	}
-	void commit(Plan &plan) {
-		if (plan.columns) {
-			int cost = plan.graph.cost(plan.roots);
-			log_assert(cost + plan.retained_reference < plan.reference);
-			log_debug("opt_pmuxrel columns outputs=%d shared=%d ordinary=%d original=%d retained=%d candidate=%d removed=%d\n",
-			          GetSize(plan.targets), plan.shared_columns, GetSize(plan.targets)-plan.shared_columns, plan.reference,
-			          plan.retained_reference, cost, GetSize(plan.remove));
+	void commit(const std::vector<Plan> &plans) {
+		// 在修改连接关系和删除单元之前，使用网表索引断开所有被替换的输出位。
+		for (const auto &plan : plans) {
+			pool<SigBit> targets(plan.targets.begin(), plan.targets.end());
+			for (auto cell : plan.region)
+				if (!plan.remove.count(cell))
+					netlist.disconnect_outputs(cell, targets);
 		}
-		pool<SigBit> targets(plan.targets.begin(),plan.targets.end());
-		// 改写宽单元的部分输出时，独立断开这些位的旧驱动。
-		for (auto cell : plan.region) if (!plan.remove.count(cell)) {
-			std::vector<std::pair<IdString,SigSpec>> updates;
-			for (auto &port : cell->connections()) if (types.cell_output(cell->type,port.first)) {
-				auto value = port.second, canonical = sigmap(value);
-				bool changed = false;
-				for (int j = 0; j < GetSize(value); j++) if (targets.count(canonical[j])) {
-					value[j] = SigBit(module->addWire(NEW_ID));
-					changed = true;
-				}
-				if (changed) updates.emplace_back(port.first,value);
+		for (const auto &plan : plans) {
+			if (plan.columns) {
+				int cost = plan.graph.cost(plan.roots);
+				log_assert(cost + plan.retained_reference < plan.reference);
+				log_debug("opt_pmuxrel columns outputs=%d shared=%d ordinary=%d original=%d retained=%d candidate=%d removed=%d\n",
+				          GetSize(plan.targets), plan.shared_columns, GetSize(plan.targets)-plan.shared_columns, plan.reference,
+				          plan.retained_reference, cost, GetSize(plan.remove));
 			}
-			for (auto &port : updates) cell->setPort(port.first,port.second);
+			log_assert(GetSize(plan.targets) == GetSize(plan.roots));
+			module->connect(plan.targets, plan.graph.emit(module, luttype, plan.roots));
+			for (auto cell : plan.remove) module->remove(cell);
 		}
-		log_assert(GetSize(plan.targets) == GetSize(plan.roots));
-		auto result = plan.graph.emit(module, luttype, plan.roots);
-		module->connect(plan.targets, result);
-		for (auto cell : plan.remove) module->remove(cell);
-		xor_sources.clear();
-		exchange_sources.clear();
-		unary_sources.clear();
 	}
-	struct Cube { dict<SigBit,bool> bits; };
-	bool decode(SigBit bit, Cube &cube, pool<Cell *> &region) {
-		if (!unique(bit) || --budget < 0) return false;
-		auto cell = drivers.at(bit).cell;
-		if (!cell || !editable(cell) || !cell->type.in(ID($eq),ID($logic_not)) || GetSize(cell->getPort(ID::Y)) != 1) return false;
-		auto a = sigmap(cell->getPort(ID::A));
-		SigSpec b(State::S0, GetSize(a));
-		if (cell->type == ID($eq)) {
-			b = sigmap(cell->getPort(ID::B));
-			bool sign = cell->getParam(ID::A_SIGNED).as_bool() && cell->getParam(ID::B_SIGNED).as_bool();
-			int width = std::max(GetSize(a), GetSize(b));
-			a.extend_u0(width, sign);
-			b.extend_u0(width, sign);
-		}
-		if (GetSize(a) > 16) return false;
-		for (int j = 0; j < GetSize(a); j++) {
-			auto x = a[j], y = b[j];
-			if ((!x.wire && x != State::S0 && x != State::S1) || (!y.wire && y != State::S0 && y != State::S1)) return false;
-			if (x == y) continue;
-			if (!x.wire) std::swap(x,y);
-			if (!x.wire || y.wire || (cube.bits.count(x) && cube.bits.at(x) != (y == State::S1))) return false;
-			cube.bits[x] = y == State::S1;
-		}
-		if (cube.bits.empty() || GetSize(cube.bits) > 4) return false;
-		region.insert(cell);
-		return true;
-	}
-	struct Table {
-		Cell *cell;
-		SigSpec control;
-		std::vector<SigSpec> data;
-		pool<Cell *> region;
-		std::vector<Cube> cubes;
-	};
-	bool table(Cell *cell, Table &result) {
-		if (!editable(cell) || cell->type != ID($pmux)) return false;
-		auto a = sigmap(cell->getPort(ID::A)), b = sigmap(cell->getPort(ID::B)), s = sigmap(cell->getPort(ID::S));
-		if (a.empty() || GetSize(a) > 128 || GetSize(s) < 3 || GetSize(s) > 16 || GetSize(b) != GetSize(a)*GetSize(s)) return false;
-		std::vector<Cube> cubes(GetSize(s));
-		for (int j = 0; j < GetSize(s); j++) if (!decode(s[j],cubes[j],result.region)) return false;
-		std::vector<SigBit> controls;
-		for (auto &entry : cubes[0].bits)
-			controls.push_back(entry.first);
-		std::sort(controls.begin(), controls.end());
-		int n = GetSize(controls);
-		if (n < 2 || n > 4 || GetSize(s) < (1 << n)-1) return false;
-		result.control = SigSpec(controls);
-		result.cell = cell;
-		result.data.assign(1 << n, a);
-		pool<int> seen;
-		for (int j = 0; j < GetSize(s); j++) {
-			if (GetSize(cubes[j].bits) != n) return false;
-			int code = 0;
-			for (int k = 0; k < n; k++) {
-				auto bit = cubes[j].bits.find(controls[k]);
-				if (bit == cubes[j].bits.end()) return false;
-				if (bit->second) code |= 1 << k;
-			}
-			if (!seen.insert(code).second) return false;
-			result.data[code] = b.extract(j*GetSize(a),GetSize(a));
-		}
-		for (auto &branch : result.data) for (auto bit : branch) if (!bit.wire && bit != State::S0 && bit != State::S1) return false;
-		result.cubes = std::move(cubes);
-		result.region.insert(cell);
-		return true;
-	}
-	struct XorSource {
-		SigSpec a, b;
-		dict<SigBit,int> offsets;
-		bool valid = false;
-	};
-	dict<Cell *,XorSource> xor_sources;
-	dict<Cell *,pool<SigBit>> exchange_sources;
+	dict<Cell *, bool> xor_sources;
+	pool<Cell *> exchange_sources;
 	bool xor_pair(SigBit bit, std::vector<SigBit> &leaves, pool<Cell *> &region) {
-		if (!unique(bit)) return false;
-		auto cell = drivers.at(bit).cell;
-		if (!cell || cell->type != ID($xor)) return false;
+		auto source = netlist.source(bit);
+		if (!source || !source->cell || source->cell->type != ID($xor)) return false;
+		auto cell = source->cell;
 		auto found = xor_sources.find(cell);
 		if (found == xor_sources.end()) {
-			auto &source = xor_sources[cell];
+			auto &valid = xor_sources[cell];
 			int width = GetSize(cell->getPort(ID::Y));
-			if ((budget -= width) < 0 || !editable(cell)) return false;
+			if ((budget -= width) < 0 || !netlist.editable(cell)) return false;
 			int a_width = GetSize(cell->getPort(ID::A)), b_width = GetSize(cell->getPort(ID::B));
 			if ((budget -= std::max(width,a_width) + std::max(width,b_width) + 2*width) < 0) return false;
-			auto y = sigmap(cell->getPort(ID::Y));
-			source.a = sigmap(cell->getPort(ID::A));
-			source.b = sigmap(cell->getPort(ID::B));
-			bool sign = cell->getParam(ID::A_SIGNED).as_bool() && cell->getParam(ID::B_SIGNED).as_bool();
-			source.a.extend_u0(width,sign);
-			source.b.extend_u0(width,sign);
-			for (int j = 0; j < GetSize(y); j++) source.offsets[y[j]] = j;
-			source.valid = true;
+			valid = true;
 		}
-		auto &source = xor_sources.at(cell);
-		if (!source.valid || !source.offsets.count(bit)) return false;
-		int offset = source.offsets.at(bit);
-		if (!source.a[offset].wire || !source.b[offset].wire || source.a[offset] == source.b[offset]) return false;
-		leaves = {source.a[offset],source.b[offset]};
+		if (!xor_sources.at(cell) || source->port != ID::Y) return false;
+		auto a = netlist.operand(cell, ID::A, source->offset), b = netlist.operand(cell, ID::B, source->offset);
+		if (!a.wire || !b.wire || a == b) return false;
+		leaves = {a, b};
 		std::sort(leaves.begin(), leaves.end());
 		region.insert(cell);
 		return true;
@@ -524,18 +188,14 @@ struct RelationWorker {
 		return true;
 	}
 	bool exchange_input(SigBit bit) {
-		if (!unique(bit)) return false;
-		auto cell = drivers.at(bit).cell;
-		if (!cell) return input_bits.count(bit);
-		if (!StaticCellTypes::categories.is_ff(cell->type) || !cell->hasPort(ID::Q)) return false;
-		if (!exchange_sources.count(cell)) {
-			int width = GetSize(cell->getPort(ID::Q));
-			if ((budget -= 2*width) < 0) return false;
-			pool<SigBit> members;
-			for (auto member : sigmap(cell->getPort(ID::Q))) members.insert(member);
-			exchange_sources[cell] = std::move(members);
-		}
-		return exchange_sources.at(cell).count(bit);
+		auto source = netlist.source(bit);
+		if (!source) return false;
+		auto cell = source->cell;
+		if (!cell) return true;
+		if (source->port != ID::Q || !StaticCellTypes::categories.is_ff(cell->type)) return false;
+		if (exchange_sources.insert(cell).second)
+			budget -= 2*GetSize(cell->getPort(ID::Q));
+		return budget >= 0;
 	}
 	bool exchange(const Field &p, const Field &q, const SigSpec &control, Plan &plan) {
 		int n = GetSize(control), count = 1 << n;
@@ -661,7 +321,7 @@ struct RelationWorker {
 	bool coarse(const std::vector<Table> &tables, Plan &plan) {
 		std::vector<Field> fields;
 		for (auto &table : tables) {
-			auto y = sigmap(table.cell->getPort(ID::Y));
+			const auto &y = netlist.port(table.cell, ID::Y);
 			log_assert(GetSize(table.data) == (1 << GetSize(table.control)));
 			for (auto &data : table.data) log_assert(GetSize(data) == GetSize(y));
 			for (int j = 0; j < GetSize(y); j++) {
@@ -720,7 +380,7 @@ struct RelationWorker {
 		bool mux = cell->type.in(ID($mux), ID($_MUX_));
 		if (mux) {
 			if (GetSize(cell->connections()) != 4 || !cell->hasPort(ID::B) || !cell->hasPort(ID::S)) return false;
-			auto b = sigmap(cell->getPort(ID::B)), s = sigmap(cell->getPort(ID::S));
+			const auto &b = netlist.port(cell, ID::B), &s = netlist.port(cell, ID::S);
 			if (GetSize(a) != GetSize(y) || GetSize(b) != GetSize(y) || GetSize(s) != 1) return false;
 			if (cell->type == ID($mux) ? !parameter(ID::WIDTH, GetSize(y)) : GetSize(y) != 1) return false;
 			inputs = {a[offset], b[offset], s[0]};
@@ -744,19 +404,13 @@ struct RelationWorker {
 		    GetSize(cell->getParam(ID::A_SIGNED)) > 32) return false;
 		int signed_value = cell->getParam(ID::A_SIGNED).as_int();
 		if (signed_value != 0 && signed_value != 1) return false;
-		bool sign = signed_value == 1;
-		inputs = {offset < GetSize(a) ? a[offset] : sign ? a[GetSize(a)-1] : SigBit(State::S0)};
+		inputs = {netlist.operand(cell, ID::A, offset)};
 		inverted = cell->type == ID($not);
 		return true;
 	}
-	bool table_inputs(Cell *cell, SigBit bit, std::vector<SigBit> &inputs, bool &inverted) {
+	bool table_inputs(Cell *cell, int offset, std::vector<SigBit> &inputs, bool &inverted) {
 		if (!cell->hasPort(ID::A) || !cell->hasPort(ID::Y)) return false;
-		auto a = sigmap(cell->getPort(ID::A)), y = sigmap(cell->getPort(ID::Y));
-		if (a.empty() || y.empty() || GetSize(a) > 128 || GetSize(y) > 128) return false;
-		int offset = -1;
-		for (int j = 0; j < GetSize(y); j++) if (y[j] == bit) offset = j;
-		if (offset < 0) return false;
-		return table_inputs(cell,offset,a,y,inputs,inverted);
+		return table_inputs(cell, offset, netlist.port(cell, ID::A), netlist.port(cell, ID::Y), inputs, inverted);
 	}
 	struct UnarySource {
 		dict<SigBit,std::pair<SigBit,bool>> inputs;
@@ -772,7 +426,7 @@ struct RelationWorker {
 			int a_width = GetSize(cell->getPort(ID::A)), y_width = GetSize(cell->getPort(ID::Y));
 			if (a_width < 1 || a_width > 128 || y_width < 1 || y_width > 128) return false;
 			if ((budget -= a_width + 2*y_width) < 0) return false;
-			auto a = sigmap(cell->getPort(ID::A)), y = sigmap(cell->getPort(ID::Y));
+			const auto &a = netlist.port(cell, ID::A), &y = netlist.port(cell, ID::Y);
 			for (int j = 0; j < GetSize(y); j++) {
 				std::vector<SigBit> inputs;
 				bool step_inverted = false;
@@ -803,8 +457,7 @@ struct RelationWorker {
 		bool inverted = false;
 		for (int depth = 0; depth < 4; depth++) {
 			if (--budget < 0) return false;
-			if (!bit.wire || !unique(bit)) break;
-			auto cell = drivers.at(bit).cell;
+			auto cell = netlist.driver(bit);
 			if (!cell) break;
 			SigBit input;
 			bool step_inverted = false;
@@ -833,13 +486,13 @@ struct RelationWorker {
 		pool<Cell *> selectors;
 		for (auto &table : tables) {
 			selectors.insert(table.cell);
-			auto s = sigmap(table.cell->getPort(ID::S));
+			const auto &s = netlist.port(table.cell, ID::S);
 			log_assert(GetSize(s) == GetSize(table.cubes));
 			for (int j = 0; j < GetSize(s); j++) network.decoded[s[j]] = table.cubes[j];
 		}
 		for (auto cell : plan.region) {
 			if (selectors.count(cell)) continue;
-			auto y = sigmap(cell->getPort(ID::Y));
+			const auto &y = netlist.port(cell, ID::Y);
 			if (cell->type.in(ID($eq),ID($logic_not))) {
 				log_assert(GetSize(y) == 1 && network.decoded.count(y[0]));
 				continue;
@@ -848,22 +501,21 @@ struct RelationWorker {
 				if (--budget < 0) return false;
 				SigBit input;
 				bool inverted = false;
-				if (!unique(bit) || !unary_input(cell,bit,input,inverted)) return false;
+				if (!netlist.unique(bit) || !unary_input(cell,bit,input,inverted)) return false;
 				network.unary[bit] = {input,inverted};
 			}
 		}
 		return true;
 	}
-	bool column_bit(SigBit bit, const ColumnNetwork &network, RelationGraph &graph,
+	bool column_bit(SigBit bit, const ColumnNetwork &network, PmuxLutGraph &graph,
 	                dict<SigBit,int> &roots, dict<SigBit,int> &state, int &root, int depth = 0) {
-		if (--budget < 0 || depth > 96 || unknown.count(bit)) return false;
-		if (graph.nodes.size() >= 24000) return false;
+		if (--budget < 0 || depth > 96 || netlist.uncertain(bit)) return false;
 		if (!bit.wire) {
 			if (bit != State::S0 && bit != State::S1) return false;
 			root = graph.leaf(bit);
 			return true;
 		}
-		if (!unique(bit)) return false;
+		if (!netlist.unique(bit)) return false;
 		if (state.count(bit)) {
 			if (state.at(bit) != 2) return false;
 			root = roots.at(bit);
@@ -890,10 +542,10 @@ struct RelationWorker {
 		}
 		roots[bit] = root;
 		state[bit] = 2;
-		return !graph.overflow;
+		return !graph.overflowed();
 	}
 	struct ColumnReference {
-		RelationGraph graph;
+		PmuxLutGraph graph{PmuxLutGraph::Expansion::Subsets, 24000};
 		std::vector<int> roots;
 	};
 	bool column_reference(const std::vector<Table> &tables, const ColumnNetwork &network,
@@ -916,7 +568,7 @@ struct RelationWorker {
 					data.push_back(root);
 				}
 				reference.roots.push_back(graph.select(data,control));
-				if (graph.overflow) return false;
+				if (graph.overflowed()) return false;
 			}
 		}
 		for (auto bit : retained) {
@@ -924,7 +576,7 @@ struct RelationWorker {
 			if (!column_bit(bit,network,graph,roots,state,root)) return false;
 			reference.roots.push_back(root);
 		}
-		return !graph.overflow;
+		return !graph.overflowed();
 	}
 	bool simple_columns(const std::vector<Table> &tables, const std::vector<Field> &fields, Plan &plan) {
 		dict<SigBit,ColumnLiteral> literals;
@@ -967,7 +619,7 @@ struct RelationWorker {
 				log_assert(output[j] == -1);
 				output[j] = inverted[j] ? plan.graph.gate({root},0x1) : root;
 			}
-			if (plan.graph.overflow) return false;
+			if (plan.graph.overflowed()) return false;
 		}
 		for (int j = 0; j < GetSize(fields); j++) {
 			log_assert(output[j] >= 0);
@@ -977,15 +629,14 @@ struct RelationWorker {
 		log_assert(GetSize(plan.targets) == GetSize(fields));
 		if (!prepare_rewrite(plan)) return false;
 		for (auto &table : tables) log_assert(plan.remove.count(table.cell));
-		pool<SigBit> leaves, retained;
-		for (int id : plan.graph.live(plan.roots))
-			if (plan.graph.nodes[id].leaf && plan.graph.nodes[id].bit.wire) leaves.insert(plan.graph.nodes[id].bit);
+		auto leaves = plan.graph.referenced(plan.roots);
+		pool<SigBit> retained;
 		for (auto cell : plan.region) if (!plan.remove.count(cell)) {
-			bool fixed = cell->get_bool_attribute(ID::keep) || !design->selected(module,cell);
-			for (auto &port : cell->connections()) if (types.cell_output(cell->type,port.first))
-				for (auto bit : sigmap(port.second)) {
-					bool needed = fixed || leaves.count(bit) || observed.count(bit) || kept.count(bit) || unknown.count(bit);
-					for (auto user : reversed(users[bit])) if (!plan.remove.count(user)) needed = true;
+			bool fixed = cell->get_bool_attribute(ID::keep) || !netlist.selected(cell);
+			for (auto &port : cell->connections()) if (netlist.cell_output(cell->type,port.first))
+				for (auto bit : netlist.port(cell, port.first)) {
+					bool needed = fixed || leaves.count(bit) || netlist.protected_bit(bit) || netlist.uncertain(bit);
+					for (const auto &user : netlist.users(bit)) if (!plan.remove.count(user.cell)) needed = true;
 					if (needed) retained.insert(bit);
 				}
 		}
@@ -1007,20 +658,20 @@ struct RelationWorker {
 		return cost + plan.retained_reference < plan.reference;
 	}
 	bool cone(SigBit bit, pool<SigBit> &leaves, pool<Cell *> &region, dict<SigBit,int> &state, TableBits &bits, int depth = 0) {
-		if (--budget < 0 || depth > 32 || GetSize(region) > 128 || unknown.count(bit) || kept.count(bit)) return false;
+		if (--budget < 0 || depth > 32 || GetSize(region) > 128 || netlist.uncertain(bit) || netlist.kept(bit)) return false;
 		if (!bit.wire) return bit == State::S0 || bit == State::S1;
-		if (!unique(bit)) return false;
+		auto source = netlist.source(bit);
+		if (!source) return false;
 		if (state.count(bit)) return state.at(bit) == 2;
-		auto cell = drivers.at(bit).cell;
+		auto cell = source->cell;
 		if (!cell) {
-			if (!input_bits.count(bit)) return false;
 			leaves.insert(bit);
 			return GetSize(leaves) <= 5;
 		}
-		if (!editable(cell)) return false;
+		if (!netlist.editable(cell) || source->port != ID::Y) return false;
 		std::vector<SigBit> inputs;
 		bool inverted = false;
-		if (!table_inputs(cell,bit,inputs,inverted)) return false;
+		if (!table_inputs(cell,source->offset,inputs,inverted)) return false;
 		state[bit] = 1;
 		region.insert(cell);
 		if (GetSize(region) > 128) return false;
@@ -1050,25 +701,26 @@ struct RelationWorker {
 		return value;
 	}
 	bool tables(Plan &plan) {
-		pool<SigBit> endpoints;
-		for (auto bit : observed) endpoints.insert(bit);
+		pool<SigBit> endpoints = netlist.protected_bits();
 		for (auto cell : module->cells()) if (StaticCellTypes::categories.is_ff(cell->type) && cell->hasPort(ID::D))
-			for (auto bit : sigmap(cell->getPort(ID::D))) endpoints.insert(bit);
+			for (auto bit : netlist.port(cell, ID::D)) endpoints.insert(bit);
 		int candidates = 0;
 		for (auto cell : module->selected_cells()) {
 			if (budget <= 0 || candidates >= 32) break;
-			if (cell->type != ID($mux) || !editable(cell)) continue;
-			auto y = sigmap(cell->getPort(ID::Y));
+			if (cell->type != ID($mux) || !netlist.editable(cell)) continue;
+			const auto &y = netlist.port(cell, ID::Y);
 			if (GetSize(y) < 2 || GetSize(y) > 128) continue;
 			std::vector<SigBit> root_inputs;
 			bool root_inverted = false;
-			if (!table_inputs(cell,y[0],root_inputs,root_inverted)) continue;
+			if (!table_inputs(cell,0,root_inputs,root_inverted)) continue;
 			bool visible = true;
 			for (auto bit : y) if (!endpoints.count(bit)) visible = false;
 			if (!visible) continue;
-			auto s = sigmap(cell->getPort(ID::S));
-			if (GetSize(s) != 1 || !unique(s[0]) || !input_bits.count(s[0]) || drivers.at(s[0]).cell || kept.count(s[0])) continue;
-			auto a = sigmap(cell->getPort(ID::A)), b = sigmap(cell->getPort(ID::B));
+			const auto &s = netlist.port(cell, ID::S);
+			if (GetSize(s) != 1) continue;
+			auto enable_source = netlist.source(s[0]);
+			if (!enable_source || enable_source->cell || netlist.kept(s[0])) continue;
+			const auto &a = netlist.port(cell, ID::A), &b = netlist.port(cell, ID::B);
 			if (GetSize(a) != GetSize(y) || GetSize(b) != GetSize(y)) continue;
 			bool active_high = a.is_fully_zero();
 			if (!active_high && !b.is_fully_zero()) continue;
@@ -1117,8 +769,8 @@ struct RelationWorker {
 						high |= ((tables[j] >> (index | (1 << split))) & 1) << code;
 					}
 					int left = plan.graph.lut(rest,low), right = plan.graph.lut(rest,high);
-					int root = plan.graph.lut({left,right,args[split],enable},active_high ? 0xca00 : 0x00ca), cost = 0;
-					for (int id : plan.graph.live({root})) if (!shared.count(id) && !plan.graph.nodes[id].leaf) cost++;
+					int root = plan.graph.lut({left,right,args[split],enable},active_high ? 0xca00 : 0x00ca);
+					int cost = plan.graph.incremental_cost({root}, shared);
 					if (cost < bestcost) {
 						best = root;
 						bestcost = cost;
@@ -1128,7 +780,7 @@ struct RelationWorker {
 				plan.targets.append(y[j]);
 				plan.roots.push_back(best);
 			}
-			if (plan.graph.overflow) return false;
+			if (plan.graph.overflowed()) return false;
 			plan.region.insert(cell);
 			for (auto source : region)
 				plan.region.insert(source);
@@ -1189,9 +841,10 @@ struct OptPmuxRelPass : public Pass {
 			}
 			if (!candidate) continue;
 			RelationWorker worker(module,design,luttype);
+			std::vector<RelationWorker::Plan> plans;
 			if (tables) {
 				RelationWorker::Plan plan;
-				if (worker.tables(plan)) worker.commit(plan);
+				if (worker.tables(plan)) plans.push_back(std::move(plan));
 			} else {
 				dict<SigSpec,std::vector<RelationWorker::Table>> groups;
 				for (auto cell : module->selected_cells()) {
@@ -1199,7 +852,6 @@ struct OptPmuxRelPass : public Pass {
 					RelationWorker::Table table;
 					if (worker.table(cell,table)) groups[table.control].push_back(std::move(table));
 				}
-				std::vector<RelationWorker::Plan> plans;
 				pool<Cell *> reserved;
 				for (auto &group : groups) {
 					RelationWorker::Plan plan;
@@ -1210,8 +862,8 @@ struct OptPmuxRelPass : public Pass {
 					for (auto cell : plan.region) reserved.insert(cell);
 					plans.push_back(std::move(plan));
 				}
-				for (auto &plan : plans) worker.commit(plan);
 			}
+			worker.commit(plans);
 		}
 	}
 } OptPmuxRelPass;

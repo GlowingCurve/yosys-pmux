@@ -3,8 +3,9 @@
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
 #include "kernel/celltypes.h"
-#include "passes/opt/pmux_celltypes.h"
+#include "passes/opt/pmux_decoder.h"
 #include "passes/opt/pmux_lut_cost.h"
+#include "passes/opt/pmux_netlist.h"
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
 
@@ -218,85 +219,26 @@ struct PmuxSelectGateCost {
 };
 
 struct PmuxSelectWorker {
+	using CostStatus = PmuxLutCost::CostStatus;
 	Module *module;
-	Design *design;
-	SigMap sigmap;
-	PmuxCellTypes types;
-	struct Driver { Cell *cell = nullptr; int offset = 0; int count = 0; };
-	dict<SigBit, Driver> drivers;
-	pool<SigBit> kept, unknown;
-	struct User { Cell *cell; IdString port; int offset; };
-	dict<SigBit, std::vector<User>> users;
-	pool<SigBit> module_outputs;
+	PmuxNetlist netlist;
+	PmuxDecoder decoder;
+	PmuxLutCost::ModuleCost module_cost;
 	int work = 2000000;
 	bool exhausted = false;
 	bool recovered_only = false;
-	bool users_indexed = false, users_valid = false;
 	int cost_work = 1048576;
 	int cost_diagnostic_work = 16384;
-	bool cost_stopped = false, cost_live_built = false, cost_live_valid = false;
-	bool cost_budget_active = false;
+	bool cost_stopped = false;
 	size_t recovered_nodes = 0, recovered_roots = 0;
-	bool cost_boundaries_frozen = false, cost_operators_built = false;
-	dict<Cell *, dict<IdString, SigSpec>> cost_ports;
-	pool<SigBit> cost_live, cost_boundaries, cost_preserved;
-	pool<SigBit> emission_inputs, removed_outputs;
-	pool<Cell *> cost_legacy_cells;
-	enum class CostKind { Opaque, Gate, Reduce, Compare, Logic, Pmux };
-	enum class CostShape { Unsupported, Unary, Bitwise, Mux, Pmux, Compare, Reduce, Logic };
-	struct CostExpression {
-		CostKind kind = CostKind::Opaque;
-		SigSpec inputs;
-		uint16_t table = 0;
-		int split = 0, operator_id = -1;
-		bool invert = false;
-	};
-	dict<SigBit, CostExpression> cost_expressions;
-	dict<Cell *, CostShape> cost_shapes;
-	using CostSignature = std::tuple<CostKind, uint16_t, int, bool, SigSpec>;
-	dict<CostSignature, int> cost_signatures;
-	std::vector<std::vector<SigBit>> cost_operators;
+	pool<SigBit> preserved_inputs, emission_inputs, removed_outputs;
 
-	PmuxSelectWorker(Module *m, Design *d, bool recovered_only = false) : module(m), design(d), sigmap(m), types(m, d), recovered_only(recovered_only) {
-		for (auto wire : module->wires()) {
-			bool keep = wire->get_bool_attribute(ID::keep);
-			if (!wire->port_input && !wire->port_output && !keep) continue;
-			for (auto bit : sigmap(wire)) {
-				if (wire->port_input) drivers[bit].count++;
-				if (keep) kept.insert(bit);
-			}
-		}
-		for (auto cell : module->cells()) for (auto &port : cell->connections()) {
-			auto signal = sigmap(port.second);
-			auto direction = types.cell_port_dir(cell->type, port.first);
-			bool output = direction == RTLIL::PD_OUTPUT || direction == RTLIL::PD_INOUT;
-			bool input = direction == RTLIL::PD_INPUT || direction == RTLIL::PD_INOUT;
-			for (int i = 0; i < GetSize(signal); i++) {
-				auto bit = signal[i];
-				if (output) {
-					auto &entry = drivers[bit];
-					entry.count++;
-					entry.cell = cell;
-					entry.offset = i;
-				}
-				if (!input && !output) unknown.insert(bit);
-				if (cell->get_bool_attribute(ID::keep)) kept.insert(bit);
-			}
-		}
-	}
+	PmuxSelectWorker(Module *module, Design *design, bool recovered_only = false)
+		: module(module), netlist(module, design), decoder(netlist), module_cost(netlist), recovered_only(recovered_only) {}
 	bool spend(int amount = 1) {
 		work -= amount;
 		if (work < 0) exhausted = true;
 		return !exhausted;
-	}
-	bool unique(SigBit bit) const {
-		return bit.wire && !unknown.count(bit) && drivers.count(bit) && drivers.at(bit).count == 1;
-	}
-	const SigSpec &normalized_port(Cell *cell, IdString name) {
-		auto &ports = cost_ports[cell];
-		auto found = ports.find(name);
-		if (found != ports.end()) return found->second;
-		return ports[name] = sigmap(cell->getPort(name));
 	}
 	static bool candidate_shape(Cell *cell) {
 		if (cell->type != ID($pmux) || cell->get_bool_attribute(ID::keep) || !cell->hasParam(ID::WIDTH) ||
@@ -307,44 +249,6 @@ struct PmuxSelectWorker {
 			cell->getParam(ID::WIDTH).as_int() == width && cell->getParam(ID::S_WIDTH).as_int() == branches &&
 			GetSize(cell->getPort(ID::A)) == width && GetSize(cell->getPort(ID::B)) == width*branches;
 	}
-	bool editable(Cell *cell) {
-		if (!design->selected(module, cell) || cell->get_bool_attribute(ID::keep) || !cell->hasPort(ID::Y)) return false;
-		pool<SigBit> outputs;
-		for (auto bit : normalized_port(cell, ID::Y))
-			if (!unique(bit) || drivers.at(bit).cell != cell || kept.count(bit) || !outputs.insert(bit).second) return false;
-		return true;
-	}
-	bool index_users() {
-		if (users_indexed) return users_valid;
-		users_indexed = true;
-		for (auto wire : module->wires()) {
-			if (!cost_spend()) return false;
-			if (!wire->port_output) continue;
-			for (auto bit : sigmap(wire)) {
-				if (!cost_spend()) return false;
-				module_outputs.insert(bit);
-			}
-		}
-		for (auto cell : module->cells()) {
-			if (!cost_spend()) return false;
-			cost_ports[cell];
-			for (auto &port : cell->connections()) {
-				if (!cost_spend()) return false;
-				if (!cost_spend(GetSize(port.second))) return false;
-				auto signal = normalized_port(cell, port.first);
-				auto direction = types.cell_port_dir(cell->type, port.first);
-				bool input = direction == RTLIL::PD_INPUT || direction == RTLIL::PD_INOUT;
-				bool output = direction == RTLIL::PD_OUTPUT;
-				if (!input && output) continue;
-				for (int i = 0; i < GetSize(signal); i++) {
-					if (!cost_spend()) return false;
-					users[signal[i]].push_back({cell, port.first, i});
-				}
-			}
-		}
-		users_valid = true;
-		return users_valid;
-	}
 	struct Wrapper {
 		Cell *cell = nullptr;
 		bool inner_b = false;
@@ -353,181 +257,40 @@ struct PmuxSelectWorker {
 		SigSpec y, inner_y;
 	};
 	bool wrapper(Cell *cell, Wrapper &result) {
-		auto y = normalized_port(cell, ID::Y);
+		const auto &y = netlist.port(cell, ID::Y);
 		log_assert(!y.empty());
-		auto found = users.find(y[0]);
-		if (found == users.end() || GetSize(found->second) != 1) return false;
-		auto first = found->second[0];
+		const auto &first_users = netlist.users(y[0]);
+		if (GetSize(first_users) != 1) return false;
+		auto first = first_users[0];
 		auto outer = first.cell;
-		if (outer->type != ID($mux) || !first.port.in(ID::A, ID::B) || first.offset != 0 || !editable(outer)) return false;
+		if (outer->type != ID($mux) || !first.port.in(ID::A, ID::B) || first.offset != 0 || !netlist.editable(outer)) return false;
 		int width = GetSize(y);
 		if (!outer->hasParam(ID::WIDTH) || outer->getParam(ID::WIDTH).as_int() != width ||
 			!outer->hasPort(ID::A) || !outer->hasPort(ID::B) || !outer->hasPort(ID::S) ||
 			GetSize(outer->getPort(ID::A)) != width || GetSize(outer->getPort(ID::B)) != width ||
 			GetSize(outer->getPort(ID::Y)) != width || GetSize(outer->getPort(ID::S)) != 1) return false;
-		if (sigmap(outer->getPort(first.port)) != y) return false;
+		if (netlist.port(outer, first.port) != y) return false;
 		pool<SigBit> inner_outputs;
 		for (int i = 0; i < width; i++) {
-			if (!spend() || module_outputs.count(y[i])) return false;
-			auto entry = users.find(y[i]);
-			if (entry == users.end() || GetSize(entry->second) != 1) return false;
-			auto use = entry->second[0];
+			if (!spend() || netlist.protected_bit(y[i])) return false;
+			const auto &uses = netlist.users(y[i]);
+			if (GetSize(uses) != 1) return false;
+			auto use = uses[0];
 			if (use.cell != outer || use.port != first.port || use.offset != i) return false;
 			inner_outputs.insert(y[i]);
 		}
-		auto output = sigmap(outer->getPort(ID::Y));
+		const auto &output = netlist.port(outer, ID::Y);
 		for (auto bit : output) if (!spend() || inner_outputs.count(bit)) return false;
-		auto select = sigmap(outer->getPort(ID::S))[0];
+		auto select = netlist.port(outer, ID::S)[0];
 		if (!select.wire && select.data > State::S1) return false;
 		result.cell = outer;
 		result.inner_b = first.port == ID::B;
-		result.other = sigmap(outer->getPort(result.inner_b ? ID::A : ID::B));
+		result.other = netlist.port(outer, result.inner_b ? ID::A : ID::B);
 		result.select = select;
 		result.y = output;
 		if (!cost_spend(width)) return false;
 		result.inner_y = y;
 		return true;
-	}
-	SigBit operand(Cell *cell, IdString port, int offset) {
-		const auto &signal = cell->getPort(port);
-		auto parameter = port == ID::A ? ID::A_SIGNED : ID::B_SIGNED;
-		bool sign = cell->hasParam(parameter) && cell->getParam(parameter).as_bool();
-		if (cell->type.in(ID($and), ID($or), ID($xor), ID($xnor)))
-			sign = cell->getParam(ID::A_SIGNED).as_bool() && cell->getParam(ID::B_SIGNED).as_bool();
-		return sigmap(offset < GetSize(signal) ? signal[offset] : sign && !signal.empty() ? signal.back() : SigBit(State::S0));
-	}
-	struct Cube { dict<SigBit, bool> bits; bool dead = false; };
-	bool constraint(Cube &cube, SigBit a, SigBit b) {
-		if ((!a.wire && a.data > State::S1) || (!b.wire && b.data > State::S1)) return false;
-		if (a == b) return true;
-		if (a.wire && b.wire) return false;
-		if (!a.wire && !b.wire) { cube.dead = true; return true; }
-		if (!a.wire) std::swap(a, b);
-		bool value = b == State::S1;
-		if (cube.bits.count(a) && cube.bits.at(a) != value) cube.dead = true;
-		cube.bits[a] = value;
-		return true;
-	}
-	bool decode(SigBit bit, Cube &cube, bool inequalities = false) {
-		if (!bit.wire) {
-			if (bit == State::S0) { cube.dead = true; return true; }
-			return bit == State::S1;
-		}
-		if (!unique(bit) || !drivers.at(bit).cell) return false;
-		auto entry = drivers.at(bit); auto cell = entry.cell;
-		if (!cell->type.in(ID($eq), ID($logic_not)) && !(inequalities && cell->type == ID($ne))) return false;
-		if (!cell->hasPort(ID::Y)) return false;
-		if (entry.offset) { cube.dead = true; return true; }
-		auto a = sigmap(cell->getPort(ID::A));
-		if (GetSize(a) != cell->getParam(ID::A_WIDTH).as_int() || GetSize(a) > 256) return false;
-		SigSpec b(State::S0, GetSize(a));
-		if (cell->type.in(ID($eq), ID($ne))) {
-			b = sigmap(cell->getPort(ID::B));
-			if (GetSize(b) != cell->getParam(ID::B_WIDTH).as_int() || GetSize(b) > 256) return false;
-			int width = std::max(GetSize(a), GetSize(b));
-			bool sign = cell->getParam(ID::A_SIGNED).as_bool() && cell->getParam(ID::B_SIGNED).as_bool();
-			a.extend_u0(width, sign); b.extend_u0(width, sign);
-		}
-		for (int i = 0; i < GetSize(a); i++) if (!constraint(cube, a[i], b[i])) return false;
-		return true;
-	}
-	enum class SourceState { Active, Logic, HighZ };
-	struct SourceCell { int inputs = 0; bool active = true, incoming_z = false; };
-	struct SourceContext {
-		dict<SigBit, SourceState> bits;
-		dict<Cell *, SourceCell> cells;
-	};
-	bool source_z(SigBit bit, const dict<SigBit, SourceState> &state) const {
-		if (!bit.wire) return bit == State::Sz;
-		auto found = state.find(bit);
-		log_assert(found != state.end() && found->second != SourceState::Active);
-		return found->second == SourceState::HighZ;
-	}
-	bool forwarded_z(Cell *cell, int offset, const dict<SigBit, SourceState> &state, bool incoming_z, bool &result) {
-		result = incoming_z;
-		if (cell->type == ID($lut)) {
-			if (!spend()) return false;
-			const auto &table = cell->parameters.at(ID::LUT);
-			if (!spend(GetSize(table))) return false;
-			int width = cell->getParam(ID::WIDTH).as_int();
-			log_assert(width >= 0 && offset == 0);
-			result = false;
-			for (int i = 0; i < GetSize(table); i++) {
-				if (width < 31 && (i >> width)) break;
-				if (table[i] == State::Sz) { result = true; break; }
-			}
-			return true;
-		}
-		if (!incoming_z) return true;
-		if (!spend()) return false;
-		if (cell->type.in(ID($not), ID($and), ID($or), ID($xor), ID($xnor), ID($logic_not), ID($logic_and), ID($logic_or),
-			ID($reduce_bool), ID($reduce_or), ID($reduce_and), ID($reduce_xor), ID($reduce_xnor),
-			ID($eq), ID($ne), ID($eqx), ID($nex), ID($lt), ID($le), ID($gt), ID($ge), ID($sop))) result = false;
-		else if (cell->type.in(ID($pos), ID($buf))) {
-			if (!spend(GetSize(cell->getPort(ID::A)) + 1)) return false;
-			result = source_z(operand(cell, ID::A, offset), state);
-		} else if (cell->type == ID($mux)) {
-			if (!spend(GetSize(cell->getPort(ID::A)) + GetSize(cell->getPort(ID::B)) + 4)) return false;
-			auto s = normalized_port(cell, ID::S);
-			log_assert(GetSize(s) == 1);
-			result = false;
-			if (s[0] != State::S1) result |= source_z(operand(cell, ID::A, offset), state);
-			if (s[0] != State::S0) result |= source_z(operand(cell, ID::B, offset), state);
-		} else if (cell->type == ID($pmux)) {
-			if (!spend(2*GetSize(cell->getPort(ID::A)) + 2*GetSize(cell->getPort(ID::B)) + 4*GetSize(cell->getPort(ID::S)))) return false;
-			auto a = normalized_port(cell, ID::A), b = normalized_port(cell, ID::B), s = normalized_port(cell, ID::S);
-			log_assert(offset >= 0 && offset < GetSize(a) && GetSize(b) == GetSize(a)*GetSize(s));
-			int selected = -1;
-			for (int i = 0; i < GetSize(s); i++) if (s[i] == State::S1) {
-				if (selected >= 0) { result = false; return true; }
-				selected = i;
-			}
-			if (selected >= 0) result = source_z(b[selected*GetSize(a)+offset], state);
-			else {
-				result = source_z(a[offset], state);
-				for (int i = 0; i < GetSize(s); i++) if (s[i] != State::S0) result |= source_z(b[i*GetSize(a)+offset], state);
-			}
-		}
-		return true;
-	}
-	// 只穿过组合单元检查依赖；时序单元的输出作为独立输入边界。
-	bool upstream(SigBit bit, const pool<SigBit> &outputs, SourceContext &context) {
-		auto &state = context.bits;
-		if (!spend() || outputs.count(bit) || unknown.count(bit)) return false;
-		if (!bit.wire) return !drivers.count(bit);
-		if (!unique(bit)) return false;
-		if (state.count(bit)) return state.at(bit) != SourceState::Active;
-		auto driver = drivers.at(bit);
-		auto cell = driver.cell;
-		if (!cell || StaticCellTypes::categories.is_ff(cell->type)) { state[bit] = SourceState::Logic; return true; }
-		if (!types.cell_evaluable(cell->type)) return false;
-		state[bit] = SourceState::Active;
-		bool incoming_z = false;
-		auto cached = context.cells.find(cell);
-		if (cached != context.cells.end()) {
-			if (cached->second.active || !spend(cached->second.inputs)) return false;
-			incoming_z = cached->second.incoming_z;
-		} else {
-			context.cells[cell];
-			int inputs = 0;
-			for (auto &port : cell->connections()) {
-			auto direction = types.cell_port_dir(cell->type, port.first);
-				if (direction != RTLIL::PD_INPUT && direction != RTLIL::PD_INOUT) continue;
-				for (auto input : normalized_port(cell, port.first)) {
-					if (!upstream(input, outputs, context)) return false;
-					incoming_z |= source_z(input, state);
-					inputs++;
-				}
-			}
-			context.cells[cell] = {inputs, false, incoming_z};
-		}
-		bool high_z;
-		if (!forwarded_z(cell, driver.offset, state, incoming_z, high_z)) return false;
-		state[bit] = high_z ? SourceState::HighZ : SourceState::Logic;
-		return true;
-	}
-	int graph_leaf(PmuxSelectGraph &graph, SigBit bit, const dict<SigBit, SourceState> &state) {
-		return graph.leaf(bit, source_z(bit, state));
 	}
 	struct Function { std::vector<SigBit> support; std::vector<State> table; };
 	void check_function(const Function &f) {
@@ -646,9 +409,10 @@ struct PmuxSelectWorker {
 			return true;
 		}
 		if (context.cache.count(bit)) { result = context.cache.at(bit); return true; }
-		if (!unique(bit)) return false;
-		auto entry = drivers.at(bit); auto cell = entry.cell;
-		if (context.expand && (!cell || kept.count(bit))) { result = atom(bit); context.cache[bit] = result; return true; }
+		const auto *entry = netlist.source(bit);
+		if (!entry) return false;
+		auto cell = entry->cell;
+		if (context.expand && (!cell || netlist.kept(bit))) { result = atom(bit); context.cache[bit] = result; return true; }
 		bool unary = cell && cell->type.in(ID($not), ID($pos), ID($buf));
 		bool binary = cell && cell->type.in(ID($and), ID($or), ID($xor), ID($xnor));
 		bool compare = cell && cell->type.in(ID($eq), ID($ne), ID($logic_not));
@@ -665,15 +429,15 @@ struct PmuxSelectWorker {
 				!control_port(cell, ID::B, plain ? ID::WIDTH : ID::B_WIDTH)) return false;
 			if (mux && (!cell->hasPort(ID::S) || GetSize(cell->getPort(ID::S)) != 1)) return false;
 			int edges = 0;
-			for (auto &port : cell->connections()) if (types.cell_input(cell->type, port.first)) {
+			for (auto &port : cell->connections()) if (netlist.cell_input(cell->type, port.first)) {
 				edges += GetSize(port.second);
-				for (auto input : sigmap(port.second)) if (!input.wire && input.data > State::S1) return false;
+				for (auto input : netlist.port(cell, port.first)) if (!input.wire && input.data > State::S1) return false;
 			}
 			context.edges += edges;
 			if (context.edges > 2048 || !control_spend(context, 1+edges)) return false;
 		}
-		Cube cube;
-		if (decode(bit, cube, context.expand)) {
+		PmuxDecoder::Cube cube;
+		if (decoder.decode(bit, cube, context.expand)) {
 			result = atom(cube.dead ? State::S0 : State::S1);
 			if (!cube.dead) for (auto &constraint : cube.bits) {
 				Function input = atom(constraint.first);
@@ -681,32 +445,32 @@ struct PmuxSelectWorker {
 				if (!constraint.second && !control_combine(context, ID($not), {input}, input)) return false;
 				if (!control_combine(context, ID($and), {result, input}, result)) return false;
 			}
-			if (context.expand && cell && cell->type == ID($ne) && entry.offset == 0 &&
+			if (cube.inverted &&
 				!control_combine(context, ID($not), {result}, result)) return false;
 		} else if (!context.expand) return false;
 		else if (compare) result = atom(bit);
-		else if ((logic || reduce) && entry.offset > 0) result = atom(State::S0);
+		else if ((logic || reduce) && entry->offset > 0) result = atom(State::S0);
 		else if (logic || reduce) {
 			IdString type = cell->type == ID($reduce_and) ? ID($and) :
 				cell->type.in(ID($reduce_xor), ID($reduce_xnor)) ? ID($xor) : ID($or);
-			if (!control_reduce(sigmap(cell->getPort(ID::A)), type, context, result, depth-1)) return false;
+			if (!control_reduce(netlist.port(cell, ID::A), type, context, result, depth-1)) return false;
 			if (logic) {
 				Function other;
-				if (!control_reduce(sigmap(cell->getPort(ID::B)), ID($or), context, other, depth-1) ||
+				if (!control_reduce(netlist.port(cell, ID::B), ID($or), context, other, depth-1) ||
 					!control_combine(context, cell->type == ID($logic_and) ? ID($and) : ID($or), {result, other}, result)) return false;
 			}
 			if (cell->type == ID($reduce_xnor) && !control_combine(context, ID($not), {result}, result)) return false;
 		} else {
 			Function input;
 			std::vector<Function> args;
-			if (!control(operand(cell, ID::A, entry.offset), context, input, depth-1)) return false;
+			if (!control(netlist.operand(cell, ID::A, entry->offset), context, input, depth-1)) return false;
 			args.push_back(input);
 			if (binary || mux) {
-				if (!control(operand(cell, ID::B, entry.offset), context, input, depth-1)) return false;
+				if (!control(netlist.operand(cell, ID::B, entry->offset), context, input, depth-1)) return false;
 				args.push_back(input);
 			}
 			if (mux) {
-				if (!control(sigmap(cell->getPort(ID::S))[0], context, input, depth-1)) return false;
+				if (!control(netlist.port(cell, ID::S)[0], context, input, depth-1)) return false;
 				args.push_back(input);
 			}
 			if (!control_combine(context, cell->type, args, result)) return false;
@@ -748,8 +512,8 @@ struct PmuxSelectWorker {
 		return true;
 	}
 	bool selection_table(Cell *cell, bool expand, Selection &result) {
-		if (!candidate_shape(cell) || !editable(cell)) return false;
-		auto s = normalized_port(cell, ID::S), y = normalized_port(cell, ID::Y);
+		if (!candidate_shape(cell) || !netlist.editable(cell)) return false;
+		const auto &s = netlist.port(cell, ID::S), &y = netlist.port(cell, ID::Y);
 		int width = GetSize(y), branches = GetSize(s);
 		ControlContext context;
 		context.expand = expand;
@@ -790,18 +554,20 @@ struct PmuxSelectWorker {
 		if (!bit.wire) return atom(bit);
 		auto key = std::make_pair(bit, code);
 		if (cache.count(key)) return cache.at(key);
-		if (!spend() || depth == 0 || GetSize(cache) >= 65536 || GetSize(expanded) >= 4096 || !unique(bit) || !drivers.at(bit).cell || kept.count(bit)) return atom(bit);
+		if (!spend() || depth == 0 || GetSize(cache) >= 65536 || GetSize(expanded) >= 4096 || netlist.kept(bit)) return atom(bit);
+		const auto *entry = netlist.source(bit);
+		if (!entry || !entry->cell) return atom(bit);
 		if (!active.insert(bit).second) { exhausted = true; return atom(bit); }
-		auto entry = drivers.at(bit); auto cell = entry.cell;
+		auto cell = entry->cell;
 		bool unary = cell->type.in(ID($not), ID($pos), ID($buf));
 		bool binary = cell->type.in(ID($and), ID($or), ID($xor), ID($xnor));
 		bool mux = cell->type == ID($mux) && GetSize(cell->getPort(ID::S)) == 1;
 		Function result = atom(bit);
 		if (unary || binary || mux) {
 			std::vector<Function> args;
-			args.push_back(expression(operand(cell, ID::A, entry.offset), code, controls, cache, active, expanded, depth-1));
-			if (binary || mux) args.push_back(expression(operand(cell, ID::B, entry.offset), code, controls, cache, active, expanded, depth-1));
-			if (mux) args.push_back(expression(sigmap(cell->getPort(ID::S))[0], code, controls, cache, active, expanded, depth-1));
+			args.push_back(expression(netlist.operand(cell, ID::A, entry->offset), code, controls, cache, active, expanded, depth-1));
+			if (binary || mux) args.push_back(expression(netlist.operand(cell, ID::B, entry->offset), code, controls, cache, active, expanded, depth-1));
+			if (mux) args.push_back(expression(netlist.port(cell, ID::S)[0], code, controls, cache, active, expanded, depth-1));
 			Function combined;
 			if (combine(cell->type, args, 3, combined)) { result = std::move(combined); expanded.insert(cell); }
 		}
@@ -809,16 +575,18 @@ struct PmuxSelectWorker {
 		cache[key] = result;
 		return result;
 	}
-	int build(PmuxSelectGraph &graph, const std::vector<int> &table, const std::vector<SigBit> &order, const dict<SigBit, SourceState> &state, int depth = 0, int code = 0) {
+	int build(PmuxSelectGraph &graph, const std::vector<int> &table, const std::vector<SigBit> &order,
+			const PmuxNetlist::Dependencies &dependency, int depth = 0, int code = 0) {
 		if (!spend()) { graph.overflow = true; return graph.leaf(State::Sx); }
 		if (depth == GetSize(order)) return table[code];
-		int a = build(graph, table, order, state, depth+1, code), b = build(graph, table, order, state, depth+1, code | (1 << depth));
-		return graph.mux(graph_leaf(graph, order[depth], state), a, b);
+		int a = build(graph, table, order, dependency, depth+1, code);
+		int b = build(graph, table, order, dependency, depth+1, code | (1 << depth));
+		return graph.mux(graph.leaf(order[depth], dependency.high_z(order[depth])), a, b);
 	}
-	int function_graph(PmuxSelectGraph &graph, const Function &f, const dict<SigBit, SourceState> &state) {
+	int function_graph(PmuxSelectGraph &graph, const Function &f, const PmuxNetlist::Dependencies &dependency) {
 		std::vector<int> values;
 		for (auto value : f.table) values.push_back(graph.leaf(value));
-		return build(graph, values, f.support, state);
+		return build(graph, values, f.support, dependency);
 	}
 	int reference_tree(const std::vector<SigBit> &table, const std::vector<int> &permuted) {
 		struct Node { int a, b; };
@@ -926,7 +694,6 @@ struct PmuxSelectWorker {
 		return true;
 	}
 	bool cost_spend(int amount = 1) {
-		log_assert(!cost_budget_active);
 		if (cost_stopped) return false;
 		cost_work -= amount;
 		bool valid = spend(amount);
@@ -937,217 +704,6 @@ struct PmuxSelectWorker {
 		if (!ys_debug(1) || amount > cost_diagnostic_work) return false;
 		cost_diagnostic_work -= amount;
 		return true;
-	}
-	static bool cost_read(int &remaining, int64_t amount = 1) {
-		if (amount > remaining) { remaining = -1; return false; }
-		remaining -= amount;
-		return true;
-	}
-	const SigSpec &cost_port(Cell *cell, IdString name) const {
-		log_assert(users_valid && cost_ports.count(cell) && cost_ports.at(cell).count(name));
-		return cost_ports.at(cell).at(name);
-	}
-	SigBit cost_operand(Cell *cell, IdString name, int offset) const {
-		const auto &signal = cost_port(cell, name);
-		bool sign = cell->hasParam(ID::A_SIGNED) && cell->getParam(ID::A_SIGNED).as_bool();
-		if (cell->hasPort(ID::B)) sign &= cell->hasParam(ID::B_SIGNED) && cell->getParam(ID::B_SIGNED).as_bool();
-		return offset < GetSize(signal) ? signal[offset] : sign && !signal.empty() ? signal.back() : SigBit(State::S0);
-	}
-	CostShape cost_shape(Cell *cell, int &remaining) {
-		auto found = cost_shapes.find(cell);
-		if (found != cost_shapes.end()) return found->second;
-		if (!cost_read(remaining)) return CostShape::Unsupported;
-		CostShape shape = CostShape::Unsupported;
-		auto sized = [&](IdString port, IdString parameter) {
-			return cell->hasPort(port) && cell->hasParam(parameter) &&
-				GetSize(cost_port(cell, port)) == cell->getParam(parameter).as_int();
-		};
-		bool unary = cell->type.in(ID($not), ID($pos), ID($buf));
-		bool binary = cell->type.in(ID($and), ID($or), ID($xor), ID($xnor));
-		bool compare = cell->type.in(ID($eq), ID($ne));
-		bool reduce = cell->type.in(ID($logic_not), ID($reduce_or), ID($reduce_bool), ID($reduce_and), ID($reduce_xor), ID($reduce_xnor));
-		bool logic = cell->type.in(ID($logic_and), ID($logic_or));
-		if (cell->type.in(ID($mux), ID($pmux))) {
-			if (sized(ID::Y, ID::WIDTH) && sized(ID::A, ID::WIDTH) && cell->hasPort(ID::B) && cell->hasPort(ID::S)) {
-				int width = GetSize(cost_port(cell, ID::Y)), branches = GetSize(cost_port(cell, ID::S));
-				if (cell->type == ID($mux) && branches == 1 && GetSize(cost_port(cell, ID::B)) == width) shape = CostShape::Mux;
-				if (cell->type == ID($pmux) && cell->hasParam(ID::S_WIDTH) && cell->getParam(ID::S_WIDTH).as_int() == branches &&
-					GetSize(cost_port(cell, ID::B)) == width*branches) shape = CostShape::Pmux;
-			}
-		} else if (cell->type == ID($buf)) {
-			if (sized(ID::Y, ID::WIDTH) && sized(ID::A, ID::WIDTH)) shape = CostShape::Unary;
-		} else if ((unary || binary || compare || reduce || logic) && sized(ID::Y, ID::Y_WIDTH) && sized(ID::A, ID::A_WIDTH) &&
-			cell->hasParam(ID::A_SIGNED) && (!(binary || compare || logic) || (sized(ID::B, ID::B_WIDTH) && cell->hasParam(ID::B_SIGNED)))) {
-			shape = unary ? CostShape::Unary : binary ? CostShape::Bitwise : compare ? CostShape::Compare : reduce ? CostShape::Reduce : CostShape::Logic;
-		}
-		cost_shapes[cell] = shape;
-		return shape;
-	}
-	CostExpression cost_expression(SigBit bit, int &remaining) {
-		auto found = cost_expressions.find(bit);
-		if (found != cost_expressions.end()) {
-			if (!cost_read(remaining, GetSize(found->second.inputs))) return {};
-			return found->second;
-		}
-		CostExpression result;
-		if (!cost_read(remaining) || !unique(bit) || !drivers.at(bit).cell) return result;
-		auto source = drivers.at(bit);
-		auto cell = source.cell;
-		if (!cell->hasPort(ID::Y) || source.offset >= GetSize(cost_port(cell, ID::Y)) || cost_port(cell, ID::Y)[source.offset] != bit ||
-			StaticCellTypes::categories.is_ff(cell->type)) return cost_expressions[bit] = result;
-		CostShape shape = cost_shape(cell, remaining);
-		if (shape == CostShape::Unary || shape == CostShape::Bitwise || shape == CostShape::Mux) {
-			if (!cost_read(remaining, 6)) return {};
-			result.kind = CostKind::Gate;
-			result.inputs.append(cost_operand(cell, ID::A, source.offset));
-			if (shape != CostShape::Unary) result.inputs.append(shape == CostShape::Mux ? cost_port(cell, ID::B)[source.offset] : cost_operand(cell, ID::B, source.offset));
-			if (shape == CostShape::Mux) result.inputs.append(cost_port(cell, ID::S));
-			result.table = shape == CostShape::Mux ? 0xca : cell->type == ID($not) ? 1 : shape == CostShape::Unary ? 2 :
-				cell->type == ID($and) ? 8 : cell->type == ID($or) ? 14 : cell->type == ID($xor) ? 6 : 9;
-		} else if (shape == CostShape::Pmux) {
-			result.kind = CostKind::Pmux;
-			const auto &s = cost_port(cell, ID::S), &b = cost_port(cell, ID::B), &y = cost_port(cell, ID::Y);
-			if (!cost_read(remaining, 2LL*(1+2LL*GetSize(s)))) return {};
-			result.inputs.append(cost_port(cell, ID::A)[source.offset]);
-			result.inputs.append(s);
-			for (int i = 0; i < GetSize(s); i++) result.inputs.append(b[i*GetSize(y)+source.offset]);
-			result.split = GetSize(s);
-		} else if ((shape == CostShape::Compare || shape == CostShape::Reduce || shape == CostShape::Logic) && source.offset > 0) {
-			result.kind = CostKind::Gate;
-		} else if (shape == CostShape::Compare) {
-			result.kind = CostKind::Compare;
-			int width = std::max(GetSize(cost_port(cell, ID::A)), GetSize(cost_port(cell, ID::B)));
-			if (!cost_read(remaining, 6LL*width)) return {};
-			auto a = cost_port(cell, ID::A), b = cost_port(cell, ID::B);
-			bool sign = cell->getParam(ID::A_SIGNED).as_bool() && cell->getParam(ID::B_SIGNED).as_bool();
-			a.extend_u0(width, sign);
-			b.extend_u0(width, sign);
-			for (int i = 0; i < width; i++) {
-				result.inputs.append(a[i]);
-				result.inputs.append(b[i]);
-			}
-			result.invert = cell->type == ID($ne);
-		} else if (shape == CostShape::Reduce || shape == CostShape::Logic) {
-			result.kind = shape == CostShape::Reduce ? CostKind::Reduce : CostKind::Logic;
-			int64_t width = GetSize(cost_port(cell, ID::A));
-			if (shape == CostShape::Logic) width += GetSize(cost_port(cell, ID::B));
-			if (!cost_read(remaining, 2*width)) return {};
-			result.inputs = cost_port(cell, ID::A);
-			result.split = GetSize(result.inputs);
-			if (shape == CostShape::Logic) result.inputs.append(cost_port(cell, ID::B));
-			result.table = cell->type.in(ID($reduce_and), ID($logic_and)) ? 8 :
-				cell->type.in(ID($reduce_xor), ID($reduce_xnor)) ? 6 : 14;
-			result.invert = cell->type.in(ID($logic_not), ID($reduce_xnor));
-		} else {
-			pool<SigBit> inputs;
-			int connections = 0;
-			bool usable = types.cell_evaluable(cell->type) && GetSize(cost_port(cell, ID::Y)) == 1;
-			for (auto &port : cost_ports.at(cell)) {
-				connections += GetSize(port.second);
-				if (connections > 64) { usable = false; break; }
-				if (port.first == ID::Y) continue;
-				if (!port.first.in(ID::A, ID::B)) usable = false;
-				for (auto input : port.second) {
-					if (!cost_read(remaining)) return result;
-					if (input.wire) inputs.insert(input);
-					else if (input != State::S0 && input != State::S1) usable = false;
-				}
-			}
-			if (usable && GetSize(inputs) <= 4) {
-				result.inputs = SigSpec(std::vector<SigBit>(inputs.begin(), inputs.end()));
-				result.inputs.sort();
-				dict<SigBit, int> positions;
-				for (int i = 0; i < GetSize(result.inputs); i++) positions[result.inputs[i]] = i;
-				for (int assignment = 0; assignment < (1 << GetSize(result.inputs)); assignment++) {
-					Const a, b;
-					for (auto name : {ID::A, ID::B}) if (cell->hasPort(name)) for (auto input : cost_port(cell, name)) {
-						if (!cost_read(remaining)) return result;
-						State value = input.wire ? ((assignment >> positions.at(input)) & 1 ? State::S1 : State::S0) : input.data;
-						(name == ID::A ? a : b).append(Const(value, 1));
-					}
-					if (!cost_read(remaining)) return result;
-					bool error = false;
-					auto value = CellTypes::eval(cell, a, b, &error);
-					if (error || GetSize(value) != 1 || value[0] > State::S1) { usable = false; break; }
-					if (value[0] == State::S1) result.table |= 1 << assignment;
-				}
-				if (usable) result.kind = CostKind::Gate;
-			}
-		}
-		cost_expressions[bit] = result;
-		return result;
-	}
-	// 运算编号仅在当前 Worker 的固定拓扑上复用。
-	int cost_operator_id(SigBit bit, int &remaining) {
-		if (!cost_read(remaining)) return -1;
-		auto &expression = cost_expressions.at(bit);
-		if (expression.kind == CostKind::Opaque || expression.operator_id >= 0)
-			return expression.operator_id;
-		if (!cost_read(remaining, 4LL*GetSize(expression.inputs))) return -1;
-		auto inputs = expression.inputs;
-		if (expression.kind == CostKind::Gate && GetSize(inputs) == 2 &&
-			(expression.table == 8 || expression.table == 14 || expression.table == 6 || expression.table == 9)) inputs.sort();
-		CostSignature signature = {expression.kind, expression.table, expression.split, expression.invert, std::move(inputs)};
-		auto found = cost_signatures.emplace(std::move(signature), GetSize(cost_operators));
-		if (found.second) cost_operators.emplace_back();
-		return expression.operator_id = found.first->second;
-	}
-	bool build_cost_indices(int &remaining) {
-		log_assert(cost_boundaries_frozen && users_valid);
-		if (!cost_live_built) {
-			cost_live_built = true;
-			if (!cost_read(remaining, int64_t(GetSize(module_outputs))+GetSize(kept)+GetSize(cost_preserved))) return false;
-			std::vector<SigBit> pending(module_outputs.begin(), module_outputs.end());
-			for (auto bit : kept) pending.push_back(bit);
-			for (auto bit : cost_preserved) pending.push_back(bit);
-			for (auto cell : module->cells()) {
-				if (!cost_read(remaining)) return false;
-				if (design->selected(module, cell) && !cell->get_bool_attribute(ID::keep) &&
-					(types.cell_evaluable(cell->type) || StaticCellTypes::categories.is_ff(cell->type))) continue;
-				for (auto &port : cost_ports.at(cell)) for (auto bit : port.second) {
-					if (!cost_read(remaining)) return false;
-					pending.push_back(bit);
-				}
-			}
-			pool<Cell *> expanded_full;
-			for (int i = 0; i < GetSize(pending); i++) {
-				auto bit = pending[i];
-				if (!cost_read(remaining)) return false;
-				if (!bit.wire || !cost_live.insert(bit).second || cost_boundaries.count(bit) || !unique(bit) || !drivers.at(bit).cell) continue;
-				auto cell = drivers.at(bit).cell;
-				SigSpec inputs;
-				if (cost_shape(cell, remaining) != CostShape::Unsupported) inputs = cost_expression(bit, remaining).inputs;
-				else {
-					if (!expanded_full.insert(cell).second) continue;
-					for (auto &port : cost_ports.at(cell)) if (types.cell_port_dir(cell->type, port.first) != RTLIL::PD_OUTPUT) {
-						if (!cost_read(remaining, GetSize(port.second))) return false;
-						inputs.append(port.second);
-					}
-				}
-				for (auto input : inputs) {
-					if (!cost_read(remaining)) return false;
-					pending.push_back(input);
-				}
-			}
-			cost_live_valid = remaining >= 0;
-		}
-		if (!cost_live_valid) return false;
-		if (!cost_operators_built) {
-			cost_operators_built = true;
-			for (auto cell : module->cells()) {
-				if (!cost_read(remaining)) return false;
-				if (cost_legacy_cells.count(cell)) continue;
-				if (cost_shape(cell, remaining) == CostShape::Unsupported) continue;
-				for (auto bit : cost_port(cell, ID::Y)) {
-					if (!cost_read(remaining)) return false;
-					if (!cost_live.count(bit) || !unique(bit) || drivers.at(bit).cell != cell) continue;
-					int id = cost_operator_id(bit, remaining);
-					if (remaining < 0) return false;
-					if (id >= 0) cost_operators[id].push_back(bit);
-				}
-			}
-		}
-		return remaining >= 0;
 	}
 	bool collect_plan_inputs(Plan &plan, const std::vector<SigBit> &controls,
 			const std::vector<std::vector<SigBit>> &tables) {
@@ -1178,18 +734,16 @@ struct PmuxSelectWorker {
 		plan.inputs_collected = true;
 		return true;
 	}
-	void preserve_legacy(Cell *cell, const SigSpec &y, Plan &plan, const std::vector<SigBit> &controls,
+	void preserve_plan_inputs(const SigSpec &y, Plan &plan, const std::vector<SigBit> &controls,
 			const std::vector<std::vector<SigBit>> &tables) {
-		log_assert(!cost_boundaries_frozen);
 		if (!collect_plan_inputs(plan, controls, tables) || !cost_spend(GetSize(y)+GetSize(plan.inputs))) return;
-		cost_legacy_cells.insert(cell);
-		for (auto bit : y) cost_boundaries.insert(bit);
-		for (auto bit : plan.inputs) cost_preserved.insert(bit);
+		module_cost.preserve(y, plan.inputs);
+		preserved_inputs.insert(plan.inputs.begin(), plan.inputs.end());
 	}
 	bool emission_compatible(const Plan &plan, const Wrapper *wrapper, Cell *cell) {
 		log_assert(plan.inputs_collected);
 		if (!cost_spend(GetSize(plan.inputs)+(wrapper ? GetSize(wrapper->inner_y) : 0))) return false;
-		if (wrapper) for (auto bit : wrapper->inner_y) if (cost_preserved.count(bit) || emission_inputs.count(bit)) {
+		if (wrapper) for (auto bit : wrapper->inner_y) if (preserved_inputs.count(bit) || emission_inputs.count(bit)) {
 			if (cost_diagnostic()) log_debug("PMUX select %s.%s: emission deletion conflicts with accepted input %s.\n", log_id(module), log_id(wrapper->cell), log_signal(bit));
 			return false;
 		}
@@ -1206,542 +760,98 @@ struct PmuxSelectWorker {
 		if (wrapper) for (auto bit : wrapper->inner_y) log_assert(removed_outputs.insert(bit).second);
 		return true;
 	}
-	enum class CostStatus { Profitable, NoGain, UnsupportedSource, UnsupportedActivatedBoundary, DepthLimit, NodeLimit, BudgetExhausted };
-	struct CostResult {
-		CostStatus status = CostStatus::NoGain;
-		int before = 0, after = 0;
-	};
 	struct CostView {
 		Cell *cell;
 		const SigSpec *y;
 		const Wrapper *wrapper;
 		const Plan *plan;
 	};
-	struct CostSignal { int value, care; };
-	using CostKey = std::pair<SigBit, int>;
-	enum class CostReadKind { Primary, Boundary, Opaque, Fixed, Expanded };
-	struct CostRead {
-		CostSignal signal;
-		CostReadKind kind;
-		bool dependent;
-	};
-	struct CostSnapshot {
-		PmuxLutCost::LutCostGraph::ReadOnlyGraph topology;
-		dict<CostKey, CostRead> reads;
-		pool<SigBit> expanded, opaque, fixed;
-		std::vector<SigBit> expanded_order;
-		int64_t copy_work() const {
-			return 32LL*GetSize(topology.nodes) + 8LL*GetSize(reads) +
-				4LL*(GetSize(expanded)+GetSize(opaque)+GetSize(fixed)+GetSize(expanded_order));
-		}
-	};
-	struct CostBudget {
-		PmuxSelectWorker &worker;
-		int initial, remaining;
-		CostBudget(PmuxSelectWorker &worker) : worker(worker), initial(std::min(worker.work, worker.cost_work)), remaining(initial) {
-			log_assert(!worker.cost_budget_active);
-			worker.cost_budget_active = true;
-		}
-		~CostBudget() {
-			worker.cost_budget_active = false;
-			worker.cost_spend(initial-remaining);
-		}
-	};
-	struct CostBuilder {
-		PmuxSelectWorker &worker;
-		PmuxLutCost::LutCostGraph &graph;
-		const std::vector<CostView> &edits;
-		const dict<SigBit, std::pair<int, int>> &replacements;
-		const pool<SigBit> &removed;
-		bool changed;
-		CostStatus status = CostStatus::NoGain;
-		dict<std::pair<SigBit, int>, CostSignal> bits;
-		dict<std::tuple<int, int, int>, CostSignal> refs;
-		pool<SigBit> active, expanded, opaque;
-		std::vector<SigBit> expanded_order;
-		CostSnapshot *record = nullptr;
-		const CostSnapshot *baseline = nullptr;
-		const CostSnapshot *original = nullptr;
-		pool<CostKey> replayed;
-		CostBuilder(PmuxSelectWorker &worker, PmuxLutCost::LutCostGraph &graph, const std::vector<CostView> &edits,
-			const dict<SigBit, std::pair<int, int>> &replacements, const pool<SigBit> &removed, bool changed) :
-			worker(worker), graph(graph), edits(edits), replacements(replacements), removed(removed), changed(changed) {}
-		int expanded_count() const {
-			return GetSize(expanded_order) + (baseline ? GetSize(baseline->expanded_order) : 0);
-		}
-		SigBit expanded_at(int index) const {
-			int prefix = baseline ? GetSize(baseline->expanded_order) : 0;
-			return index < prefix ? baseline->expanded_order[index] : expanded_order[index-prefix];
-		}
-		bool expanded_contains(SigBit value) const {
-			return expanded.count(value) || (baseline && baseline->expanded.count(value));
-		}
-		void expand(SigBit value) {
-			if (baseline && baseline->expanded.count(value)) return;
-			if (expanded.insert(value).second) expanded_order.push_back(value);
-		}
-		void mark_opaque(SigBit value) {
-			if (!baseline || !baseline->opaque.count(value)) opaque.insert(value);
-		}
-		CostSignal cached_bit(const CostKey &key) const {
-			auto found = bits.find(key);
-			if (found != bits.end()) return found->second;
-			log_assert(baseline && !changed);
-			return baseline->reads.at(key).signal;
-		}
-		CostSignal operation(uint16_t table, const std::vector<CostSignal> &args) {
-			if (!graph.valid) return {0, 0};
-			std::vector<int> values, care;
-			for (auto arg : args) { values.push_back(arg.value); care.push_back(arg.care); }
-			return {graph.gate(table, values), graph.reduce(8, care, 1)};
-		}
-		CostSignal fail(CostStatus reason) {
-			status = reason;
-			graph.valid = false;
-			return {0, 0};
-		}
-		CostSignal reference(int edit, int ref, int depth) {
-			if (!graph.valid || !graph.spend()) return {0, 0};
-			if (!depth) return fail(CostStatus::DepthLimit);
-			auto key = std::make_tuple(edit, ref, depth);
-			auto found = refs.find(key);
-			if (found != refs.end()) return found->second;
-			const auto &plan = *edits[edit].plan;
-			log_assert(!plan.fields && ref >= 0 && ref/2 < GetSize(plan.graph.nodes));
-			const auto &node = plan.graph.nodes[ref/2];
-			CostSignal result;
-			if (ref & 1) result = operation(1, {reference(edit, ref ^ 1, depth-1)});
-			else if (!node.kind) result = bit(node.bit, depth-1);
-			else if (node.kind == 1) result = operation(0xca, {reference(edit, node.a, depth-1), reference(edit, node.b, depth-1), reference(edit, node.s, depth-1)});
-			else { log_assert(node.kind == 2); result = operation(6, {reference(edit, node.a, depth-1), reference(edit, node.b, depth-1)}); }
-			refs[key] = result;
-			return result;
-		}
-		bool replay_original(const CostKey &key) {
-			log_assert(original && changed && original->reads.count(key));
-			if (!graph.spend()) return false;
-			if (!replayed.insert(key).second) return true;
-			const auto &read = original->reads.at(key);
-			log_assert(!read.dependent);
-			auto value = key.first;
-			if (read.kind == CostReadKind::Opaque) {
-				mark_opaque(value);
-				if (!worker.cost_live.count(value)) { fail(CostStatus::UnsupportedActivatedBoundary); return false; }
-			} else if (read.kind == CostReadKind::Fixed) graph.add_fixed(value);
-			else if (read.kind == CostReadKind::Expanded) {
-				expand(value);
-				log_assert(worker.cost_expressions.count(value));
-				const auto &expression = worker.cost_expressions.at(value);
-				if (!cost_read(graph.work, GetSize(expression.inputs))) {
-					fail(CostStatus::BudgetExhausted);
-					return false;
-				}
-				for (auto input : expression.inputs) if (input.wire)
-					if (!replay_original({input, key.second-1})) return false;
-			}
-			return graph.valid;
-		}
-		CostSignal bit(SigBit value, int depth = 64) {
-			if (!graph.valid || !graph.spend()) return {0, 0};
-			if (!depth) return fail(CostStatus::DepthLimit);
-			if (!value.wire) {
-				log_assert(value == State::S0 || value == State::S1 || value == State::Sx || value == State::Sz);
-				// SatGen 在当前证明入口将 Sz 导入为已定义零。
-				return {value == State::S1 ? 1 : 0, value != State::Sx ? 1 : 0};
-			}
-			log_assert(!changed || !removed.count(value));
-			auto key = std::make_pair(value, depth);
-			auto found = bits.find(key);
-			if (found != bits.end()) return found->second;
-			if (baseline) {
-				auto cached = baseline->reads.find(key);
-				if (cached != baseline->reads.end()) return cached->second.signal;
-			}
-			if (original) {
-				auto cached = original->reads.find(key);
-				if (cached != original->reads.end() && !cached->second.dependent) {
-					if (!replay_original(key)) return {0, 0};
-					return bits[key] = cached->second.signal;
-				}
-			}
-			log_assert(active.insert(value).second);
-			CostSignal result;
-			CostReadKind kind = CostReadKind::Primary;
-			bool dependent = replacements.count(value) && !worker.cost_boundaries.count(value);
-			if (changed && replacements.count(value)) {
-				auto replacement = replacements.at(value);
-				result = reference(replacement.first, replacement.second, depth-1);
-			} else if (worker.cost_boundaries.count(value)) { kind = CostReadKind::Boundary; result = {graph.leaf(value), 1}; }
-			else if (!worker.unique(value)) result = fail(CostStatus::UnsupportedSource);
+	using PlanCost = dict<std::pair<int, int>, PmuxLutCost::Signal>;
+
+	PmuxLutCost::Signal cost_node(const PmuxSelectGraph &graph, int ref, PmuxLutCost::Builder &builder, int depth, PlanCost &memo) {
+		log_assert(ref >= 0 && ref / 2 < GetSize(graph.nodes));
+		if (depth <= 0) return builder.fail(CostStatus::DepthLimit);
+		if (!builder.spend()) return builder.fail(CostStatus::BudgetExhausted);
+		auto key = std::make_pair(ref, depth);
+		auto found = memo.find(key);
+		if (found != memo.end()) return found->second;
+		const auto &node = graph.nodes[ref / 2];
+		PmuxLutCost::Signal signal;
+		if (ref & 1) signal = builder.operation(1, {cost_node(graph, ref ^ 1, builder, depth - 1, memo)});
+		else if (!node.kind) signal = builder.bit(node.bit, depth - 1);
+		else {
+			auto a = cost_node(graph, node.a, builder, depth - 1, memo);
+			auto b = cost_node(graph, node.b, builder, depth - 1, memo);
+			if (node.kind == 1) signal = builder.operation(0xca, {a, b, cost_node(graph, node.s, builder, depth - 1, memo)});
 			else {
-				auto cell = worker.drivers.at(value).cell;
-				if (!cell || StaticCellTypes::categories.is_ff(cell->type)) result = {graph.leaf(value), 1};
-				else {
-					auto expression = worker.cost_expression(value, graph.work);
-					if (graph.work < 0) result = fail(CostStatus::BudgetExhausted);
-					else if (expression.kind == CostKind::Opaque) {
-						kind = CostReadKind::Opaque;
-						mark_opaque(value);
-						if (changed && !worker.cost_live.count(value)) result = fail(CostStatus::UnsupportedActivatedBoundary);
-						else result = {graph.leaf(value), 1};
-					} else if (worker.kept.count(value) || !worker.design->selected(worker.module, cell) || cell->get_bool_attribute(ID::keep)) {
-						kind = CostReadKind::Fixed;
-						graph.add_fixed(value);
-						result = {graph.leaf(value), 1};
-					} else {
-						kind = CostReadKind::Expanded;
-						expand(value);
-						std::vector<CostSignal> args;
-						for (auto input : expression.inputs) {
-							args.push_back(bit(input, depth-1));
-							if (!graph.valid) { active.erase(value); return {0, 0}; }
-							if (record && input.wire) dependent |= record->reads.at({input, depth-1}).dependent;
-						}
-						std::vector<int> values, care;
-						for (auto arg : args) { values.push_back(arg.value); care.push_back(arg.care); }
-						if (expression.kind == CostKind::Gate) result = operation(expression.table, args);
-						else if (expression.kind == CostKind::Compare) {
-							std::vector<int> terms;
-							for (int i = 0; i < GetSize(values); i += 2) terms.push_back(graph.gate(9, {values[i], values[i+1]}));
-							result = {graph.reduce(8, terms, 1), graph.reduce(8, care, 1)};
-						} else if (expression.kind == CostKind::Reduce) result = {graph.reduce(expression.table, values, expression.table == 8), graph.reduce(8, care, 1)};
-						else if (expression.kind == CostKind::Logic) {
-							std::vector<int> a(values.begin(), values.begin()+expression.split), b(values.begin()+expression.split, values.end());
-							result = {graph.gate(expression.table, {graph.reduce(14, a, 0), graph.reduce(14, b, 0)}), graph.reduce(8, care, 1)};
-						} else {
-							log_assert(expression.kind == CostKind::Pmux && GetSize(args) == 1+2*expression.split);
-							int enabled = 0, collision = 0;
-							std::vector<int> terms, qualification;
-							for (int i = 0; i < expression.split; i++) {
-								auto control = args[1+i], data = args[1+expression.split+i];
-								terms.push_back(graph.gate(8, {data.value, control.value}));
-								qualification.push_back(control.care);
-								qualification.push_back(graph.gate(14, {graph.gate(1, {control.value}), data.care}));
-								collision = graph.gate(14, {collision, graph.gate(8, {enabled, control.value})});
-								enabled = graph.gate(14, {enabled, control.value});
-							}
-							int selected = graph.reduce(14, terms, 0);
-							qualification.push_back(graph.gate(1, {collision}));
-							qualification.push_back(graph.gate(14, {enabled, args[0].care}));
-							result = {args[0].value == 0 ? selected : graph.gate(0xca, {args[0].value, selected, enabled}), graph.reduce(8, qualification, 1)};
-						}
-						if (expression.invert) result = operation(1, {result});
-					}
-				}
-			}
-			active.erase(value);
-			bits[key] = result;
-			if (record && graph.valid) {
-				if (!cost_read(graph.work, 8)) return fail(CostStatus::BudgetExhausted);
-				record->reads[key] = {result, kind, dependent};
-			}
-			return result;
-		}
-	};
-	CostStatus make_cost_snapshot(const CostView &edit, CostSnapshot &snapshot) {
-		log_assert(cost_boundaries_frozen && !edit.wrapper && snapshot.topology.nodes.empty());
-		if (cost_stopped || work <= 0 || cost_work <= 0) {
-			cost_stopped = true;
-			return CostStatus::BudgetExhausted;
-		}
-		CostBudget budget(*this);
-		if (!build_cost_indices(budget.remaining)) return CostStatus::BudgetExhausted;
-		std::vector<CostView> edits = {edit};
-		dict<SigBit, std::pair<int, int>> replacements;
-		pool<SigBit> removed;
-		if (!cost_read(budget.remaining, GetSize(*edit.y)+GetSize(cost_preserved))) return CostStatus::BudgetExhausted;
-		for (int i = 0; i < GetSize(*edit.y); i++) replacements[(*edit.y)[i]] = {0, edit.plan->roots[i]};
-		PmuxLutCost::LutCostGraph graph(budget.remaining);
-		CostBuilder before(*this, graph, edits, replacements, removed, false);
-		before.record = &snapshot;
-		for (auto bit : *edit.y) { before.bit(bit); if (!graph.valid) break; }
-		for (auto bit : cost_preserved) { if (!graph.valid) break; if (bit.wire) before.bit(bit); }
-		if (!graph.valid) return budget.remaining < 0 ? CostStatus::BudgetExhausted :
-			before.status == CostStatus::NoGain ? CostStatus::NodeLimit : before.status;
-		log_assert(before.active.empty() && graph.certificates.empty() && graph.checked_certificates.empty() && graph.required.empty());
-		int64_t copy_work = 32LL*graph.node_count() + 8LL*GetSize(snapshot.reads) +
-			4LL*(GetSize(before.expanded)+GetSize(before.opaque)+GetSize(graph.fixed_bits)+GetSize(before.expanded_order));
-		if (!cost_read(budget.remaining, copy_work)) return CostStatus::BudgetExhausted;
-		log_assert(snapshot.topology.leaves.empty() && snapshot.topology.functions.empty() && snapshot.fixed.empty());
-		log_assert(snapshot.expanded.empty() && snapshot.opaque.empty() && snapshot.expanded_order.empty());
-		snapshot.topology.nodes.reserve(graph.node_count());
-		for (auto &node : graph.nodes) {
-			log_assert(node.cost == -1 && node.cuts.empty() && node.best_cut().empty());
-			snapshot.topology.nodes.push_back(node);
-		}
-		snapshot.topology.leaves = std::move(graph.leaves);
-		snapshot.topology.functions = std::move(graph.functions);
-		snapshot.fixed = std::move(graph.fixed_bits);
-		snapshot.expanded = std::move(before.expanded);
-		snapshot.opaque = std::move(before.opaque);
-		snapshot.expanded_order = std::move(before.expanded_order);
-		log_assert(copy_work == snapshot.copy_work());
-		if (cost_diagnostic()) log_debug("PMUX select %s.%s: recovered snapshot nodes=%d reads=%d copy=%lld work=%d.\n",
-			log_id(module), log_id(edit.cell), GetSize(snapshot.topology.nodes), GetSize(snapshot.reads), (long long)copy_work, budget.initial-budget.remaining);
-		return CostStatus::NoGain;
-	}
-	bool restore_cost_snapshot(const CostSnapshot &snapshot, PmuxLutCost::LutCostGraph &graph, CostBuilder &before,
-			PmuxLutCost::LutCostGraph::CertificateCache *certificates) {
-		log_assert(graph.valid && graph.node_count() == 2 && before.bits.empty() && !before.changed && !before.baseline);
-		if (!cost_read(graph.work, snapshot.copy_work())) return false;
-		graph.use_snapshot(snapshot.topology, snapshot.fixed, certificates);
-		before.baseline = &snapshot;
-		return true;
-	}
-	bool cost_observed(SigBit bit, const pool<SigBit> &modeled, const pool<Cell *> &rewritten,
-			dict<Cell *, std::vector<SigBit>> &generic, int &remaining) {
-		if (!cost_live.count(bit)) return false;
-		if (module_outputs.count(bit) || kept.count(bit) || cost_preserved.count(bit)) return true;
-		auto found = users.find(bit);
-		if (found == users.end()) return false;
-		for (auto use : found->second) {
-			if (!cost_read(remaining)) return false;
-			auto cell = use.cell;
-			if (rewritten.count(cell) || cost_legacy_cells.count(cell)) continue;
-			auto direction = types.cell_port_dir(cell->type, use.port);
-			if (direction == RTLIL::PD_UNKNOWN || direction == RTLIL::PD_INOUT || !design->selected(module, cell) || cell->get_bool_attribute(ID::keep)) return true;
-			CostShape shape = cost_shape(cell, remaining);
-			if ((shape == CostShape::Unary || shape == CostShape::Bitwise || shape == CostShape::Mux || shape == CostShape::Pmux) && use.port != ID::S) {
-				log_assert(use.port.in(ID::A, ID::B));
-				const auto &y = cost_port(cell, ID::Y), &input = cost_port(cell, use.port);
-				int offset = shape == CostShape::Pmux && use.port == ID::B ? use.offset % GetSize(y) : use.offset;
-				auto observed = [&](int index) { return cost_live.count(y[index]) && !modeled.count(y[index]); };
-				if (!cost_read(remaining)) return false;
-				if (offset < GetSize(y) && observed(offset)) return true;
-				if (shape == CostShape::Unary || shape == CostShape::Bitwise) {
-					bool sign = cell->hasParam(ID::A_SIGNED) && cell->getParam(ID::A_SIGNED).as_bool();
-					if (cell->hasPort(ID::B)) sign &= cell->hasParam(ID::B_SIGNED) && cell->getParam(ID::B_SIGNED).as_bool();
-					if (sign && use.offset == GetSize(input)-1) for (int index = GetSize(input); index < GetSize(y); index++) {
-						if (!cost_read(remaining)) return false;
-						if (observed(index)) return true;
-					}
-				}
-			} else if (shape == CostShape::Compare || shape == CostShape::Reduce || shape == CostShape::Logic) {
-				const auto &y = cost_port(cell, ID::Y);
-				if (!cost_read(remaining)) return false;
-				if (!y.empty() && cost_live.count(y[0]) && !modeled.count(y[0])) return true;
-			} else {
-				if (!types.cell_evaluable(cell->type) && !StaticCellTypes::categories.is_ff(cell->type)) return true;
-				auto cached = generic.find(cell);
-				if (cached == generic.end()) {
-					std::vector<SigBit> outputs;
-					for (auto &port : cost_ports.at(cell)) if (types.cell_port_dir(cell->type, port.first) != RTLIL::PD_INPUT) for (auto output : port.second) {
-						if (!cost_read(remaining)) return false;
-						if (cost_live.count(output)) outputs.push_back(output);
-					}
-					generic[cell] = std::move(outputs);
-					cached = generic.find(cell);
-				}
-				while (!cached->second.empty()) {
-					if (!cost_read(remaining)) return false;
-					if (!modeled.count(cached->second.back())) return true;
-					cached->second.pop_back();
-				}
+				log_assert(node.kind == 2);
+				signal = builder.operation(6, {a, b});
 			}
 		}
-		return false;
+		return memo[key] = signal;
 	}
-	static const char *cost_status_name(CostStatus status) {
-		switch (status) {
-		case CostStatus::Profitable: return "profitable";
-		case CostStatus::NoGain: return "no-gain";
-		case CostStatus::UnsupportedSource: return "unsupported-source";
-		case CostStatus::UnsupportedActivatedBoundary: return "unsupported-activated-boundary";
-		case CostStatus::DepthLimit: return "depth-limit";
-		case CostStatus::NodeLimit: return "node-limit";
-		case CostStatus::BudgetExhausted: return "budget-exhausted";
-		}
-		log_abort();
-	}
-	CostResult estimate_select(const std::vector<CostView> &edits, const CostSnapshot *snapshot = nullptr,
-			PmuxLutCost::LutCostGraph::CertificateCache *certificates = nullptr) {
-		log_assert(cost_boundaries_frozen && !edits.empty());
-		if (cost_stopped || work <= 0 || cost_work <= 0) {
-			cost_stopped = true;
-			return {CostStatus::BudgetExhausted, 0, 0};
-		}
-		CostBudget budget(*this);
-		CostResult result;
-		auto finish = [&](CostStatus status) {
-			result.status = status;
-			if (cost_diagnostic()) log_debug("PMUX select %s cost in %s: %s %d -> %d, %d targets, work used %d, remaining %d.\n",
-				edits[0].wrapper ? "wrapper" : "recovered", log_id(module), cost_status_name(status), result.before, result.after, GetSize(edits), budget.initial-budget.remaining, cost_work-(budget.initial-budget.remaining));
-			return result;
-		};
-		if (!build_cost_indices(budget.remaining)) return finish(CostStatus::BudgetExhausted);
-		dict<SigBit, std::pair<int, int>> replacements;
+
+	bool cost_request(const std::vector<CostView> &edits, PmuxLutCost::Request &request) {
+		log_assert(!edits.empty());
 		pool<Cell *> rewritten;
-		pool<SigBit> roots, removed;
-		for (int i = 0; i < GetSize(edits); i++) {
-			const auto &edit = edits[i];
-			log_assert(edit.y && edit.plan && !edit.plan->fields && GetSize(*edit.y) == GetSize(edit.plan->roots));
+		for (const auto &edit : edits) {
+			log_assert(edit.cell && edit.y && edit.plan && !edit.plan->fields && GetSize(*edit.y) == GetSize(edit.plan->roots));
 			log_assert(rewritten.insert(edit.cell).second);
+			if (!cost_spend(1 + GetSize(*edit.y) + (edit.wrapper ? GetSize(edit.wrapper->inner_y) : 0))) return false;
 			if (edit.wrapper) {
 				log_assert(edit.wrapper->cell && rewritten.insert(edit.wrapper->cell).second);
-				if (!cost_read(budget.remaining, GetSize(edit.wrapper->inner_y))) return finish(CostStatus::BudgetExhausted);
-				for (auto bit : edit.wrapper->inner_y) log_assert(removed.insert(bit).second);
+				for (auto bit : edit.wrapper->inner_y) log_assert(request.removed.insert(bit).second);
 			}
-			for (int j = 0; j < GetSize(*edit.y); j++) {
-				if (!cost_read(budget.remaining)) return finish(CostStatus::BudgetExhausted);
-				auto bit = (*edit.y)[j];
-				log_assert(!cost_boundaries.count(bit) && !replacements.count(bit));
-				replacements[bit] = {i, edit.plan->roots[j]};
-				roots.insert(bit);
-			}
-		}
-		if (!cost_read(budget.remaining, GetSize(cost_preserved))) return finish(CostStatus::BudgetExhausted);
-		for (auto bit : cost_preserved) if (bit.wire) roots.insert(bit);
-		PmuxLutCost::LutCostGraph graph(budget.remaining);
-		CostBuilder before(*this, graph, edits, replacements, removed, false), after(*this, graph, edits, replacements, removed, true);
-		if (snapshot) {
-			log_assert(GetSize(edits) == 1 && !edits[0].wrapper);
-			if (!restore_cost_snapshot(*snapshot, graph, before, certificates)) return finish(CostStatus::BudgetExhausted);
-			after.original = snapshot;
-		}
-		auto add_root = [&](SigBit bit) { before.bit(bit); after.bit(bit); };
-		for (auto bit : roots) {
-			if (!graph.valid) break;
-			add_root(bit);
-		}
-		pool<SigBit> modeled, checked;
-		pool<int> signatures;
-		dict<Cell *, std::vector<SigBit>> generic;
-		std::vector<SigBit> pending;
-		int before_count = 0, after_count = 0;
-		auto collect = [&]() {
-			while (before_count < before.expanded_count()) {
-				if (!graph.spend()) return;
-				auto bit = before.expanded_at(before_count++);
-				if (modeled.insert(bit).second) pending.push_back(bit);
-			}
-			while (after_count < after.expanded_count()) {
-				if (!graph.spend()) return;
-				auto bit = after.expanded_at(after_count++);
-				if (modeled.insert(bit).second) pending.push_back(bit);
-			}
-		};
-		collect();
-		for (int i = 0; graph.valid && i < GetSize(pending); i++) {
-			auto bit = pending[i];
-			if (!graph.spend()) break;
-			if (cost_observed(bit, modeled, rewritten, generic, budget.remaining) && roots.insert(bit).second) {
-				add_root(bit);
-				collect();
-			}
-			int id = cost_operator_id(bit, budget.remaining);
-			if (budget.remaining < 0) break;
-			if (id < 0 || !signatures.insert(id).second) continue;
-			for (auto outside : cost_operators[id]) {
-				if (!graph.spend()) break;
-				if (modeled.count(outside) || !cost_live.count(outside) || !checked.insert(outside).second) continue;
-				if (cost_observed(outside, modeled, rewritten, generic, budget.remaining) && roots.insert(outside).second) {
-					add_root(outside);
-					collect();
-				}
+			auto memo = std::make_shared<PlanCost>();
+			const auto *graph = &edit.plan->graph;
+			for (int i = 0; i < GetSize(*edit.y); i++) {
+				auto bit = (*edit.y)[i];
+				int ref = edit.plan->roots[i];
+				log_assert(!request.replacements.count(bit));
+				request.replacements[bit] = [this, graph, ref, memo](PmuxLutCost::Builder &builder, int depth) {
+					return cost_node(*graph, ref, builder, depth, *memo);
+				};
 			}
 		}
-		if (budget.remaining < 0) return finish(CostStatus::BudgetExhausted);
-		if (!graph.valid) {
-			if (before.status != CostStatus::NoGain) return finish(before.status);
-			if (after.status != CostStatus::NoGain) return finish(after.status);
-			return finish(CostStatus::NodeLimit);
-		}
-		std::vector<int> old_roots, new_roots;
-		for (auto bit : roots) {
-			if (!graph.valid) break;
-			auto old_signal = before.bit(bit), new_signal = after.bit(bit);
-			graph.prepare_certificate(old_signal.value, old_signal.care);
-			graph.prepare_certificate(new_signal.value, new_signal.care);
-			old_roots.push_back(old_signal.value);
-			new_roots.push_back(new_signal.value);
-		}
-		if (!graph.valid) return finish(budget.remaining < 0 ? CostStatus::BudgetExhausted : CostStatus::NodeLimit);
-		auto old_cover = graph.cover(old_roots);
-		dict<int, PmuxLutCost::Cut> old_cuts;
-		if (ys_debug(1) && !snapshot) for (int id : old_cover) {
-			if (!cost_diagnostic(1+GetSize(graph.mapping(id).best_cut()))) break;
-			old_cuts[id] = graph.mapping(id).best_cut();
-		}
-		auto new_cover = graph.cover(new_roots);
-		if (budget.remaining < 0) return finish(CostStatus::BudgetExhausted);
-		if (!graph.valid) return finish(CostStatus::NodeLimit);
-		result.before = GetSize(old_cover)+graph.fixed_count();
-		result.after = GetSize(new_cover)+graph.fixed_count();
-		if (ys_debug(1)) {
-			for (auto &edit : edits) {
-				if (!cost_diagnostic()) break;
-				if (edit.wrapper) log_debug("Select cost target %s outer %s.\n", log_id(edit.cell), log_id(edit.wrapper->cell));
-				else log_debug("Select cost target %s recovered.\n", log_id(edit.cell));
-			}
-			for (auto bit : roots) {
-				if (!cost_diagnostic()) break;
-				auto old_signal = before.cached_bit({bit, 64}), new_signal = after.cached_bit({bit, 64});
-				log_debug("Select cost root %s before %d care %d after %d care %d.\n", log_signal(bit), old_signal.value, old_signal.care, new_signal.value, new_signal.care);
-			}
-			for (int index = 0; index < before.expanded_count(); index++) {
-				if (!cost_diagnostic()) break;
-				auto bit = before.expanded_at(index);
-				log_debug("Select cost source %s retained %d.\n", log_signal(bit), int(after.expanded_contains(bit)));
-			}
-			if (snapshot) for (auto bit : snapshot->fixed) {
-				if (!cost_diagnostic()) break;
-				log_debug("Select cost fixed %s.\n", log_signal(bit));
-			}
-			for (auto bit : graph.fixed_bits) {
-				if (!cost_diagnostic()) break;
-				log_debug("Select cost fixed %s.\n", log_signal(bit));
-			}
-			if (!snapshot) for (auto &entry : graph.leaves) {
-				if (!cost_diagnostic()) break;
-				log_debug("Select cost leaf %s node %d.\n", log_signal(entry.first), entry.second);
-			}
-			if (!snapshot) for (int id = 0; id < graph.node_count(); id++) {
-				const auto &node = graph.primary(id);
-				const auto &state = graph.mapping(id);
-			if (!cost_diagnostic(1+GetSize(node.inputs)+(old_cuts.count(id) ? GetSize(old_cuts.at(id)) : 0)+(new_cover.count(id) ? GetSize(state.best_cut()) : 0))) break;
-				log_debug("Select cost node %d table %u leaf %d before %d after %d inputs", id, unsigned(node.table), node.leaf, old_cover.count(id), new_cover.count(id));
-				for (int input : node.inputs) log_debug(" %d", input);
-				log_debug(" cuts");
-				if (old_cuts.count(id)) for (int input : old_cuts.at(id)) log_debug(" %d", input);
-				log_debug(" / ");
-			if (new_cover.count(id)) for (int input : state.best_cut()) log_debug(" %d", input);
-				log_debug("\n");
-			}
-			if (cost_diagnostic()) log_debug("Select cost certificates 5/6/7=%d/%d/%d partial=%d nodes=%d.\n", graph.certificate_widths[5], graph.certificate_widths[6], graph.certificate_widths[7], graph.partial_functions, graph.node_count());
-		}
-		return finish(result.before > result.after ? CostStatus::Profitable : CostStatus::NoGain);
+		return true;
+	}
+
+	PmuxLutCost::CostResult estimate_select(const std::vector<CostView> &edits, const PmuxLutCost::Snapshot *snapshot = nullptr) {
+		PmuxLutCost::Request request;
+		if (!cost_request(edits, request)) return {CostStatus::BudgetExhausted};
+		int initial = std::min(work, cost_work), remaining = initial;
+		auto result = module_cost.estimate(request, remaining, snapshot);
+		cost_spend(initial - remaining);
+		if (cost_diagnostic()) log_debug("PMUX select %s cost in %s: %s %d -> %d, %d targets, work used %d, remaining %d.\n",
+			edits.front().wrapper ? "wrapper" : "recovered", log_id(module), PmuxLutCost::status_name(result.status), result.before, result.after,
+			GetSize(edits), initial - remaining, cost_work);
+		return result;
 	}
 	// recovered 保留原输出，确认直接 MUX 使用环境的形状和输入依赖。
 	bool recovered_context(Cell *cell) {
-		log_assert(users_valid);
 		pool<Cell *> checked;
-		for (auto bit : cost_port(cell, ID::Y)) {
+		for (auto bit : netlist.port(cell, ID::Y)) {
 			if (!cost_spend()) return false;
-			auto found = users.find(bit);
-			if (found == users.end()) continue;
-			for (auto use : found->second) {
+			for (auto use : netlist.users(bit)) {
 				if (!cost_spend()) return false;
 				auto outer = use.cell;
 				if (outer->type != ID($mux) || !checked.insert(outer).second) continue;
-				{
-					CostBudget budget(*this);
-					if (!cost_read(budget.remaining, 4) || GetSize(outer->connections()) != 4 ||
-						cost_shape(outer, budget.remaining) != CostShape::Mux) return false;
-				}
-				if (work <= 0 || cost_work <= 0) return false;
-				const auto &output = cost_port(outer, ID::Y);
+				if (!cost_spend(4) || GetSize(outer->connections()) != 4 || !outer->hasParam(ID::WIDTH) ||
+					!outer->hasPort(ID::A) || !outer->hasPort(ID::B) || !outer->hasPort(ID::S) || !outer->hasPort(ID::Y)) return false;
+				const auto &output = netlist.port(outer, ID::Y);
 				int width = GetSize(output);
-				if (width < 1 || !cost_spend(width)) return false;
+				if (width < 1 || width != outer->getParam(ID::WIDTH).as_int() || !cost_spend(width) ||
+					GetSize(netlist.port(outer, ID::A)) != width || GetSize(netlist.port(outer, ID::B)) != width ||
+					GetSize(netlist.port(outer, ID::S)) != 1) return false;
 				pool<SigBit> outputs;
 				for (int i = 0; i < width; i++) {
 					auto bit = output[i];
-					if (!unique(bit)) return false;
-					const auto &driver = drivers.at(bit);
-					if (driver.cell != outer || driver.offset != i || !outputs.insert(bit).second) return false;
+					auto driver = netlist.source(bit);
+					if (!driver || driver->cell != outer || driver->port != ID::Y || driver->offset != i || !outputs.insert(bit).second) return false;
 				}
-				SourceContext dependency;
-				for (auto port : {ID::A, ID::B, ID::S}) for (auto input : cost_port(outer, port))
-					if (!upstream(input, outputs, dependency)) return false;
+				PmuxNetlist::Dependencies dependency(netlist, outputs, work);
+				for (auto port : {ID::A, ID::B, ID::S}) for (auto input : netlist.port(outer, port))
+					if (!dependency.visit(input)) return false;
 			}
 		}
 		return work > 0 && cost_work > 0;
@@ -1749,16 +859,19 @@ struct PmuxSelectWorker {
 	int choose_recovered(Recovered &record) {
 		log_assert(record.ready && !record.plans.empty());
 		if (!recovered_context(record.cell)) return -1;
-		CostSnapshot snapshot;
+		PmuxLutCost::Snapshot snapshot;
 		CostView view = {record.cell, &record.y, nullptr, &record.plans[0].plan};
-		auto status = make_cost_snapshot(view, snapshot);
+		PmuxLutCost::Request request;
+		if (!cost_request({view}, request)) return -1;
+		int initial = std::min(work, cost_work), remaining = initial;
+		auto status = module_cost.checkpoint(request, remaining, snapshot);
+		cost_spend(initial - remaining);
 		if (status != CostStatus::NoGain) {
-			if (cost_diagnostic()) log_debug("PMUX select %s.%s: recovered snapshot %s.\n", log_id(module), log_id(record.cell), cost_status_name(status));
+			if (cost_diagnostic()) log_debug("PMUX select %s.%s: recovered snapshot %s.\n", log_id(module), log_id(record.cell), PmuxLutCost::status_name(status));
 			return -1;
 		}
 		int chosen = -1;
 		std::tuple<int, int, int, int, int> best;
-		PmuxLutCost::LutCostGraph::CertificateCache certificates;
 		for (int index = 0; index < GetSize(record.plans); index++) {
 			if (cost_stopped || work <= 0 || cost_work <= 0) { cost_stopped = true; return -1; }
 			auto &alternative = record.plans[index];
@@ -1771,10 +884,10 @@ struct PmuxSelectWorker {
 				continue;
 			}
 			view.plan = &plan;
-			auto result = estimate_select({view}, &snapshot, &certificates);
+			auto result = estimate_select({view}, &snapshot);
 			if (cost_diagnostic()) log_debug("PMUX select %s.%s: recovered order=%d count=%d reference=%d gates=%d original_gates=%d %s %d -> %d.\n",
 				log_id(module), log_id(record.cell), alternative.order, plan.count, plan.reference, plan.gates, record.original_gates,
-				cost_status_name(result.status), result.before, result.after);
+				PmuxLutCost::status_name(result.status), result.before, result.after);
 			if (cost_stopped) return -1;
 			if (result.status != CostStatus::Profitable) continue;
 			auto rank = std::make_tuple(result.after-result.before, result.after, plan.count, plan.gates, alternative.order);
@@ -1787,8 +900,8 @@ struct PmuxSelectWorker {
 	bool candidate(Cell *cell, const Selection &selection, Plan &best, std::vector<std::vector<SigBit>> &tables,
 			const Wrapper *wrapper = nullptr, Recovered *recovered = nullptr) {
 		log_assert(!wrapper || !recovered);
-		if (wrapper && cost_stopped) return false;
-		auto a = normalized_port(cell, ID::A), b = normalized_port(cell, ID::B), s = normalized_port(cell, ID::S), y = normalized_port(cell, ID::Y);
+		if (!spend(0) || (wrapper && cost_stopped)) return false;
+		const auto &a = netlist.port(cell, ID::A), &b = netlist.port(cell, ID::B), &s = netlist.port(cell, ID::S), &y = netlist.port(cell, ID::Y);
 		int width = GetSize(y), branches = GetSize(s);
 		auto &controls = selection.controls;
 		log_assert(!controls.empty() && GetSize(controls) <= 6);
@@ -1800,14 +913,14 @@ struct PmuxSelectWorker {
 		if (wrapper) for (auto bit : wrapper->y) outputs.insert(bit);
 		dict<SigBit, int> positions;
 		for (int i = 0; i < GetSize(controls); i++) positions[controls[i]] = i;
-		SourceContext dependency;
-		for (auto bit : a) if (!upstream(bit, outputs, dependency)) return false;
-		for (auto bit : b) if (!upstream(bit, outputs, dependency)) return false;
-		for (auto bit : controls) if (!upstream(bit, outputs, dependency)) return false;
-		if (selection.expanded || wrapper) for (auto bit : s) if (!upstream(bit, outputs, dependency)) return false;
+		PmuxNetlist::Dependencies dependency(netlist, outputs, work, true);
+		for (auto bit : a) if (!dependency.visit(bit)) return false;
+		for (auto bit : b) if (!dependency.visit(bit)) return false;
+		for (auto bit : controls) if (!dependency.visit(bit)) return false;
+		if (selection.expanded || wrapper) for (auto bit : s) if (!dependency.visit(bit)) return false;
 		if (wrapper) {
-			if (!upstream(wrapper->select, outputs, dependency)) return false;
-			for (auto bit : wrapper->other) if (!upstream(bit, outputs, dependency)) return false;
+			if (!dependency.visit(wrapper->select)) return false;
+			for (auto bit : wrapper->other) if (!dependency.visit(bit)) return false;
 			if (!spend(width*size)) return false;
 		}
 		tables.assign(width, {});
@@ -1878,7 +991,7 @@ struct PmuxSelectWorker {
 		// 按原始 PMUX 的数据选择数量计算字段支持缩减。
 		bool field_gain = !recovered_only && !wrapper && support_saved > 0 && 4*field_choices <= 3*width*branches;
 		// 原始数据叶节点全局互异时，完整选择图与参考树具有相同节点数量。
-		auto legacy_no_gain = [&]() {
+		auto distinct_table = [&]() {
 			if (wrapper || recovered || size < 4) return false;
 			pool<SigBit> seen;
 			for (int j = 0; j < width; j++) {
@@ -1895,8 +1008,8 @@ struct PmuxSelectWorker {
 			}
 			return true;
 		};
-		if (legacy_no_gain()) {
-			log_debug("PMUX select %s.%s: complete distinct data table has no legacy gain.\n", log_id(module), log_id(cell));
+		if (distinct_table()) {
+			log_debug("PMUX select %s.%s: complete distinct data table has no sharing gain.\n", log_id(module), log_id(cell));
 			return false;
 		}
 		int original_gates = 0;
@@ -1955,9 +1068,10 @@ struct PmuxSelectWorker {
 				for (int c = 0; c < size; c++) {
 					int index = permuted[c];
 					auto &function = functions[j][index];
-					leaves[c] = GetSize(function.support) <= 1 ? function_graph(plan.graph, function, dependency.bits) : graph_leaf(plan.graph, tables[j][index], dependency.bits);
+					auto bit = tables[j][index];
+					leaves[c] = GetSize(function.support) <= 1 ? function_graph(plan.graph, function, dependency) : plan.graph.leaf(bit, dependency.high_z(bit));
 				}
-				int normal = build(plan.graph, leaves, selectors, dependency.bits), result = normal;
+				int normal = build(plan.graph, leaves, selectors, dependency), result = normal;
 				const auto &cofactor = cofactors[j];
 				if (!cofactor.atoms.empty()) {
 					std::vector<int> cofactor_roots;
@@ -1967,9 +1081,9 @@ struct PmuxSelectWorker {
 							int index = permuted[c];
 							values[c] = plan.graph.leaf(State((cofactor.values[index] >> (3*d)) & 7));
 						}
-						cofactor_roots.push_back(build(plan.graph, values, selectors, dependency.bits));
+						cofactor_roots.push_back(build(plan.graph, values, selectors, dependency));
 					}
-					int swapped = build(plan.graph, cofactor_roots, cofactor.atoms, dependency.bits);
+					int swapped = build(plan.graph, cofactor_roots, cofactor.atoms, dependency);
 					if (plan.graph.cost({swapped}, cost_context).first < plan.graph.cost({normal}, cost_context).first) {
 						result = swapped;
 						plan.swaps++;
@@ -2004,7 +1118,7 @@ struct PmuxSelectWorker {
 		}
 		// 字段选择保留原始 PMUX 的编码形式，全部编码均具有真实默认数据。
 		if (!accepted && saving) {
-			if (!selection.expanded) for (auto bit : s) if (!upstream(bit, outputs, dependency)) {
+			if (!selection.expanded) for (auto bit : s) if (!dependency.visit(bit)) {
 				release_recovered(*recovered);
 				return false;
 			}
@@ -2207,7 +1321,7 @@ struct OptPmuxSelectPass : public Pass {
 				PmuxSelectWorker::Recovered record;
 				record.cell = cell;
 				if (worker.candidate(cell, edit.selection, edit.plan, edit.tables, nullptr, defer_recovered ? nullptr : &record)) {
-					edit.y = worker.sigmap(cell->getPort(ID::Y));
+					edit.y = worker.netlist.port(cell, ID::Y);
 					reserved.insert(cell);
 					edits.push_back(std::move(edit));
 				} else {
@@ -2234,12 +1348,9 @@ struct OptPmuxSelectPass : public Pass {
 					break;
 				}
 			}
-			if (!worker.exhausted && analyze_recovered) {
-				for (auto &edit : edits) worker.preserve_legacy(edit.cell, edit.y, edit.plan, edit.selection.controls, edit.tables);
-				worker.cost_boundaries_frozen = true;
-			}
-			if (!worker.exhausted && analyze_recovered) worker.index_users();
-			if (!recovered_only && worker.users_valid) for (auto &entry : recovered) {
+			if (!worker.exhausted && analyze_recovered)
+				for (auto &edit : edits) worker.preserve_plan_inputs(edit.y, edit.plan, edit.selection.controls, edit.tables);
+			if (!worker.exhausted && analyze_recovered && !recovered_only) for (auto &entry : recovered) {
 				if (worker.exhausted || worker.cost_stopped) break;
 				if (reserved.count(entry.cell)) continue;
 				Edit edit;
